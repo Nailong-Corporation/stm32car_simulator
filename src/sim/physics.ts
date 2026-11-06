@@ -3,8 +3,7 @@ import { graySensorUpdate, GraySensorModel } from './gray_sensor';
 import {
   START_POINT,
   START_HEADING_RAD,
-  isSensorOnTrackLine,
-  TRACK_LINE_WIDTH_CM,
+  isWhiteAt,
   type Point2D,
 } from '../track/map_data';
 import {
@@ -115,7 +114,8 @@ export class VehicleSimulator {
       const sx = cx + offset * lx;
       const sy = cy + offset * ly;
 
-      const onLine = isSensorOnTrackLine(sx, sy, TRACK_LINE_WIDTH_CM / 2);
+      // White wires AND the printed component symbols are physical line.
+      const onLine = isWhiteAt(sx, sy);
       if (onLine) {
         mask |= 1 << i;
       }

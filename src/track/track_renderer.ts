@@ -4,7 +4,18 @@ import {
   TRACK_LINE_WIDTH_CM,
   TRACK_SEGMENTS,
   CIRCUIT_COMPONENTS,
-  type CircuitComponent,
+  RESISTOR_LENGTH_CM,
+  RESISTOR_WIDTH_CM,
+  RESISTOR_STROKE_CM,
+  TRANSISTOR_MOUTH_CM,
+  TRANSISTOR_DEPTH_CM,
+  TRANSISTOR_BAR_HALF_CM,
+  TRANSISTOR_STROKE_CM,
+  BATTERY_PLATE_SPACING_CM,
+  BATTERY_LONG_HALF_CM,
+  BATTERY_SHORT_HALF_CM,
+  BATTERY_STROKE_CM,
+  type TrackComponent,
 } from './map_data';
 
 export interface ViewportTransform {
@@ -179,196 +190,138 @@ export class TrackRenderer {
     ctx.restore();
   }
 
-  private renderComponent(comp: CircuitComponent): void {
+  /**
+   * Draw one printed component symbol at its true physical size (cm) on the
+   * track. The board covers the wire underneath the symbol footprint, then the
+   * white symbol strokes are drawn, matching what the grayscale sensors see.
+   */
+  private renderComponent(comp: TrackComponent): void {
     const ctx = this.ctx;
     const { x, y } = this.toScreen(comp.x, comp.y);
     const scale = this.transform.scale;
+    const px = (cm: number) => cm * scale;
+    const board = '#020d75';
 
     ctx.save();
     ctx.translate(x, y);
     ctx.rotate(comp.rotation);
-
     ctx.strokeStyle = '#ffffff';
-    ctx.fillStyle = '#020d75'; // Matches track background so symbols pop cleanly
-    ctx.lineWidth = Math.max(1.5, 2 * (scale / 4.0));
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
 
     if (comp.type === 'battery') {
-      // Battery symbol at (0, 120): 4 parallel plates (Long, Short, Long, Short)
-      const plateH = 24 * (scale / 4.0);
-      const spacing = 4 * (scale / 4.0);
-
-      // Plate 1 (Long, positive)
-      ctx.beginPath();
-      ctx.moveTo(-spacing * 1.5, -plateH * 0.7);
-      ctx.lineTo(-spacing * 1.5, plateH * 0.7);
-      ctx.stroke();
-
-      // Plate 2 (Short, negative)
-      ctx.beginPath();
-      ctx.lineWidth = Math.max(2, 3 * (scale / 4.0));
-      ctx.moveTo(-spacing * 0.5, -plateH * 0.35);
-      ctx.lineTo(-spacing * 0.5, plateH * 0.35);
-      ctx.stroke();
-
-      // Plate 3 (Long)
-      ctx.lineWidth = Math.max(1.5, 2 * (scale / 4.0));
-      ctx.beginPath();
-      ctx.moveTo(spacing * 0.5, -plateH * 0.7);
-      ctx.lineTo(spacing * 0.5, plateH * 0.7);
-      ctx.stroke();
-
-      // Plate 4 (Short)
-      ctx.beginPath();
-      ctx.lineWidth = Math.max(2, 3 * (scale / 4.0));
-      ctx.moveTo(spacing * 1.5, -plateH * 0.35);
-      ctx.lineTo(spacing * 1.5, plateH * 0.35);
-      ctx.stroke();
-
-      // Start text indicator
-      ctx.save();
-      ctx.rotate(-comp.rotation);
-      ctx.fillStyle = '#00ffcc';
-      ctx.font = `bold ${Math.max(10, 12 * (scale / 4.0))}px sans-serif`;
-      ctx.textAlign = 'right';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('P (START)', -16 * (scale / 4.0), 0);
-      ctx.restore();
+      // Four plates straddling the wire: long, short, long, short.
+      const footprintHalfU = 2 * BATTERY_PLATE_SPACING_CM + BATTERY_STROKE_CM;
+      const footprintHalfV = BATTERY_LONG_HALF_CM + BATTERY_STROKE_CM;
+      ctx.fillStyle = board;
+      ctx.fillRect(px(-footprintHalfU), px(-footprintHalfV), px(2 * footprintHalfU), px(2 * footprintHalfV));
+      ctx.lineWidth = Math.max(1.2, px(BATTERY_STROKE_CM));
+      const half = [BATTERY_LONG_HALF_CM, BATTERY_SHORT_HALF_CM, BATTERY_LONG_HALF_CM, BATTERY_SHORT_HALF_CM];
+      for (let i = 0; i < 4; ++i) {
+        const u = (i - 1.5) * BATTERY_PLATE_SPACING_CM;
+        ctx.beginPath();
+        ctx.moveTo(px(u), px(-half[i]));
+        ctx.lineTo(px(u), px(half[i]));
+        ctx.stroke();
+      }
     } else if (comp.type === 'resistor') {
-      // Rectangular box with line passing through
-      const boxW = 22 * (scale / 4.0);
-      const boxH = 10 * (scale / 4.0);
-
-      ctx.beginPath();
-      ctx.rect(-boxW / 2, -boxH / 2, boxW, boxH);
-      ctx.fill();
-      ctx.stroke();
+      const L = comp.length ?? RESISTOR_LENGTH_CM;
+      const W = comp.width ?? RESISTOR_WIDTH_CM;
+      const t = comp.stroke ?? RESISTOR_STROKE_CM;
+      ctx.fillStyle = board;
+      ctx.fillRect(px(-L / 2), px(-W / 2), px(L), px(W));
+      ctx.lineWidth = Math.max(1.2, px(t));
+      ctx.strokeRect(px(-L / 2), px(-W / 2), px(L), px(W));
     } else if (comp.type === 'transistor') {
-      // BJT Transistor symbol (base bar, collector lead, emitter lead with arrow)
-      const r = 10 * (scale / 4.0);
-
-      // Base bar
+      // Canonical: through-wire along u (+x), V dips toward the branch (+v),
+      // base bar perpendicular to the branch at the V vertex.
+      const m = TRANSISTOR_MOUTH_CM / 2;
+      const d = TRANSISTOR_DEPTH_CM;
+      const t = comp.stroke ?? TRANSISTOR_STROKE_CM;
+      ctx.fillStyle = board;
+      ctx.fillRect(px(-TRANSISTOR_BAR_HALF_CM - t), px(-t), px(2 * (TRANSISTOR_BAR_HALF_CM + t)), px(d + 2 * t));
+      ctx.lineWidth = Math.max(1.2, px(t));
       ctx.beginPath();
-      ctx.moveTo(-r * 0.5, -r);
-      ctx.lineTo(-r * 0.5, r);
+      ctx.moveTo(px(-m), 0);
+      ctx.lineTo(0, px(d));
+      ctx.lineTo(px(m), 0);
       ctx.stroke();
-
-      // Collector lead
       ctx.beginPath();
-      ctx.moveTo(-r * 0.5, -r * 0.5);
-      ctx.lineTo(r, -r);
+      ctx.moveTo(px(-TRANSISTOR_BAR_HALF_CM), px(d));
+      ctx.lineTo(px(TRANSISTOR_BAR_HALF_CM), px(d));
       ctx.stroke();
-
-      // Emitter lead with arrow
-      ctx.beginPath();
-      ctx.moveTo(-r * 0.5, r * 0.5);
-      ctx.lineTo(r, r);
-      ctx.stroke();
-
-      // Emitter arrow
-      ctx.beginPath();
-      ctx.moveTo(r, r);
-      ctx.lineTo(r * 0.4, r * 0.85);
-      ctx.lineTo(r * 0.85, r * 0.4);
-      ctx.closePath();
-      ctx.fillStyle = '#ffffff';
-      ctx.fill();
-    } else if (comp.type === 'diode') {
-      // Diode triangle + bar
-      const size = 10 * (scale / 4.0);
-      ctx.beginPath();
-      ctx.moveTo(-size, -size);
-      ctx.lineTo(size, 0);
-      ctx.lineTo(-size, size);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.beginPath();
-      ctx.moveTo(size, -size);
-      ctx.lineTo(size, size);
-      ctx.stroke();
-    }
-
-    // Component Label (optional)
-    if (this.options.showComponentLabels && comp.label) {
-      ctx.restore();
-      ctx.save();
-      ctx.translate(x, y);
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
-      ctx.font = `${Math.max(9, 10 * (scale / 4.0))}px monospace`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'top';
-      ctx.fillText(comp.label, 0, 14 * (scale / 4.0));
-      ctx.restore();
-      return;
     }
 
     ctx.restore();
+
+    // Component label clear of the symbol
+    if (this.options.showComponentLabels && comp.label) {
+      const label = this.toScreen(comp.x, comp.y);
+      ctx.save();
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+      ctx.font = `${Math.max(9, Math.min(14, 2.6 * scale))}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      const outward = comp.type === 'resistor' ? RESISTOR_WIDTH_CM / 2 : TRANSISTOR_DEPTH_CM;
+      ctx.fillText(comp.label, label.x, label.y + px(outward) + 4);
+      ctx.restore();
+    }
   }
 
   private renderDimensions(): void {
     const ctx = this.ctx;
     const scale = this.transform.scale;
-    const fontSize = Math.max(9, 11 * (scale / 4.0));
+    const fontSize = Math.max(9, Math.min(13, 2.6 * scale));
 
     ctx.save();
     ctx.font = `${fontSize}px sans-serif`;
-    ctx.fillStyle = '#8bc34a'; // Soft blueprint green/amber for dimension text
+    ctx.fillStyle = '#8bc34a';
     ctx.strokeStyle = 'rgba(139, 195, 74, 0.4)';
     ctx.lineWidth = 1;
 
-    // Helper to draw horizontal dimension line with arrows and text
     const drawHorizDim = (x1: number, x2: number, y: number, text: string, textAbove = true) => {
       const p1 = this.toScreen(x1, y);
       const p2 = this.toScreen(x2, y);
-
       ctx.beginPath();
       ctx.moveTo(p1.x, p1.y);
       ctx.lineTo(p2.x, p2.y);
       ctx.stroke();
-
-      // Arrow heads
-      const arrowS = 3;
+      const a = 3;
       ctx.beginPath();
-      ctx.moveTo(p1.x + arrowS, p1.y - arrowS);
+      ctx.moveTo(p1.x + a, p1.y - a);
       ctx.lineTo(p1.x, p1.y);
-      ctx.lineTo(p1.x + arrowS, p1.y + arrowS);
-      ctx.moveTo(p2.x - arrowS, p2.y - arrowS);
+      ctx.lineTo(p1.x + a, p1.y + a);
+      ctx.moveTo(p2.x - a, p2.y - a);
       ctx.lineTo(p2.x, p2.y);
-      ctx.lineTo(p2.x - arrowS, p2.y + arrowS);
+      ctx.lineTo(p2.x - a, p2.y + a);
       ctx.stroke();
-
       ctx.textAlign = 'center';
       ctx.textBaseline = textAbove ? 'bottom' : 'top';
       ctx.fillText(text, (p1.x + p2.x) / 2, p1.y + (textAbove ? -2 : 2));
     };
 
-    // Helper to draw vertical dimension line with arrows and text
     const drawVertDim = (x: number, y1: number, y2: number, text: string, textLeft = true) => {
       const p1 = this.toScreen(x, y1);
       const p2 = this.toScreen(x, y2);
-
       ctx.beginPath();
       ctx.moveTo(p1.x, p1.y);
       ctx.lineTo(p2.x, p2.y);
       ctx.stroke();
-
-      const arrowS = 3;
+      const a = 3;
       ctx.beginPath();
-      ctx.moveTo(p1.x - arrowS, p1.y + arrowS);
+      ctx.moveTo(p1.x - a, p1.y + a);
       ctx.lineTo(p1.x, p1.y);
-      ctx.lineTo(p1.x + arrowS, p1.y + arrowS);
-      ctx.moveTo(p2.x - arrowS, p2.y - arrowS);
+      ctx.lineTo(p1.x + a, p1.y + a);
+      ctx.moveTo(p2.x - a, p2.y - a);
       ctx.lineTo(p2.x, p2.y);
-      ctx.lineTo(p2.x + arrowS, p2.y - arrowS);
+      ctx.lineTo(p2.x + a, p2.y - a);
       ctx.stroke();
-
       ctx.textAlign = textLeft ? 'right' : 'left';
       ctx.textBaseline = 'middle';
       ctx.fillText(text, p1.x + (textLeft ? -4 : 4), (p1.y + p2.y) / 2);
     };
 
-    // Top Dimension Chain (y = -10 cm)
+    // Top dimension chain (new CAD drawing): 55/40/150/30/70/30
     const topY = -8;
     drawHorizDim(0, 55, topY, '55.00');
     drawHorizDim(55, 95, topY, '40.00');
@@ -376,26 +329,25 @@ export class TrackRenderer {
     drawHorizDim(245, 275, topY, '30.00');
     drawHorizDim(275, 345, topY, '70.00');
     drawHorizDim(345, 375, topY, '30.00');
-    // Total Width top
     drawHorizDim(0, 375, topY - 10, '375.00');
 
-    // Left Dimension Chain (x = -8 cm)
-    const leftX = -8;
-    drawVertDim(leftX, 0, 120, '120.00');
-    drawVertDim(leftX, 120, 220, '100.00');
-    drawVertDim(leftX - 10, 0, 220, '220.00');
+    // Left chain: 140 + 80 = 220
+    drawVertDim(-8, 0, 140, '140.00');
+    drawVertDim(-8, 140, 220, '80.00');
+    drawVertDim(-18, 0, 220, '220.00');
 
-    // Middle Box Dimensions (y = 40..80, x = 165..245)
+    // Right chain: 110 + 55 + 55
+    drawVertDim(383, 110, 220, '110.00', false);
+    drawVertDim(370, 110, 165, '55.00', false);
+    drawVertDim(370, 50, 110, '60.00', false);
+
+    // Middle box and hexagon dimensions
     drawHorizDim(165, 245, 34, '80.00');
     drawVertDim(160, 40, 80, '40.00');
-    drawVertDim(160, 80, 120, '40.00');
+    drawHorizDim(292.5, 327.5, 130, '35.00');
+    drawVertDim(350, 110, 165, '55.00', false);
 
-    // Hexagon Dimensions
-    drawHorizDim(292.5, 327.5, 134, '35.00');
-    drawVertDim(350, 120, 170, '50.00', false);
-    drawVertDim(382, 120, 220, '100.00', false);
-
-    // Bottom Dimension Chain (y = 228 cm)
+    // Bottom chain: 55/40/55/95/100/30
     const botY = 228;
     drawHorizDim(0, 55, botY, '55.00', false);
     drawHorizDim(55, 95, botY, '40.00', false);

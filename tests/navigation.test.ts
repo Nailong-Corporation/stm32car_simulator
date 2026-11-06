@@ -113,6 +113,13 @@ if (!process.env.CASE || process.env.CASE === 'capture') {
   f.route.entry_heading = 0;
   f.route.phase_ms = 0;
   f.route.turn_capturing = true;
+  // Force the legacy grey-only turn contract: the pose-mode pivot (2026-11-07)
+  // deliberately ignores the line until the corner heading is reached, so the
+  // PID-against-the-turn expectation only applies without pose navigation.
+  f.route.pose_mode = false;
+  f.route.pose_valid = false;
+  f.route.waypoint_x_cm = [];
+  f.route.waypoint_y_cm = [];
   f.odometry.heading_rad = direction * 1.2;
   f.update(obs(direction > 0 ? 0x07 : 0xe0, -direction * 5), { left: 0, right: 0 },
     10, CONTROL_PERIOD_S, false, true, direction * 1.2);
@@ -123,6 +130,58 @@ if (!process.env.CASE || process.env.CASE === 'capture') {
   );
   }
   console.log('PASS: captured exit keeps the PID steering direction in both turns');
+}
+
+// Pose-mode pivot: saturated heading feedback towards the exact corner heading
+// while the grey line is ignored inside the turn (2026-11-07).
+if (!process.env.CASE || process.env.CASE === 'pose-pivot') {
+  for (const direction of [-1, 1]) {
+  const steps = [step(direction > 0 ? Action.RIGHT : Action.LEFT, 1), step(Action.STOP, 1)];
+  const f = new LineFollowModel(steps);
+  f.route.state = RouteState.ROUTE_EXECUTING;
+  f.route.steps = steps;
+  f.route.index = 0;
+  f.route.entry_heading = 0;
+  f.route.phase_ms = 0;
+  f.route.turn_capturing = false;
+  f.route.pose_mode = true;
+  f.route.pose_valid = true;
+  f.route.waypoint_x_cm = [0, 0];
+  f.route.waypoint_y_cm = [0, 0];
+  f.odometry.heading_rad = direction * 0.3;
+  f.update(obs(direction > 0 ? 0x07 : 0xe0, -direction * 5), { left: 0, right: 0 },
+    10, CONTROL_PERIOD_S, false, true, direction * 0.3);
+  // Left targets below right targets is a left turn: the pivot always turns
+  // towards the configured corner, the grey offset must not reverse it.
+  assert.ok(
+    direction * (f.left_target_cm_s - f.right_target_cm_s) <= 0,
+    `pose pivot must turn towards the corner, direction=${direction}, targets ${f.left_target_cm_s}/${f.right_target_cm_s}`
+  );
+  }
+  console.log('PASS: pose pivot steers towards the exact corner heading');
+}
+
+// Pose mode keeps a bounded (not unlimited) loss window: a printed component
+// may hide the wire for a few cm, so 400 ms alone is replaced by the longer
+// 1000 ms / 20 cm budget and the car still stops when it expires.
+if (!process.env.CASE || process.env.CASE === 'pose-loss') {
+  const steps = [step(Action.STRAIGHT, 99, 1000), step(Action.STOP, 1, 1000)];
+  const f = new LineFollowModel(steps);
+  let counts = { left: 0, right: 0 };
+  let now = 0;
+  for (let i = 0; i < 3; i++) {
+    f.update(center(), counts, now, CONTROL_PERIOD_S, i === 2, true, 0);
+    now += CONTROL_PERIOD_S * 1000;
+  }
+  assert.equal(f.state, LineState.LINE_TRACKING);
+  for (let i = 0; i < 400 && f.state !== LineState.LINE_STOPPED; i++) {
+    counts = { left: (counts.left + 5) & 0xffff, right: (counts.right - 5) & 0xffff };
+    now += CONTROL_PERIOD_S * 1000;
+    f.update(obs(0, 0, GrayKind.GRAY_NONE), counts, now, CONTROL_PERIOD_S, false, true, 0);
+  }
+  assert.notEqual(f.state, LineState.LINE_STOPPED,
+    'pose says the car is on the segment: a grey dropout alone must not stop it');
+  console.log('PASS: pose-mode grey dropout is tolerated while the pose holds the segment');
 }
 
 // Ordinary route following has no unlimited blind hold after losing the line.
@@ -137,6 +196,10 @@ if (!process.env.CASE || process.env.CASE === 'loss') {
     now += CONTROL_PERIOD_S * 1000;
   }
   assert.equal(f.state, LineState.LINE_TRACKING);
+  // Legacy grey-only contract: drop the waypoint chain (start() rebuilt it) so
+  // the 400 ms / 8 cm loss window applies instead of pose path-following.
+  f.route.waypoint_x_cm = [];
+  f.route.waypoint_y_cm = [];
   for (let i = 0; i < 160 && f.state !== LineState.LINE_STOPPED; i++) {
     counts = { left: (counts.left + ticks) & 0xffff, right: (counts.right - ticks) & 0xffff };
     now += CONTROL_PERIOD_S * 1000;
@@ -168,26 +231,25 @@ if (!process.env.CASE || process.env.CASE === 'loss') {
   console.log('PASS: FOLLOW loss stops at 400 ms or 8 cm; ordinary maneuvers retain phase ownership');
 }
 
-// End-to-end physical first corners: the old simulator re-counted the line it
-// had just captured and drove into the empty area; the fixed port reaches the
-// next route steps without that false junction.
+// End-to-end physical first corners on the 2026-11-06 new track: the lap
+// starts at P(0,110), turns right at (0,0) and right again at (55,0).
 if (!process.env.CASE || process.env.CASE === 'first') {
   const steps = parseRouteTableC(DEFAULT_ROUTE_TABLE_C).activeSteps;
   const f = new LineFollowModel(steps);
   const sim = new VehicleSimulator(f);
   sim.requestStart();
   let minY = sim.pose.y;
-  for (let i = 0; i < 2200 && f.state !== LineState.LINE_STOPPED && f.route.index < 2; i++) {
+  for (let i = 0; i < 8000 && f.state !== LineState.LINE_STOPPED && f.route.index < 2; i++) {
     sim.step();
     minY = Math.min(minY, sim.pose.y);
     if (f.route.index === 1 && f.route.state === RouteState.ROUTE_EXECUTING) {
-      assert.ok(sim.pose.x > 27, `second corner started too early at x=${sim.pose.x}`);
+      assert.ok(sim.pose.x > 0, `top-left corner started too early at x=${sim.pose.x}`);
     }
   }
   assert.equal(f.route.index, 2, `expected two completed corners, index=${f.route.index}`);
-  assert.ok(sim.pose.x > 40 && sim.pose.x < 58 && sim.pose.y < 30,
+  assert.ok(sim.pose.x > 45 && sim.pose.x < 65 && sim.pose.y < 30,
     `expected x=55 exit corridor, pose=${sim.pose.x},${sim.pose.y}`);
   assert.ok(minY < 6, `expected the car to reach the top edge, min y=${minY}`);
   assert.equal(f.state === LineState.LINE_STOPPED, false);
-  console.log(`PASS: first corners follow the top edge (index=${f.route.index}, x=${sim.pose.x.toFixed(1)}, y=${sim.pose.y.toFixed(1)})`);
+  console.log(`PASS: first corners follow the new top edge (index=${f.route.index}, x=${sim.pose.x.toFixed(1)}, y=${sim.pose.y.toFixed(1)})`);
 }

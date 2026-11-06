@@ -76,6 +76,12 @@ export function grayClassify(
 
   let selected = 0;
   if (result.region_count > 1) {
+    // Printed hollow component / plate gap: two outer groups with an empty
+    // centre cannot be resolved into one line; keep it ambiguous so the line
+    // follower holds heading across the printed symbol instead of chasing an edge.
+    if ((line_mask & 0x18) === 0 && (line_mask & 0x03) !== 0 && (line_mask & 0xc0) !== 0) {
+      return result;
+    }
     if (!have_previous || !Number.isFinite(previous)) return result;
     let best = 100.0;
     let second = 100.0;

@@ -20,6 +20,7 @@ export interface RouteStep {
   angle_deg: number;       /* CUSTOM_TURN / HEXAGON: clockwise positive, unwrapped */
   corner_arc_enabled: boolean;
   segment_length_cm: number; /* START / previous action completion -> target; 0 means unknown */
+  short_link_cm?: number; /* Explicit full corner spacing; 0/omitted disables dead reckoning. */
   comment?: string;        /* Associated comment in route_table.c */
   rawLine?: string;
 }
@@ -96,6 +97,20 @@ export interface HexagonNavigation {
   use_line: boolean;
   center_pending: boolean;
   exit_armed: boolean;
+  /* Pose-mode polygon drive (2026-11-06): target heading of the current
+   * inside-ring leg, whether the axle is pivoting, how many of the 7 ring
+   * turns are done, and the world coordinates of the next vertex. */
+  target_heading: number;
+  turning: boolean;
+  turn_index: number;
+  vertex_x_cm: number;
+  vertex_y_cm: number;
+  leg_start_cm: number;
+  /* Inside-ring leg line (from the vertex just passed to the next one) and the
+   * pose cross-track error against it, for the blind stretches beyond the bar. */
+  leg_from_x_cm: number;
+  leg_from_y_cm: number;
+  cross_cm: number;
 }
 
 export enum GrayKind {

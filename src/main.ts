@@ -95,7 +95,7 @@ class App {
     if (!select) return;
 
     select.innerHTML = '';
-    this.parseResult.schemes.forEach((sc) => {
+    this.parseResult.schemes.filter((sc) => sc.steps.length > 0).forEach((sc) => {
       const opt = document.createElement('option');
       opt.value = sc.id.toString();
       opt.textContent = `${sc.name} (${sc.steps.length}步)`;
