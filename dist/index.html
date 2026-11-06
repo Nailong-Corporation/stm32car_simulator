@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>STM32 智能循迹小车 - 赛道与路径规划仿真器</title>
+    <script type="module" crossorigin src="/assets/index-BgoP-ILh.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DK2pyUvS.css">
+  </head>
+  <body>
+    <div id="app">
+      <!-- Fullscreen Simulation Canvas -->
+      <canvas id="simCanvas"></canvas>
+
+      <!-- Top Header Navigation Bar -->
+      <header class="top-nav">
+        <div class="nav-left">
+          <div class="brand">
+            <span class="brand-icon">🏎️</span>
+            <div class="brand-text">
+              <h1>STM32 智能小车赛道仿真器</h1>
+              <span class="subtitle">PlatformIO car_stm32 算法 1:1 高保真仿真</span>
+            </div>
+          </div>
+
+          <div class="status-pill" id="simStatusPill">
+            <span class="status-dot"></span>
+            <span class="status-text">就绪 (READY)</span>
+          </div>
+        </div>
+
+        <div class="nav-center">
+          <div class="scheme-selector-wrapper">
+            <label for="schemeSelect">路径方案：</label>
+            <select id="schemeSelect">
+              <option value="1">方案 1 (正式全元件: 走虚线+环岛 - 30步)</option>
+              <option value="2">方案 2 (不走虚线，走环岛 - 30步)</option>
+              <option value="3">方案 3 (走虚线，不走环岛 - 25步)</option>
+              <option value="0">方案 0 (基础调试用赛道 - 4步)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="nav-right">
+          <!-- Upload route_table.c Button -->
+          <button class="btn btn-primary" id="btnUploadRoute">
+            <span class="icon">📁</span>
+            <span>上传 route_table.c</span>
+          </button>
+          <input type="file" id="fileInput" accept=".c,.h,.txt" style="display: none" />
+
+          <button class="btn btn-secondary" id="btnViewRouteTable">
+            <span class="icon">📋</span>
+            <span>路径详情</span>
+          </button>
+
+          <button class="btn btn-secondary" id="btnFitViewport" title="铺满当前屏幕">
+            <span class="icon">⛶</span>
+            <span>画面铺满</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- Bottom Floating Control & Playback Bar -->
+      <div class="floating-playback-bar">
+        <button class="play-btn" id="btnPlayPause" title="运行 / 暂停 (空格键)">
+          <span class="icon" id="playIcon">▶</span>
+        </button>
+
+        <button class="ctrl-btn" id="btnStep" title="单步推进一步 (5ms)">
+          <span class="icon">⏭</span>
+          <span>单步</span>
+        </button>
+
+        <button class="ctrl-btn" id="btnReset" title="复位回到起点 P(0,120)">
+          <span class="icon">↺</span>
+          <span>复位</span>
+        </button>
+
+        <div class="divider"></div>
+
+        <div class="speed-control">
+          <span class="label">倍速：</span>
+          <div class="speed-buttons" id="speedButtons">
+            <button class="speed-btn" data-speed="0.2">0.2x</button>
+            <button class="speed-btn" data-speed="0.5">0.5x</button>
+            <button class="speed-btn active" data-speed="1.0">1.0x</button>
+            <button class="speed-btn" data-speed="2.0">2.0x</button>
+            <button class="speed-btn" data-speed="5.0">5.0x</button>
+            <button class="speed-btn" data-speed="10.0">10x</button>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="toggle-group">
+          <label class="toggle-label" title="跟随小车移动视野">
+            <input type="checkbox" id="chkFollowCar" />
+            <span>视角跟随</span>
+          </label>
+          <label class="toggle-label" title="显示图纸尺寸标注">
+            <input type="checkbox" id="chkDimensions" checked />
+            <span>尺寸标注</span>
+          </label>
+          <label class="toggle-label" title="显示电路元件代号">
+            <input type="checkbox" id="chkComponents" checked />
+            <span>元件标记</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Left Telemetry & HUD Panel -->
+      <div class="hud-panel left-hud" id="leftHud">
+        <div class="hud-header">
+          <span class="hud-title">实时状态 & 传感器遥测</span>
+          <button class="hud-toggle-btn" id="btnToggleHud">− </button>
+        </div>
+
+        <div class="hud-content">
+          <!-- 8-Channel Gray Sensor Array Visualization -->
+          <div class="sensor-section">
+            <div class="section-label">前置 8 路灰度传感器 (S0..S7)</div>
+            <div class="sensor-array" id="sensorArray">
+              <!-- Rendered via JS -->
+            </div>
+            <div class="sensor-metrics">
+              <div class="metric-row">
+                <span>位置偏差 (Position):</span>
+                <span class="val highlight" id="valSensorPos">0.00</span>
+              </div>
+              <div class="metric-row">
+                <span>观测分类 (Kind):</span>
+                <span class="val" id="valSensorKind">VALID</span>
+              </div>
+              <div class="metric-row">
+                <span>白线掩码 (Line Mask):</span>
+                <span class="val mono" id="valLineMask">0x18 (00011000)</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="divider"></div>
+
+          <!-- Vehicle Motion Telemetry -->
+          <div class="telemetry-section">
+            <div class="section-label">小车运动学 & 控制输出</div>
+            <div class="metrics-grid">
+              <div class="grid-card">
+                <span class="card-label">线速度 (Linear)</span>
+                <span class="card-val" id="valSpeedLinear">0.0 <small>cm/s</small></span>
+              </div>
+              <div class="grid-card">
+                <span class="card-label">目标航速 (Cruise)</span>
+                <span class="card-val" id="valSpeedTarget">60 <small>cm/s</small></span>
+              </div>
+              <div class="grid-card">
+                <span class="card-label">左轮速度</span>
+                <span class="card-val" id="valSpeedLeft">0.0 <small>cm/s</small></span>
+              </div>
+              <div class="grid-card">
+                <span class="card-label">右轮速度</span>
+                <span class="card-val" id="valSpeedRight">0.0 <small>cm/s</small></span>
+              </div>
+              <div class="grid-card">
+                <span class="card-label">左轮 PWM</span>
+                <span class="card-val" id="valPwmLeft">0 <small>/ 255</small></span>
+              </div>
+              <div class="grid-card">
+                <span class="card-label">右轮 PWM</span>
+                <span class="card-val" id="valPwmRight">0 <small>/ 255</small></span>
+              </div>
+            </div>
+
+            <div class="metric-row">
+              <span>坐标 (X, Y):</span>
+              <span class="val mono" id="valCarCoords">(0.0, 120.0) cm</span>
+            </div>
+            <div class="metric-row">
+              <span>航向角 (Yaw):</span>
+              <span class="val" id="valCarHeading">0.0° (-90.0° 北)</span>
+            </div>
+            <div class="metric-row">
+              <span>总行驶里程 (Distance):</span>
+              <span class="val" id="valCarDistance">0.0 cm</span>
+            </div>
+            <div class="metric-row">
+              <span>仿真用时 (Time):</span>
+              <span class="val" id="valSimTime">0.000 s</span>
+            </div>
+          </div>
+
+          <div class="divider"></div>
+
+          <!-- Route Planner Status -->
+          <div class="route-status-section">
+            <div class="section-label">路径规划状态 (Route FSM)</div>
+            <div class="metric-row">
+              <span>当前规划步 (Step):</span>
+              <span class="val highlight" id="valCurrentStepIndex">第 0 / 30 步</span>
+            </div>
+            <div class="metric-row">
+              <span>动作 (Action):</span>
+              <span class="val highlight" id="valCurrentAction">CUSTOM_TURN (90°)</span>
+            </div>
+            <div class="metric-row">
+              <span>路径状态 (State):</span>
+              <span class="val badge" id="valRouteState">ROUTE_FOLLOW</span>
+            </div>
+            <div class="metric-row">
+              <span>环岛状态 (Hexagon):</span>
+              <span class="val" id="valHexState">HEXAGON_OFF</span>
+            </div>
+            <div class="metric-row">
+              <span>路口识别计数 (Junctions):</span>
+              <span class="val" id="valJunctionsSeen">0 / 1</span>
+            </div>
+            <div class="metric-row" id="rowStepComment">
+              <span>阶段说明:</span>
+              <span class="val step-comment" id="valStepComment">向北直行至左上角</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Route Table Modal Drawer -->
+      <div class="modal-backdrop" id="modalBackdrop" style="display: none">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h2>route_table.c 路径规划表</h2>
+            <button class="close-btn" id="btnCloseModal">✕</button>
+          </div>
+          <div class="modal-body">
+            <div class="modal-toolbar">
+              <div class="active-scheme-info">
+                <span>当前加载：</span>
+                <strong id="modalSchemeName">方案 1 (正式赛道全元件)</strong>
+                <span class="badge" id="modalStepCount">共 30 步</span>
+              </div>
+              <div class="modal-actions">
+                <button class="btn btn-secondary btn-sm" id="btnReplaceFile">
+                  <span>重新上传文件</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Steps Table -->
+            <div class="table-container">
+              <table class="route-table" id="routeStepsTable">
+                <thead>
+                  <tr>
+                    <th>序号</th>
+                    <th>路口上限</th>
+                    <th>转弯限速</th>
+                    <th>规划动作</th>
+                    <th>巡航航速</th>
+                    <th>转向角度</th>
+                    <th>圆弧</th>
+                    <th>总段长度</th>
+                    <th>动作备注 & 途经元件</th>
+                  </tr>
+                </thead>
+                <tbody id="routeTableBody">
+                  <!-- Generated by JS -->
+                </tbody>
+              </table>
+            </div>
+
+            <!-- Source Code Viewer / Editor -->
+            <div class="code-viewer-container">
+              <div class="code-header">
+                <span>源文件代码 (route_table.c):</span>
+                <span class="code-badge">只读解析预览</span>
+              </div>
+              <pre><code id="sourceCodeViewer"></code></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Upload Modal / Drag-and-drop overlay -->
+      <div class="drag-overlay" id="dragOverlay" style="display: none">
+        <div class="drag-box">
+          <span class="drag-icon">📥</span>
+          <h3>松开鼠标以上传 route_table.c</h3>
+          <p>支持将 .c / .h / 文本文件直接拖入仿真器</p>
+        </div>
+      </div>
+    </div>
+
+  </body>
+</html>
