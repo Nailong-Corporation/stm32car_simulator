@@ -21,6 +21,11 @@ export const GRAY_FORWARD_OFFSET_CM = 24.0;
 
 export const CORNER_RADIUS_CM = 24.0;
 export const CORNER_HEADING_KP = 8.0;
+/* Conservative coasting deceleration used to size the pre-corner slow window
+ * (motion_config.h CORNER_ENTRY_DECEL_CM_S2).  The passive braking planner still
+ * uses BRAKING_SAFE_DECEL_CM_S2 for its envelope; this one only decides when
+ * the approach starts slowing. */
+export const CORNER_ENTRY_DECEL_CM_S2 = 100.0;
 
 /* Rolling corner (2026-11-08 prototype): instead of braking to the settle speed
  * and pivoting around the inner wheel, an ordinary 90 degree corner is a single
@@ -36,8 +41,8 @@ export const CORNER_HEADING_KP = 8.0;
  * the simulator and the firmware build the same constants. */
 export const CORNER_ARC_RADIUS_CM = 13.0;
 /* Axle centre speed through the arc (cm/s). The outer wheel runs at
- * v*(1 + track/(2*R)) = 1.47v at R=15, track=14. */
-export const CORNER_ARC_SPEED_CM_S = 70.0;
+ * v*(1 + track/(2*R)) = 1.538v at R=13, track=14. */
+export const CORNER_ARC_SPEED_CM_S = 60.0;
 /* Differential (cm/s) per rad of heading error against the arc tangent. */
 export const CORNER_ARC_HEADING_KP = 22.0;
 /* The outgoing leg must leave room for the exit tangent point (R past the
@@ -52,9 +57,9 @@ export const CORNER_ARC_ENTER_TOL_CM = 0.5;
 export const CORNER_ARC_EXIT_LEAD_S = 0.05;
 /* Pose exit: heading within this residual of the corner angle AND the axle
  * within this distance of the exit tangent point. */
-export const CORNER_ARC_EXIT_ALONG_TOL_CM = 6.0;
+export const CORNER_ARC_EXIT_ALONG_TOL_CM = 8.0;
 export const CORNER_ARC_EXIT_ANGLE_RAD = 0.05;
-export const CORNER_ARC_EXIT_TOL_CM = 3.0;
+export const CORNER_ARC_EXIT_TOL_CM = 8.0;
 /* Angular progress (rad) that also counts as reaching the exit tangent. */
 export const CORNER_ARC_EXIT_PROGRESS_RAD = 0.06;
 /* Yaw-rate damping applied while a rolling corner's differential unwinds
@@ -65,11 +70,15 @@ export const CORNER_ARC_EXIT_DAMPING = 2.5;
 export const CORNER_ARC_DIFF_SLEW_CM_S2 = 900.0;
 export const LEFT_COUNTS_PER_WHEEL_REV = 780.0;
 export const RIGHT_COUNTS_PER_WHEEL_REV = 780.0;
-/* MG310 1:10 gearbox (2026-11-07): the encoder sits on the motor shaft, so a
- * wheel revolution now yields half the quadrature counts (1560 -> 780); the
- * distance scale halves with it so distance-per-count is unchanged. */
-export const ODOMETRY_DISTANCE_SCALE = 1.525;
-export const ODOMETRY_HEADING_SCALE = 0.77;
+/* Encoder polarity after the 2026-11-09 motor wiring swap (motion_config.h
+ * ENCODER_LEFT_SIGN / ENCODER_RIGHT_SIGN).  The simulator feeds the same raw
+ * counter bits into the C controller, so it must use the same signs. */
+export const ENCODER_LEFT_SIGN = -1;
+export const ENCODER_RIGHT_SIGN = 1;
+/* Calibration factors from motion_config.h: 780 counts already include the
+ * gearbox and TI12 4x decoding, so the distance scale is 0.95, not 1.525. */
+export const ODOMETRY_DISTANCE_SCALE = 0.95;
+export const ODOMETRY_HEADING_SCALE = 0.641;
 
 export const VEHICLE_MAX_SPEED_CM_S = 500.0;
 export const ODOMETRY_MAX_SPEED_CM_S = 650.0;
@@ -77,7 +86,7 @@ export const SPEED_FILTER_TAU_S = 0.030;
 export const WHEEL_TARGET_MAX_CM_S = 500.0;
 
 /* Speed PID Inner Loop */
-export const SPEED_KP = 2.0;
+export const SPEED_KP = 1.2;
 export const SPEED_KI = 8.0;
 export const SPEED_KD = 0.0;
 export const SPEED_INTEGRAL_LIMIT = 10.0;

@@ -166,7 +166,7 @@ export class VehicleSimulator {
     const obs: GrayObservation = graySensorUpdate(
       this.gray_sensor,
       raw_mask,
-      this.follow.have_reliable,
+      this.follow.haveRecentPosition(this.sim_time_ms),
       this.follow.reliable_position
     );
 

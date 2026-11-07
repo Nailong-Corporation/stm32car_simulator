@@ -100,8 +100,8 @@ if (!process.env.CASE || process.env.CASE === 'smooth') {
   console.log('PASS: smooth center+branch drift is not a second junction in either lateral direction');
 }
 
-// A visible captured exit must let the position PID steer against the turn;
-// the old unconditional minimum-turn bias inverted this correction.
+// An early visible exit cannot steal the remaining angle. At full net yaw the
+// maneuver holds the exit heading until three new center frames recover the line.
 if (!process.env.CASE || process.env.CASE === 'capture') {
   for (const direction of [-1, 1]) {
   const steps = [step(direction > 0 ? Action.RIGHT : Action.LEFT, 1), step(Action.STOP, 1)];
@@ -112,10 +112,9 @@ if (!process.env.CASE || process.env.CASE === 'capture') {
   f.route.index = 0;
   f.route.entry_heading = 0;
   f.route.phase_ms = 0;
-  f.route.turn_capturing = true;
-  // Force the legacy grey-only turn contract: the pose-mode pivot (2026-11-07)
-  // deliberately ignores the line until the corner heading is reached, so the
-  // PID-against-the-turn expectation only applies without pose navigation.
+  f.route.turn_capturing = false;
+  // Exercise the gray-only path too: it shares the full-angle gate with pose
+  // navigation, including when an early exit line would steer against the turn.
   f.route.pose_mode = false;
   f.route.pose_valid = false;
   f.route.waypoint_x_cm = [];
@@ -123,13 +122,39 @@ if (!process.env.CASE || process.env.CASE === 'capture') {
   f.odometry.heading_rad = direction * 1.2;
   f.update(obs(direction > 0 ? 0x07 : 0xe0, -direction * 5), { left: 0, right: 0 },
     10, CONTROL_PERIOD_S, false, true, direction * 1.2);
-  assert.equal(f.route.turn_capturing, true);
+  assert.equal(f.route.turn_capturing, false);
+  assert.equal(f.route.state, RouteState.ROUTE_EXECUTING);
+  assert.equal(f.route.index, 0);
   assert.ok(
-    direction * (f.left_target_cm_s - f.right_target_cm_s) < 0,
-    `captured exit must allow opposite steering, direction=${direction}, targets ${f.left_target_cm_s}/${f.right_target_cm_s}`
+    direction * (f.left_target_cm_s - f.right_target_cm_s) > 0,
+    `early exit must preserve the remaining turn, direction=${direction}, targets ${f.left_target_cm_s}/${f.right_target_cm_s}`
   );
+  const target = f.route.turnTargetRad();
+  // Start the exit check with stationary yaw, so the damping term is zero.
+  f.odometry.heading_rad = target;
+  f.turn_yaw_rate_rad_s = 0;
+  let now = 10;
+  const feedExit = (o: GrayObservation) => {
+    now += CONTROL_PERIOD_S * 1000;
+    f.update(o, { left: 0, right: 0 }, now, CONTROL_PERIOD_S, false, true, target);
+  };
+  feedExit(obs(0, 0, GrayKind.GRAY_NONE));
+  assert.equal(f.route.state, RouteState.ROUTE_CLEARING);
+  assert.equal(f.route.turn_exit_search, true);
+  assert.equal(f.route.line_exit_confirmed, false);
+  assert.ok(f.left_target_cm_s > 0 && f.right_target_cm_s > 0);
+  assert.ok(Math.max(f.left_target_cm_s, f.right_target_cm_s) <= 16,
+    'full-angle search must move forward at its low speed cap');
+  assert.ok(Math.abs(f.left_target_cm_s - f.right_target_cm_s) < 1e-9,
+    'at the exit heading, wireless search must command straight motion');
+  feedExit(center()); feedExit(center());
+  assert.equal(f.route.turn_exit_search, true, 'two centered samples cannot end the search');
+  feedExit(center());
+  assert.equal(f.route.turn_exit_search, false);
+  assert.equal(f.route.line_exit_confirmed, true);
+  assert.equal(f.route.index, 0, 'line recovery must precede normal clearance');
   }
-  console.log('PASS: captured exit keeps the PID steering direction in both turns');
+  console.log('PASS: early exit preserves both turn directions; full-angle search recovers after three center frames');
 }
 
 // Pose-mode pivot: saturated heading feedback towards the exact corner heading
@@ -161,9 +186,9 @@ if (!process.env.CASE || process.env.CASE === 'pose-pivot') {
   console.log('PASS: pose pivot steers towards the exact corner heading');
 }
 
-// Pose mode keeps a bounded (not unlimited) loss window: a printed component
-// may hide the wire for a few cm, so 400 ms alone is replaced by the longer
-// 1000 ms / 20 cm budget and the car still stops when it expires.
+// 2026-11-07 hardware sync: pose mode only widens the loss window for a
+// latched printed-component crossing. A plain grey dropout is a real line loss
+// and immediately returns to the 400 ms / 8 cm cut-off.
 if (!process.env.CASE || process.env.CASE === 'pose-loss') {
   const steps = [step(Action.STRAIGHT, 99, 1000), step(Action.STOP, 1, 1000)];
   const f = new LineFollowModel(steps);
@@ -175,13 +200,17 @@ if (!process.env.CASE || process.env.CASE === 'pose-loss') {
   }
   assert.equal(f.state, LineState.LINE_TRACKING);
   for (let i = 0; i < 400 && f.state !== LineState.LINE_STOPPED; i++) {
-    counts = { left: (counts.left + 5) & 0xffff, right: (counts.right - 5) & 0xffff };
+    // Firmware 2026-11-09 signs: forward left = -counts, forward right = +counts.
+    counts = { left: (counts.left - 1) & 0xffff, right: (counts.right + 1) & 0xffff };
     now += CONTROL_PERIOD_S * 1000;
     f.update(obs(0, 0, GrayKind.GRAY_NONE), counts, now, CONTROL_PERIOD_S, false, true, 0);
   }
-  assert.notEqual(f.state, LineState.LINE_STOPPED,
-    'pose says the car is on the segment: a grey dropout alone must not stop it');
-  console.log('PASS: pose-mode grey dropout is tolerated while the pose holds the segment');
+  assert.equal(f.state, LineState.LINE_STOPPED,
+    'a plain dropout must not be hidden by pose dead-reckoning');
+  assert.equal(f.stop_reason, LineStopReason.LINE_STOP_LOST);
+  assert.equal(now, 410, 'plain loss keeps the 400 ms cut-off even in pose mode');
+  assert.ok(f.odometry.distance_cm < 8);
+  console.log('PASS: pose mode no longer extends a plain grey dropout');
 }
 
 // Ordinary route following has no unlimited blind hold after losing the line.
@@ -201,7 +230,8 @@ if (!process.env.CASE || process.env.CASE === 'loss') {
   f.route.waypoint_x_cm = [];
   f.route.waypoint_y_cm = [];
   for (let i = 0; i < 160 && f.state !== LineState.LINE_STOPPED; i++) {
-    counts = { left: (counts.left + ticks) & 0xffff, right: (counts.right - ticks) & 0xffff };
+    // Firmware 2026-11-09 signs: forward left = -counts, forward right = +counts.
+    counts = { left: (counts.left - ticks) & 0xffff, right: (counts.right + ticks) & 0xffff };
     now += CONTROL_PERIOD_S * 1000;
     f.update(obs(0, 0, GrayKind.GRAY_NONE), counts, now, CONTROL_PERIOD_S, false, true, 0);
   }

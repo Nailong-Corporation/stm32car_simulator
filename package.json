@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "node tests/run.mjs"
+    "test": "node tests/run.mjs",
+    "parity": "node tests/firmware_parity.mjs",
+    "parity:legacy": "PARITY_POSE_NAV=0 node tests/firmware_parity.mjs"
   },
   "devDependencies": {
     "typescript": "^5.0.0",

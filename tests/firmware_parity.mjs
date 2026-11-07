@@ -6,6 +6,10 @@ import { join } from 'node:path';
 import assert from 'node:assert/strict';
 
 const firmware = process.env.FW_DIR ?? new URL('../../PlatformIO/Projects/car_stm32/', import.meta.url).pathname;
+/* PARITY_POSE_NAV=0 builds the firmware's legacy grey-only controller
+ * (POSE_NAV_ENABLED=0) and disables pose navigation in the simulator. It also
+ * includes scheme 0, the four-step debug table. */
+const poseNav = process.env.PARITY_POSE_NAV !== '0';
 const temp = mkdtempSync(join(tmpdir(), 'car-parity-'));
 const server = await createServer({server:{middlewareMode:true},logLevel:'error',optimizeDeps:{noDiscovery:true,include:[]}});
 try {
@@ -15,16 +19,18 @@ try {
   const {LineState,RouteState} = await server.ssrLoadModule('/src/sim/types.ts');
   const tableC = process.env.ROUTE_TABLE_C ?? join(firmware,'src/route_table.c');
   const schemes=parseRouteTableC(readFileSync(tableC,'utf8')).schemes;
-  for(const scheme of schemes.filter(s=>s.id>0)) {
+  for(const scheme of schemes.filter(s=>poseNav ? s.id>0 : true)) {
     const executable=join(temp,`controller-${scheme.id}`);
+    const defines=poseNav ? [] : ['-DPOSE_NAV_ENABLED=0'];
     const compile=spawnSync('cc',['-std=c11','-Wall','-Wextra','-Werror','-pedantic',
-      '-I'+join(firmware,'include'),'-DROUTE_SCHEME_SELECT='+scheme.id,
+      '-I'+join(firmware,'include'),'-DROUTE_SCHEME_SELECT='+scheme.id,...defines,
       ...['test/replay_controller.c','src/route_table.c','src/line_follow.c','src/route.c',
       'src/gray_sensor.c','src/pid.c','src/odometry.c','src/braking_planner.c','src/speed_control.c'].map(p=>join(firmware,p)),
       '-lm','-o',executable],{encoding:'utf8'});
     assert.equal(compile.status,0,compile.stderr);
     const f=new LineFollowModel(scheme.steps), sim=new VehicleSimulator(f);
     f.route.repeat_count=1;
+    if(!poseNav) f.route.pose_enabled=false;
     const inputs=[], expected=[];
     const original=f.update.bind(f);
     f.update=(o,c,now,dt,start,valid,heading)=>{

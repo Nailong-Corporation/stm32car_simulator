@@ -29,6 +29,7 @@ import {
   POSITION_CURVE_SLOWDOWN,
   LINE_CONFIRM_SAMPLES,
   INTERFERENCE_TIMEOUT_MS,
+  CONTROL_MAX_INTERVAL_MS,
   INTERFERENCE_MAX_DISTANCE_CM,
   COMPONENT_CROSS_MAX_CM,
   COMPONENT_CROSS_MS,
@@ -63,6 +64,7 @@ import {
   NAVIGATION_RECOVERY_SPEED_CM_S,
   CORNER_RADIUS_CM,
   CORNER_HEADING_KP,
+  CORNER_ENTRY_DECEL_CM_S2,
   CORNER_ARC_RADIUS_CM,
   CORNER_ARC_SPEED_CM_S,
   CORNER_ARC_HEADING_KP,
@@ -77,6 +79,7 @@ import {
   ROUTE_WAYPOINT_SLOW_CM,
   JUNCTION_POSE_GRAY_SPREAD,
   JUNCTION_CENTER_LIMIT,
+  JUNCTION_STRAIGHT_EXIT_MAX_WIDTH,
   JUNCTION_CROSS_KP,
   POSE_PURSUIT_LOOKAHEAD_CM,
   POSE_GRAY_TRIM,
@@ -87,11 +90,13 @@ import { OdometryModel, defaultOdometryCalibration } from './odometry';
 import { RoutePlannerModel, routeIsNarrowLine, routeIsClearLine } from './route';
 import { SpeedControlModel } from './speed_control';
 import { Pid } from './pid';
+import { grayIsParallelPair } from './gray_sensor';
 import { BrakingSlewModel, brakingPlan, brakingDecide, brakingSlew } from './braking_planner';
 
 /** True while the grayscale pattern matches a printed component symbol
  * (hollow resistor interior / symmetric wide graphic band). */
 export function grayIsComponentPattern(o: GrayObservation): boolean {
+  if (grayIsParallelPair(o)) return false;
   if (
     o.region_count >= 2 &&
     (o.line_mask & 0x18) === 0 &&
@@ -349,6 +354,18 @@ export class LineFollowModel {
          (r.state === RouteState.ROUTE_EXECUTING && r.turn_approaching)));
   }
 
+  /** C line_follow_have_recent_position: a reliable sample decays after 400 ms. */
+  public haveRecentPosition(now_ms: number): boolean {
+    return this.have_reliable && now_ms - this.last_reliable_ms < INTERFERENCE_TIMEOUT_MS;
+  }
+
+  private lockedStop(): boolean {
+    return this.stop_reason === LineStopReason.LINE_STOP_FAULT ||
+      this.stop_reason === LineStopReason.LINE_STOP_ENCODER ||
+      this.stop_reason === LineStopReason.LINE_STOP_IMU ||
+      this.stop_reason === LineStopReason.LINE_STOP_TILT;
+  }
+
   public update(
     observation: GrayObservation,
     counts: EncoderCounts,
@@ -361,10 +378,32 @@ export class LineFollowModel {
     this.sample_ms = now_ms;
     this.observation = observation;
 
+    // Mirror line_follow.c input guards: an invalid sample is a latched fault,
+    // never a recovered reading.
+    if (
+      !Number.isFinite(dt) || dt <= 0 || dt > CONTROL_MAX_INTERVAL_MS / 1000 ||
+      (observation.kind !== GrayKind.GRAY_VALID &&
+        observation.kind !== GrayKind.GRAY_NONE &&
+        observation.kind !== GrayKind.GRAY_AMBIGUOUS) ||
+      (observation.kind === GrayKind.GRAY_VALID &&
+        (!Number.isFinite(observation.position) || Math.abs(observation.position) > 7.0))
+    ) {
+      this.stop(LineStopReason.LINE_STOP_FAULT);
+      return;
+    }
+
+    // IMU fallback latch: once the heading source degrades to the encoders it
+    // stays there (motion_config.h / line_follow.c).
+    let imu_usable = imu_valid && Number.isFinite(imu_heading_rad);
+    if (this.heading_source === HeadingSource.HEADING_IMU && !imu_usable) {
+      this.heading_source = HeadingSource.HEADING_ENCODER;
+    }
+    imu_usable = imu_usable && this.heading_source === HeadingSource.HEADING_IMU;
+
     const previous_heading = this.odometry.heading_rad;
     const previous_route = this.route.state;
 
-    if (!this.odometry.updateWithHeading(counts, dt, imu_valid, imu_heading_rad)) {
+    if (!this.odometry.updateWithHeading(counts, dt, imu_usable, imu_heading_rad)) {
       this.stop(LineStopReason.LINE_STOP_ENCODER);
       return;
     }
@@ -376,7 +415,7 @@ export class LineFollowModel {
     }
 
     const obs = observation;
-    const narrow = routeIsNarrowLine(obs);
+    const narrow = routeIsNarrowLine(obs) || grayIsParallelPair(obs);
 
     if (narrow) {
       if (this.valid_count < LINE_CONFIRM_SAMPLES) this.valid_count++;
@@ -387,7 +426,11 @@ export class LineFollowModel {
 
     if (this.state === LineState.LINE_IDLE || this.state === LineState.LINE_STOPPED) {
       if (start_request) {
-        if (!stable) {
+        if (this.lockedStop() || !stable || !routeIsNarrowLine(obs)) {
+          return;
+        }
+        if (!this.route.valid) {
+          this.stop(LineStopReason.LINE_STOP_ROUTE);
           return;
         }
         this.state = LineState.LINE_TRACKING;
@@ -410,24 +453,31 @@ export class LineFollowModel {
     }
 
 
-    // Route mode always bounds ordinary lost/ambiguous-line holding, even with
-    // LOST_LINE_STOP_ENABLED=0. Check before a late good sample can renew it.
-    // Printed component symbols (hollow resistors, transistor V, battery
-    // plates) latch a bounded straight-crossing window; a plain line loss keeps
-    // the 400 ms / 8 cm cut-off.
-    if (!this.abnormal) this.component_cross_latched = false;
-    else if (!this.component_cross_latched && grayIsComponentPattern(obs)) {
+    // Printed component graphics (hollow resistors, transistor V, battery
+    // plates) must be crossable. Latch the crossing window as soon as the
+    // component signature appears; while latched, hold-and-cross is allowed for
+    // a bounded distance/time. A real line loss or an unrelated ambiguity that
+    // was never preceded by a component signature keeps 400 ms / 8 cm.
+    // 2026-11-07 hardware: do not wait for `abnormal`. A one-sided resistor
+    // stroke (1-4 channels, position 3-6) already looks like a valid offset
+    // line; waiting lets the PID drag the car onto the artwork edge.
+    if (!this.component_cross_latched && grayIsComponentPattern(obs)) {
       this.component_cross_latched = true;
       this.component_cross_ms = now_ms;
       this.component_cross_cm = this.odometry.distance_cm;
     }
-    const component_crossing = this.abnormal && this.component_cross_latched &&
+    if (stable && (grayIsParallelPair(obs) ||
+      (routeIsNarrowLine(obs) && obs.white_count <= JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
+        Math.abs(obs.position) <= JUNCTION_CENTER_LIMIT))) this.component_cross_latched = false;
+    const component_visible = this.component_cross_latched &&
       now_ms - this.component_cross_ms < COMPONENT_CROSS_MS &&
       Math.abs(this.odometry.distance_cm - this.component_cross_cm) < COMPONENT_CROSS_MAX_CM;
+    const component_crossing = this.abnormal && component_visible;
     // Pose mode: a printed component hides the wire for up to ~10 cm along the
     // segment, and the pose says the car is still on that segment, so reuse the
     // bounded component-crossing window instead of the plain 400 ms / 8 cm cut.
-    const poseBoundedLoss = this.route.pose_mode &&
+    // A genuine line loss always returns to the plain cut-off.
+    const poseBoundedLoss = this.route.pose_mode && component_crossing &&
       (this.route.state === RouteState.ROUTE_FOLLOW ||
         this.route.state === RouteState.ROUTE_CANDIDATE);
     const lost_ms = poseBoundedLoss ? POSE_BOUNDED_LOSS_MS : INTERFERENCE_TIMEOUT_MS;
@@ -514,7 +564,13 @@ export class LineFollowModel {
       this.exit_heading_pending = false;
     }
 
-    const planning_step = this.route.steps[this.route.planningIndex()];
+    const planning_index = this.route.planningIndex();
+    const planning_step = this.route.steps[planning_index];
+    const planning_seen = planning_index === this.route.index ? this.route.junctions_seen : 0;
+    const target_approach = planning_step.junction_count <= 1 ||
+      planning_seen + 1 >= planning_step.junction_count ||
+      (planning_step.segment_length_cm > 0 &&
+        this.odometry.distance_cm - this.route.planningOrigin() >= planning_step.segment_length_cm);
     const step = this.route.steps[this.route.index];
     const cruise = this.route.cruiseSpeed();
     const planning_origin = this.route.planningOrigin();
@@ -523,16 +579,8 @@ export class LineFollowModel {
     let base_speed = cruise;
     let navigation_wheel_cap = WHEEL_TARGET_MAX_CM_S;
 
-    const passing_without_exit =
-      (this.route.passing_junction &&
-        this.route.state === RouteState.ROUTE_CLEARING &&
-        (this.route.component_recovery_active ||
-          !stable ||
-          !routeIsClearLine(this.route, obs) ||
-          this.route.exit_count < LINE_CONFIRM_SAMPLES)) ||
-      (this.route.state === RouteState.ROUTE_CANDIDATE &&
-        !this.route.targetReady(this.odometry.distance_cm, true) &&
-        (!narrow || Math.abs(obs.position) > 2.0));
+    const passing_without_exit = this.route.passing_junction &&
+      this.route.state === RouteState.ROUTE_CLEARING && obs.line_mask === 0;
 
     if (passing_without_exit) {
       base_speed = Math.min(base_speed, COMPONENT_RECOVERY_SPEED_CM_S);
@@ -540,7 +588,7 @@ export class LineFollowModel {
     }
 
     if (
-      planning_step.segment_length_cm > 0 &&
+      target_approach && planning_step.segment_length_cm > 0 &&
       this.route.final_segment_active &&
       (this.route.state === RouteState.ROUTE_FOLLOW ||
         this.route.state === RouteState.ROUTE_CANDIDATE ||
@@ -581,34 +629,36 @@ export class LineFollowModel {
        * BRAKING_REVERSE_MAX_MS and cut below BRAKING_REVERSE_MIN_SPEED_CM_S.
        * Gated on the two switches so the default (OFF) build executes nothing
        * new here: the replay output stays bit-identical. */
+      const braking_speed = Math.max(
+        Math.abs(this.odometry.left_speed_cm_s),
+        Math.abs(this.odometry.right_speed_cm_s)
+      );
+      const raw_accel = this.braking_speed_primed
+        ? (braking_speed - this.braking_previous_speed_cm_s) / dt
+        : 0;
+      this.braking_previous_speed_cm_s = braking_speed;
+      if (!this.braking_speed_primed) this.braking_accel_cm_s2 = raw_accel;
+      else {
+        this.braking_accel_cm_s2 +=
+          dt / (BRAKING_ACCEL_FILTER_TAU_S + dt) * (raw_accel - this.braking_accel_cm_s2);
+      }
+      this.braking_speed_primed = true;
+      const decision = brakingDecide(
+        braking_speed,
+        planning_entry_speed,
+        plan.remaining_cm,
+        -this.braking_accel_cm_s2,
+        BRAKING_SAFE_DECEL_CM_S2,
+        BRAKING_REVERSE_GUARD_CM
+      );
+      this.braking_required_cm_s2 = decision.required_decel;
+      this.braking_reverse_active = false;
+      if (decision.distance_exhausted && braking_speed > planning_entry_speed + REVERSE_BRAKE_MARGIN_CM_S) {
+        this.route.navigation_warning = RouteFailure.ROUTE_FAILURE_BRAKE_DISTANCE;
+      }
+      // Reverse torque remains gated by the two hardware switches; the passive
+      // braking decision above is always evaluated (mirror of line_follow.c).
       if (BRAKING_REVERSE_HARDWARE_CONFIRMED && MOTOR_REVERSE_BRAKE_ENABLED) {
-        const braking_speed = Math.max(
-          Math.abs(this.odometry.left_speed_cm_s),
-          Math.abs(this.odometry.right_speed_cm_s)
-        );
-        const raw_accel = this.braking_speed_primed
-          ? (braking_speed - this.braking_previous_speed_cm_s) / dt
-          : 0;
-        this.braking_previous_speed_cm_s = braking_speed;
-        if (!this.braking_speed_primed) this.braking_accel_cm_s2 = raw_accel;
-        else {
-          this.braking_accel_cm_s2 +=
-            dt / (BRAKING_ACCEL_FILTER_TAU_S + dt) * (raw_accel - this.braking_accel_cm_s2);
-        }
-        this.braking_speed_primed = true;
-        const decision = brakingDecide(
-          braking_speed,
-          planning_entry_speed,
-          plan.remaining_cm,
-          -this.braking_accel_cm_s2,
-          BRAKING_SAFE_DECEL_CM_S2,
-          BRAKING_REVERSE_GUARD_CM
-        );
-        this.braking_required_cm_s2 = decision.required_decel;
-        this.braking_reverse_active = false;
-        if (decision.distance_exhausted && braking_speed > planning_entry_speed + REVERSE_BRAKE_MARGIN_CM_S) {
-          this.route.navigation_warning = RouteFailure.ROUTE_FAILURE_BRAKE_DISTANCE;
-        }
         if (
           decision.reverse_needed &&
           !decision.distance_exhausted &&
@@ -638,7 +688,7 @@ export class LineFollowModel {
       this.braking_reverse_active = false;
     }
 
-    if (this.route.search_pending && planning_step.segment_length_cm > 0) {
+    if (target_approach && this.route.search_pending && planning_step.segment_length_cm > 0) {
       base_speed = Math.min(base_speed, planning_entry_speed);
     }
 
@@ -664,9 +714,20 @@ export class LineFollowModel {
     // pivot approach distance (the old CANDIDATE deceleration did this). The
     // window grows with speed: v^2 / (2*a_safe) plus the 30 cm base.
     if (this.route.pose_mode) {
-      const brake = (this.odometry.left_speed_cm_s * this.odometry.left_speed_cm_s) /
-        (2 * BRAKING_SAFE_DECEL_CM_S2);
-      if (this.route.pose_gap_bar_cm <= Math.max(ROUTE_WAYPOINT_SLOW_CM, brake + 8.0)) {
+      // 2026-11-07 hardware: the real coast-down is ~100 cm/s^2, so sizing the
+      // pre-slow window with the planner's 250 cm/s^2 starts braking too late.
+      // Also use the remaining table distance, which does not depend on a
+      // possibly drifted pose estimate.
+      const brakeW = (this.odometry.left_speed_cm_s * this.odometry.left_speed_cm_s) /
+        (2 * CORNER_ENTRY_DECEL_CM_S2);
+      const slowWindow = Math.max(ROUTE_WAYPOINT_SLOW_CM, brakeW + 8.0);
+      let segmentLeft = Infinity;
+      if (step.segment_length_cm > 0) {
+        segmentLeft = step.segment_length_cm -
+          (this.odometry.distance_cm - this.route.origin_cm);
+      }
+      if (target_approach &&
+        (this.route.pose_gap_bar_cm <= slowWindow || segmentLeft <= slowWindow)) {
         base_speed = Math.min(base_speed, this.route.entrySpeedLimit());
       }
     }
@@ -689,48 +750,55 @@ export class LineFollowModel {
       this.route.pose_mode &&
       this.route.pose_cross_valid &&
       this.route.state === RouteState.ROUTE_FOLLOW &&
-      step.action !== Action.HEXAGON
+      step.action !== Action.HEXAGON &&
+      !component_visible
     ) {
-      // Unified pose path-following for FOLLOW: the car is on a known straight
-      // segment between two table corners, so track that line directly. The
-      // 8-channel reading trims the cross-track estimate only while it agrees
-      // with the pose; this survives printed symbols, dead-end short legs and
-      // the 24 cm look-ahead leaving the wire at a corner.
-      const trusted = this.grayPlausible(obs);
-      const usable = trusted && narrow;
-      let cross = this.route.pose_cross_cm;
+      // 2026-11-07 hardware (mirror of line_follow.c): pose is only a fallback.
+      // Whenever the white line is usable, steer with the position PID. The old
+      // pose-primary trim made an encoder-heading calibration error drive the
+      // car off the wire even though the 8-channel bar still saw it.
+      const usable = narrow && (stable || !this.abnormal) &&
+        !grayIsComponentPattern(obs);
       if (usable) {
-        cross = (1 - POSE_GRAY_TRIM) * cross + POSE_GRAY_TRIM * (-obs.position * 0.55);
+        if (this.abnormal) {
+          this.pid.reset();
+          this.speed.reset();
+          this.abnormal = false;
+          this.component_cross_latched = false;
+        }
+        this.state = LineState.LINE_TRACKING;
         if (stable) {
           this.have_reliable = true;
           this.last_reliable_ms = now_ms;
           this.reliable_position = obs.position;
         }
-        this.abnormal = false;
-      } else if (!this.abnormal &&
-        Math.abs(this.route.pose_cross_cm) > ROUTE_WAYPOINT_GATE_CM) {
-        // The pose itself says the car is off the segment: from here the grey
-        // loss is real, so arm the bounded loss window instead of trusting the
-        // path follower.
-        this.abnormal = true;
-        this.abnormal_origin_cm = this.odometry.distance_cm;
+        const base = base_speed * (1.0 - (POSITION_CURVE_SLOWDOWN * Math.abs(obs.position)) / 7.0);
+        const next = this.nextOuter(base, dt);
+        const res = this.pid.update(obs.position, dt, 0.5 * next);
+        let correction = res.output;
+        if (this.route.arc_just_exited)
+          correction -= CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s;
+        this.outerTargets(next, correction, dt);
+      } else {
+        // Line unusable: bounded pose fallback, and really arm the loss window.
+        if (!this.abnormal) {
+          this.abnormal = true;
+          this.abnormal_origin_cm = this.odometry.distance_cm;
+        }
+        const cross = this.route.pose_cross_cm;
+        const desired = this.route.pose_seg_heading_rad +
+          Math.atan2(-cross, POSE_PURSUIT_LOOKAHEAD_CM);
+        let corr = HEADING_KP_CM_S_PER_RAD *
+          Math.atan2(Math.sin(desired - this.odometry.heading_rad),
+            Math.cos(desired - this.odometry.heading_rad));
+        if (this.route.arc_just_exited)
+          corr -= CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s;
+        const cap = 0.5 * Math.max(base_speed, 1.0);
+        corr = Math.max(-cap, Math.min(cap, corr));
+        this.state = LineState.LINE_GAP_HOLD;
+        this.pid.reset();
+        this.outerTargets(base_speed, corr, dt);
       }
-      const desired = this.route.pose_seg_heading_rad +
-        Math.atan2(-cross, POSE_PURSUIT_LOOKAHEAD_CM);
-      let corr = HEADING_KP_CM_S_PER_RAD *
-        Math.atan2(Math.sin(desired - this.odometry.heading_rad),
-          Math.cos(desired - this.odometry.heading_rad));
-      // Right after a rolling corner the released differential keeps yawing the
-      // car for ~0.1-0.3 s; damping the measured yaw rate stops the drift much
-      // sooner than the cross-track term alone.
-      if (this.route.arc_just_exited) {
-        corr -= CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s;
-      }
-      const cap = 0.5 * Math.max(base_speed, 1);
-      corr = Math.max(-cap, Math.min(cap, corr));
-      this.state = usable ? LineState.LINE_TRACKING : LineState.LINE_GAP_HOLD;
-      this.pid.reset();
-      this.outerTargets(base_speed, corr, dt);
     } else if (this.route.state === RouteState.ROUTE_CANDIDATE && !this.route.targetReady(this.odometry.distance_cm, true)) {
       this.state = LineState.LINE_JUNCTION;
       this.abnormal = false;
@@ -755,6 +823,19 @@ export class LineFollowModel {
           dt
         );
       }
+    } else if (this.route.turn_exit_search) {
+      this.state = LineState.LINE_JUNCTION;
+      this.abnormal = false;
+      this.exit_accelerating = false;
+      this.pid.reset();
+      const outer = Math.min(step.turn_speed, COMPONENT_RECOVERY_SPEED_CM_S);
+      const err = Math.atan2(
+        Math.sin(this.route.line_exit_heading_rad - this.odometry.heading_rad),
+        Math.cos(this.route.line_exit_heading_rad - this.odometry.heading_rad)
+      );
+      let correction = HEADING_KP_CM_S_PER_RAD * err - JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
+      correction = Math.max(-.5 * outer, Math.min(.5 * outer, correction));
+      this.outerTargets(outer, correction, dt);
     } else if (this.route.component_recovery_active) {
       this.state = LineState.LINE_JUNCTION;
       this.abnormal = false;
@@ -870,7 +951,25 @@ export class LineFollowModel {
           corr = JUNCTION_SETTLE_HEADING_KP * err - 1.2 * this.turn_yaw_rate_rad_s;
           corr = Math.max(-base, Math.min(base, corr));
         }
+        if (remaining > 0)
+          corr = direction * Math.max(direction * corr, Math.min(base, JUNCTION_CAPTURE_MIN_TURN_CM_S));
         this.turnTargets(outer, corr, dt);
+      } else if (this.route.usesCornerArc() && !this.route.corner_arc_complete &&
+        !settling && !this.route.capture_line_seen) {
+        // Legacy (pose-off) rolling arc: radius-projected geometric differential
+        // with a heading-error term, mirror of line_follow.c:955-963.
+        const track = this.odometry.calibration.track_cm;
+        if (CORNER_RADIUS_CM <= track * 0.5) {
+          this.stop(LineStopReason.LINE_STOP_CALIBRATION);
+          return;
+        }
+        const arcBase = outer / (1 + track / (2 * CORNER_RADIUS_CM));
+        const lead = GRAY_FORWARD_OFFSET_CM - CORNER_RADIUS_CM;
+        const planned = Math.max(0, Math.min(Math.abs(target),
+          (this.odometry.distance_cm - this.route.entry_cm - lead) / CORNER_RADIUS_CM));
+        correction = direction *
+          (arcBase * track / (2 * CORNER_RADIUS_CM) + CORNER_HEADING_KP * (planned - turn));
+        this.turnTargets(outer, correction, dt);
       } else if (this.route.currentAction() === Action.STRAIGHT) {
         const pass = Math.min(base_speed, Math.max(outer, JUNCTION_PASS_SPEED_CM_S));
         this.straightTargets(
@@ -900,6 +999,8 @@ export class LineFollowModel {
         } else {
           this.pid.reset();
         }
+        if (remaining > 0)
+          correction = direction * Math.max(direction * correction, Math.min(base, JUNCTION_CAPTURE_MIN_TURN_CM_S));
         this.turnTargets(outer, correction, dt);
       }
     } else if (this.route.state === RouteState.ROUTE_CLEARING && this.route.next_junction_samples > 0) {
@@ -915,7 +1016,7 @@ export class LineFollowModel {
       this.state = LineState.LINE_JUNCTION;
       this.abnormal = false;
       const pass = base_speed;
-      if (routeIsClearLine(this.route, obs) && stable && this.route.exit_count >= LINE_CONFIRM_SAMPLES) {
+      if (grayIsParallelPair(obs)) {
         const res = this.pid.update(obs.position, dt, 0.5 * pass);
         this.outerTargets(pass, res.output, dt);
       } else {
@@ -927,6 +1028,34 @@ export class LineFollowModel {
           dt
         );
       }
+    } else if (this.route.state === RouteState.ROUTE_FOLLOW && component_visible) {
+      // 2026-11-07 hardware rule (mirror of line_follow.c): a printed component
+      // is treated like a junction for steering — hold straight and never feed
+      // its one-sided white stroke to the position PID. The pose cross-track
+      // trims the hold when available so blind passage does not drift.
+      this.state = LineState.LINE_JUNCTION;
+      this.pid.reset();
+      const hold = this.route.pose_mode && this.route.pose_cross_valid
+        ? this.route.pose_seg_heading_rad : this.odometry.heading_rad;
+      let correction = HEADING_KP_CM_S_PER_RAD * (hold - this.odometry.heading_rad);
+      if (this.route.pose_mode && this.route.pose_cross_valid) {
+        correction -= JUNCTION_CROSS_KP * this.route.pose_cross_cm;
+        correction = Math.max(-0.5 * base_speed, Math.min(0.5 * base_speed, correction));
+      }
+      if (obs.kind === GrayKind.GRAY_NONE) {
+        if (!this.abnormal) {
+          this.abnormal = true;
+          this.abnormal_origin_cm = this.odometry.distance_cm;
+        }
+      } else {
+        this.abnormal = false;
+        this.last_reliable_ms = now_ms;
+        if (stable) {
+          this.have_reliable = true;
+          this.reliable_position = obs.position;
+        }
+      }
+      this.outerTargets(base_speed, correction, dt);
     } else if (narrow && (stable || !this.abnormal) && this.route.state !== RouteState.ROUTE_CANDIDATE) {
       if (this.abnormal) {
         this.pid.reset();

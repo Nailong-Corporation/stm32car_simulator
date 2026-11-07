@@ -3,8 +3,8 @@ import { RoutePlannerModel } from '../src/sim/route';
 import { LineFollowModel } from '../src/sim/line_follow';
 import { VehicleSimulator } from '../src/sim/physics';
 import { grayClassify } from '../src/sim/gray_sensor';
-import { TURN_PIVOT_APPROACH_CM, WHEEL_TRACK_CM, JUNCTION_TURN_TARGET_RAD, JUNCTION_EXIT_REWIND_RAD, CONTROL_MAX_INTERVAL_MS } from '../src/sim/config';
-import { Action, RouteState, LineState, HexagonState, type RouteStep } from '../src/sim/types';
+import { TURN_PIVOT_APPROACH_CM, WHEEL_TRACK_CM, JUNCTION_TURN_TARGET_RAD, CONTROL_MAX_INTERVAL_MS } from '../src/sim/config';
+import { Action, RouteState, RouteFailure, LineState, HexagonState, type RouteStep } from '../src/sim/types';
 
 const steps = (): (RouteStep & {short_link_cm?: number})[] => [
  {junction_count:1,turn_speed:16,action:Action.LEFT,cruise_speed:60,angle_deg:0,corner_arc_enabled:false,segment_length_cm:40},
@@ -27,12 +27,25 @@ function synthetic(sign: number, nextSign: number, radius=WHEEL_TRACK_CM*.5) {
  assert.equal(r.turn_approaching,true);
  sample(0,TURN_PIVOT_APPROACH_CM+.01,0);
  for(let i=1;i<=100;i++) {
-  sample(i>=98?0x18:0,radius*JUNCTION_TURN_TARGET_RAD/100,sign*JUNCTION_TURN_TARGET_RAD*i/100);
-  if(i<100)assert.equal(r.short_link_active,false,'no exit means no short transfer');
+  sample(i>=98?0x18:0,radius*JUNCTION_TURN_TARGET_RAD/100,sign*JUNCTION_TURN_TARGET_RAD*(i/100));
+  assert.equal(r.short_link_active,false,'early center line cannot transfer before full yaw and exit recovery');
+  assert.equal(r.index,0);
+  if(i<100)assert.equal(r.state,RouteState.ROUTE_EXECUTING);
  }
- assert.equal(r.index,1);assert.equal(r.short_link_active,true);assert.equal(r.turn_approaching,true);
- assert.equal(r.junctions_seen,0);
+ assert.equal(r.state,RouteState.ROUTE_CLEARING);
+ assert.equal(r.turn_exit_search,true);
+ assert.equal(r.line_exit_confirmed,false);
  assert.ok(Math.abs(r.short_link_forward_cm-radius)<.01,'project arc displacement, not scalar wheel distance');
+ // Pre-angle center frames are not recovery proof. A fresh three-frame sequence
+ // must finish before this row can hand off to the short-link approach.
+ for(let i=0;i<3;i++) {
+  sample(0x18,0,sign*JUNCTION_TURN_TARGET_RAD);
+  assert.equal(r.short_link_active,i===2);
+  assert.equal(r.index,i===2?1:0);
+  assert.equal(r.turn_exit_search,i<2);
+ }
+ assert.equal(r.turn_approaching,true);
+ assert.equal(r.junctions_seen,0);
  return {r,sample,axis:sign*JUNCTION_TURN_TARGET_RAD};
 }
 for(const sign of [-1,1])for(const nextSign of [-1,1]) {
@@ -44,10 +57,18 @@ for(const sign of [-1,1])for(const nextSign of [-1,1]) {
  assert.equal(r.state,RouteState.ROUTE_EXECUTING);assert.equal(r.index,1);
  const final=axis+nextSign*JUNCTION_TURN_TARGET_RAD;
  for(let i=0;i<35;i++)sample(0,.01,final);
- assert.equal(r.index,1);assert.equal(r.turn_rewind_active,true);
- for(let i=0;i<3;i++)sample(0x18,.08,final-nextSign*JUNCTION_EXIT_REWIND_RAD);
+ assert.equal(r.index,1);
  assert.equal(r.state,RouteState.ROUTE_CLEARING);
- for(let i=0;i<40;i++)sample(0x18,.08,final-nextSign*JUNCTION_EXIT_REWIND_RAD);
+ assert.equal(r.turn_exit_search,true);
+ assert.equal(r.turn_rewind_active,false,'full yaw searches straight along the exit heading');
+ for(let i=0;i<3;i++) {
+  sample(0x18,.08,final);
+  assert.equal(r.turn_exit_search,i<2);
+  assert.equal(r.index,1,'line recovery precedes normal clearance');
+ }
+ assert.equal(r.state,RouteState.ROUTE_CLEARING);
+ assert.equal(r.line_exit_confirmed,true);
+ for(let i=0;i<40;i++)sample(0x18,.08,final);
  assert.equal(r.index,2);assert.equal(r.state,RouteState.ROUTE_FOLLOW);assert.equal(r.stop_pending,false);
 }
 for(const fault of ['heading','gap','reverse','timeout','overshoot','lateral']) {
@@ -66,8 +87,12 @@ for(const fault of ['heading','gap','reverse','timeout','overshoot','lateral']) 
  assert.equal(r.state,RouteState.ROUTE_BRAKING);assert.equal(r.turn_approaching,true);
  r.setSpeed(0,0);sample(0,0,axis);
  assert.equal(r.state,RouteState.ROUTE_EXECUTING);assert.equal(r.turn_approaching,false);
- for(let i=0;i<700 && r.state===RouteState.ROUTE_EXECUTING;i++)sample(0,0,axis+JUNCTION_TURN_TARGET_RAD);
+ sample(0,0,axis+JUNCTION_TURN_TARGET_RAD);
+ assert.equal(r.state,RouteState.ROUTE_CLEARING);
+ assert.equal(r.turn_exit_search,true);
+ for(let i=0;i<240 && r.state===RouteState.ROUTE_CLEARING;i++)sample(0,0,axis+JUNCTION_TURN_TARGET_RAD);
  assert.equal(r.state,RouteState.ROUTE_FAILED);assert.equal(r.index,1);
+ assert.equal(r.failure,RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE,'wireless full-angle search must expire after 1200 ms');
 }
 {
  const {r,sample,axis}=synthetic(1,1,9);

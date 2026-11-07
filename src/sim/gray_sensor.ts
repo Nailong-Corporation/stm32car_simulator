@@ -25,6 +25,17 @@ export class GraySensorModel {
   }
 }
 
+function narrowOuterGroup(mask: number): boolean {
+  return mask === 1 || mask === 2 || mask === 4 || mask === 3 || mask === 6;
+}
+
+// Exactly two narrow outer groups, with S3/S4 empty: follow their midpoint.
+export function grayIsParallelPair(observation: GrayObservation): boolean {
+  const mask = observation.line_mask;
+  return observation.region_count === 2 && (mask & 0x18) === 0 &&
+    narrowOuterGroup(mask & 0x07) && narrowOuterGroup((mask >> 5) & 0x07);
+}
+
 export function grayClassify(
   line_mask: number,
   have_previous: boolean,
@@ -32,7 +43,7 @@ export function grayClassify(
 ): GrayObservation {
   const result: GrayObservation = {
     kind: GrayKind.GRAY_NONE,
-    raw_mask: line_mask,
+    raw_mask: 0,
     line_mask: line_mask,
     selected_mask: 0,
     white_count: 0,
@@ -71,14 +82,20 @@ export function grayClassify(
     if (widths[i] > SENSOR_MAX_REGION_WIDTH) wide = true;
   }
 
+  if (grayIsParallelPair(result)) {
+    result.kind = GrayKind.GRAY_VALID;
+    result.selected_mask = line_mask;
+    // Equal weight per physical line, regardless of sampled widths.
+    result.position = (positions[0] + positions[1]) * 0.5;
+    return result;
+  }
   result.kind = GrayKind.GRAY_AMBIGUOUS;
-  if (wide) return result;
+  if (wide || result.region_count > 2) return result;
 
   let selected = 0;
   if (result.region_count > 1) {
-    // Printed hollow component / plate gap: two outer groups with an empty
-    // centre cannot be resolved into one line; keep it ambiguous so the line
-    // follower holds heading across the printed symbol instead of chasing an edge.
+    // Other hollow/complex component shapes remain ambiguous; never chase
+    // one outer edge using continuity when both outer groups are present.
     if ((line_mask & 0x18) === 0 && (line_mask & 0x03) !== 0 && (line_mask & 0xc0) !== 0) {
       return result;
     }
@@ -132,7 +149,8 @@ export function graySensorUpdate(
   }
 
   const prefilter = filtered;
-  if (FLOOR_SEAM_FILTER_ENABLED) {
+  if (FLOOR_SEAM_FILTER_ENABLED &&
+      !grayIsParallelPair(grayClassify(prefilter, false, 0))) {
     const neighbors = ((filtered << 1) | (filtered >> 1)) & 0xff;
     filtered &= neighbors;
   }

@@ -10,6 +10,14 @@ const server = await createServer({
 });
 try {
   await server.ssrLoadModule('/tests/distance_node.test.ts');
+  await server.ssrLoadModule('/tests/resistor_authorization.test.ts');
+  await server.ssrLoadModule('/tests/strict_angle_exit.test.ts');
+  await server.ssrLoadModule('/tests/resistor_artwork.test.ts');
+  await server.ssrLoadModule('/tests/transistor_artwork.test.ts');
+  await server.ssrLoadModule('/tests/route_pose_node.test.ts');
+  if (process.argv.includes('--strict-angle-only')) {
+    // Run the independent strict turn-exit contract without trajectory tests.
+  } else {
   if (process.argv.includes('--contract-only')) {
     // Isolate the latest distance/count contract from trajectory tests.
   } else {
@@ -22,6 +30,7 @@ try {
   await server.ssrLoadModule('/tests/q4_q6.test.ts');
   await server.ssrLoadModule('/tests/short_link.test.ts');
   await server.ssrLoadModule('/tests/hexagon_entry.test.ts');
+  }
   }
   }
 } finally {

@@ -8,8 +8,10 @@
  *     and y = 110.00 on the right half (x = 245..375);
  *     the old single y = 120.00 line no longer exists;
  *   - x = 95 now runs 0..140 and 168.6..220 (old: 0..120 / 170..220);
- *   - x = 245 ends at y = 170 (old: full height 0..220);
- *   - x = 275 ends at y = 110 (old: y = 120);
+ *   - x = 245 runs the full height y = 0..220 (the lower 170..220 piece was
+ *     missing from the earlier plot and is the junction left of the ring);
+ *   - x = 275 ends at y = 110; it must NOT be joined to the hexagon left
+ *     vertex (that would create a non-existent spur next to the ring);
  *   - y = 50 extends to the right border (x = 275..375, old 275..345);
  *   - hexagon centre moved to (310, 165), side 35, right vertex (345, 165);
  *   - start / finish battery P sits at (0, 110) on the left border.
@@ -66,19 +68,39 @@ export const TRACK_LINE_WIDTH_CM = 2.8;
 
 /** Component artwork proportions, measured from the official circuit render. */
 /* The artwork proportion (component length / 375 cm) gives ~14.5 cm resistors
- * and ~13 cm transistor mouths; at that size the symbol footprint is wider than
- * the 8-channel sensor bar and no car can cross it.  The values below keep the
- * artwork's aspect ratio at 55 % of that footprint so the printed symbols stay
- * recognisable distractors while a 24 cm look-ahead car can still cross them.
- * Treat this as a simulator calibration assumption until the physical board is
- * measured; the artwork is bitmap-scaled, not dimensioned. */
-export const RESISTOR_LENGTH_CM = 8.0;
-export const RESISTOR_WIDTH_CM = 3.8;
-export const RESISTOR_STROKE_CM = 1.3;
+ * and ~13 cm transistor mouths.  The resistor symbol is drawn at that full
+ * artwork scale (k = 1.8125 on the previous 55 % calibration: 8.0 * 1.8125 =
+ * 14.5 cm): its two long edges then straddle the 8-channel sensor bar so that
+ * both side walls are seen by the outermost pairs S0/S1 and S6/S7 while the
+ * centre channels S3/S4 stay dark (raw mask 0xC3, the same signature as a
+ * parallel wire pair).  This is a SIMULATOR PICTURE SCALE only - it must never
+ * be mistaken for a firmware parameter, and it does not touch the transistors,
+ * the battery or the track wires.  The symbol keeps the artwork aspect ratio
+ * (length : width : stroke = 8.0 : 3.8 : 1.3) so the printed resistor stays
+ * recognisable; treat it as a simulator calibration assumption until the
+ * physical board is measured (the artwork is bitmap-scaled, not dimensioned). */
+export const RESISTOR_LENGTH_CM = 14.5;
+export const RESISTOR_WIDTH_CM = 6.8875;
+export const RESISTOR_STROKE_CM = 2.35625;
+/* Transistor artwork (simulator picture scale, never a firmware parameter).
+ *  The printed symbol uses the SAME stroke as the track wire
+ *  (TRANSISTOR_STROKE_CM = TRACK_LINE_WIDTH_CM = 2.8 cm), and the board patch
+ *  below the symbol (insideFootprint / track_renderer board rectangle) stops
+ *  exactly at the round stroke caps of the V arms and the base bar, so the two
+ *  V ends join the through wire without a black sliver.  The base bar is as
+ *  long as the V mouth (BAR_HALF = MOUTH / 2), so the bar's painted span
+ *  (-4.0 - 1.4 .. +4.0 + 1.4 cm) covers every one of the eight
+ *  phototransistor channels (+/-0.55 .. +/-3.85 cm) when the car crosses the
+ *  bar along the branch direction (raw sensor mask 0xFF). */
 export const TRANSISTOR_MOUTH_CM = 7.0; // distance between the two V arms on the wire
-export const TRANSISTOR_DEPTH_CM = 3.6; // depth of the V notch towards the branch
-export const TRANSISTOR_BAR_HALF_CM = 4.4; // half length of the base bar
-export const TRANSISTOR_STROKE_CM = 1.3;
+export const TRANSISTOR_DEPTH_CM = 4.2; // depth of the V notch towards the branch
+/* V mouth half (3.5) plus the 2.8 cm round stroke reaches 4.9 cm on each side,
+ * so the base bar covers every phototransistor channel (+/-3.85 cm) while the
+ * through-footprint stays close to the old size: the car's line following sees
+ * the same through-wire window as before (larger footprints made the Q16 symbol
+ * steer the car off the right border in the outer-loop test). */
+export const TRANSISTOR_BAR_HALF_CM = TRANSISTOR_MOUTH_CM / 2; // 3.5
+export const TRANSISTOR_STROKE_CM = TRACK_LINE_WIDTH_CM; // 2.8: same width as the track wire
 export const BATTERY_PLATE_SPACING_CM = 1.8;
 export const BATTERY_LONG_HALF_CM = 4.6;
 export const BATTERY_SHORT_HALF_CM = 2.8;
@@ -123,7 +145,7 @@ export const TRACK_SEGMENTS: TrackSegment[] = [
   { id: 'v_95_bot', p1: { x: 95, y: 170 }, p2: { x: 95, y: 220 } },
   { id: 'v_150_bot', p1: { x: 150, y: 170 }, p2: { x: 150, y: 220 } },
   { id: 'v_165_mid', p1: { x: 165, y: 40 }, p2: { x: 165, y: 80 } },
-  { id: 'v_245', p1: { x: 245, y: 0 }, p2: { x: 245, y: 170 } },
+  { id: 'v_245', p1: { x: 245, y: 0 }, p2: { x: 245, y: 220 } },
   { id: 'v_275', p1: { x: 275, y: 0 }, p2: { x: 275, y: 110 } },
   { id: 'v_345_top', p1: { x: 345, y: 0 }, p2: { x: 345, y: 50 } },
   { id: 'v_345_to_hex', p1: { x: 345, y: 110 }, p2: { x: 345, y: 165 } },
@@ -246,14 +268,23 @@ function insideFootprint(comp: TrackComponent, u: number, v: number): boolean {
   if (comp.type === 'resistor') {
     const L = comp.length ?? RESISTOR_LENGTH_CM;
     const W = comp.width ?? RESISTOR_WIDTH_CM;
-    return Math.abs(u) <= L / 2 && Math.abs(v) <= W / 2;
+    const s = comp.stroke ?? RESISTOR_STROKE_CM;
+    // The outline stroke is centred on the L x W rectangle (see
+    // track_renderer.renderComponent -> strokeRect with lineWidth = s), so the
+    // white symbol reaches s / 2 beyond it.  The footprint must include that
+    // half-stroke, exactly like the transistor/battery branches above; otherwise
+    // the outer half of each long edge is invisible to the grayscale sensor even
+    // though it is painted white on screen.
+    return Math.abs(u) <= L / 2 + s / 2 && Math.abs(v) <= W / 2 + s / 2;
   }
   if (comp.type === 'transistor') {
-    return (
-      Math.abs(u) <= TRANSISTOR_MOUTH_CM / 2 + TRANSISTOR_STROKE_CM &&
-      v >= -TRANSISTOR_STROKE_CM &&
-      v <= TRANSISTOR_DEPTH_CM + TRANSISTOR_STROKE_CM
-    );
+    const s = comp.stroke ?? TRANSISTOR_STROKE_CM;
+    // The symbol strokes have round caps, so the white V arms / base bar reach
+    // s / 2 past their centre lines.  The footprint (the board patch that hides
+    // the wire underneath) must stop exactly at that cap: a wider footprint
+    // leaves a black sliver between the arm end and the wire it joins.
+    const uHalf = Math.max(TRANSISTOR_MOUTH_CM / 2, TRANSISTOR_BAR_HALF_CM) + s / 2;
+    return Math.abs(u) <= uHalf && v >= -s / 2 && v <= TRANSISTOR_DEPTH_CM + s / 2;
   }
   // battery: four plates straddling the wire
   return Math.abs(u) <= 2 * BATTERY_PLATE_SPACING_CM + BATTERY_STROKE_CM && Math.abs(v) <= BATTERY_LONG_HALF_CM + BATTERY_STROKE_CM;

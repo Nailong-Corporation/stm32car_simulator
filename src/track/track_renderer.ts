@@ -238,8 +238,13 @@ export class TrackRenderer {
       const m = TRANSISTOR_MOUTH_CM / 2;
       const d = TRANSISTOR_DEPTH_CM;
       const t = comp.stroke ?? TRANSISTOR_STROKE_CM;
+      // Board patch = map_data.insideFootprint: stop exactly at the round
+      // stroke caps (u half = max(mouth/2, bar half) + t/2, v = -t/2..d+t/2).
+      // A larger rectangle would hide wire the sensor still sees (or the bar
+      // would paint white over a rectangle the sensor ignores).
+      const footprintHalfU = Math.max(m, TRANSISTOR_BAR_HALF_CM) + t / 2;
       ctx.fillStyle = board;
-      ctx.fillRect(px(-TRANSISTOR_BAR_HALF_CM - t), px(-t), px(2 * (TRANSISTOR_BAR_HALF_CM + t)), px(d + 2 * t));
+      ctx.fillRect(px(-footprintHalfU), px(-t / 2), px(2 * footprintHalfU), px(d + t));
       ctx.lineWidth = Math.max(1.2, px(t));
       ctx.beginPath();
       ctx.moveTo(px(-m), 0);

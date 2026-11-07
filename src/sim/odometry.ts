@@ -11,6 +11,8 @@ import {
   LEFT_COUNTS_PER_WHEEL_REV,
   RIGHT_COUNTS_PER_WHEEL_REV,
   WHEEL_TRACK_CM,
+  ENCODER_LEFT_SIGN,
+  ENCODER_RIGHT_SIGN,
 } from './config';
 
 export function defaultOdometryCalibration(): OdometryCalibration {
@@ -20,8 +22,8 @@ export function defaultOdometryCalibration(): OdometryCalibration {
     left_counts_per_rev: LEFT_COUNTS_PER_WHEEL_REV,
     right_counts_per_rev: RIGHT_COUNTS_PER_WHEEL_REV,
     track_cm: WHEEL_TRACK_CM,
-    left_sign: 1,
-    right_sign: -1,
+    left_sign: ENCODER_LEFT_SIGN,
+    right_sign: ENCODER_RIGHT_SIGN,
     confirmed: true,
   };
 }
