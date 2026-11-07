@@ -38,6 +38,7 @@ import {
   JUNCTION_WRONG_WAY_RAD,
   JUNCTION_CENTER_LIMIT,
   JUNCTION_CAPTURE_MIN_RAD,
+  JUNCTION_YAW_FILTER_TAU_S,
   JUNCTION_CLEAR_MAX_CM,
   JUNCTION_TURN_TARGET_RAD,
   JUNCTION_SETTLE_SPEED_CM_S,
@@ -95,6 +96,16 @@ import {
   NAVIGATION_RECOVERY_CM,
   WHEEL_TARGET_MAX_CM_S,
   CORNER_RADIUS_CM,
+  CORNER_ARC_RADIUS_CM,
+  CORNER_ARC_SPEED_CM_S,
+  CORNER_ARC_ENTER_TOL_CM,
+  CORNER_ARC_MIN_LEG_MARGIN_CM,
+  CORNER_ARC_EXIT_ANGLE_RAD,
+  CORNER_ARC_EXIT_TOL_CM,
+  CORNER_ARC_EXIT_ALONG_TOL_CM,
+  CORNER_ARC_EXIT_PROGRESS_RAD,
+  CORNER_ARC_EXIT_LEAD_S,
+  CORNER_ARC_DIFF_SLEW_CM_S2,
   WHEEL_TRACK_CM,
   INTERFERENCE_TIMEOUT_MS,
   INTERFERENCE_MAX_DISTANCE_CM,
@@ -109,6 +120,27 @@ function shortLinkLength(s: RouteStep): number { return s.short_link_cm ?? 0; }
 function ordinaryRightAngle(s: RouteStep): boolean {
   return !s.corner_arc_enabled && (s.action === Action.LEFT || s.action === Action.RIGHT ||
     (s.action === Action.CUSTOM_TURN && Math.abs(Math.abs(s.angle_deg) - 90) < 0.001));
+}
+/* Rolling-corner eligibility: an ordinary 90 degree corner whose own leg and
+ * whose outgoing leg both carry explicit geometry (short links keep their
+ * dedicated tracking, so a row feeding or leaving one stays on the pivot). */
+export function cornerArcRow(s: RouteStep | undefined, next?: RouteStep): boolean {
+  if (!s || !s.corner_arc_enabled) return false;
+  if (shortLinkLength(s) > 0) return false;
+  if (next && shortLinkLength(next) > 0) return false;
+  // The exit tangent point sits R past the corner, and the 24 cm look-ahead bar
+  // of the NEXT row starts watching ~21 cm early, so a leg shorter than ~2R
+  // makes the next corner's trigger fire while this arc is still turning.
+  if (next &&
+    next.segment_length_cm + ROUTE_WAYPOINT_MARGIN_CM <
+      2 * CORNER_ARC_RADIUS_CM + CORNER_ARC_MIN_LEG_MARGIN_CM) {
+    return false;
+  }
+  if (s.action === Action.LEFT || s.action === Action.RIGHT) return true;
+  return s.action === Action.CUSTOM_TURN && Math.abs(Math.abs(s.angle_deg) - 90) < 0.001;
+}
+function wrapRad(a: number): number {
+  return Math.atan2(Math.sin(a), Math.cos(a));
 }
 
 export function routeIsNarrowLine(o: GrayObservation): boolean {
@@ -288,6 +320,30 @@ export class RoutePlannerModel {
   public stop_pending = false;
   public callback_dispatched = false;
   public corner_arc_complete = false;
+  /* Rolling corner state (pose mode): the arc geometry is rebuilt from the row's
+   * corner waypoint and the entry heading, so the axle tracks a circle that is
+   * tangent to both segments.  arc_active turns true once the axle reaches the
+   * entry tangent point; before that the car rolls straight at arc speed. */
+  public arc_active = false;
+  /* Set when the rolling corner hands off and cleared when the next row's
+   * action begins: the exit speed is kept and the yaw residue is damped while
+   * the wheels unwind, instead of dropping to the pivot exit speed. */
+  public arc_just_exited = false;
+  public arc_roll_cm = 0;
+  public arc_progress_rad = 0;
+  public arc_radius_err_cm = 0;
+  public arc_desired_heading_rad = 0;
+  public arc_outer_cm_s = 0;
+  public arc_diff_cm_s = 0;
+  public arc_diff_slew_cm_s = 0;
+  public arc_lateral_cm = 0;
+  public arc_along_cm = 0;
+  public arc_across_cm = 0;
+  public arc_heading_err_rad = 0;
+  public arc_yaw_rate_rad_s = 0;
+  public arc_last_heading = 0;
+  public arc_exit_lead_rad = 0;
+  public last_arc_ms = 0;
   public turn_capturing = false;
   public lap_boundary = false;
   public capture_line_seen = false;
@@ -391,10 +447,12 @@ export class RoutePlannerModel {
             !s.corner_arc_enabled)) &&
         (s.action !== Action.STOP || i === this.count - 1) &&
         (!s.corner_arc_enabled ||
-          (Number.isFinite(CORNER_RADIUS_CM) && CORNER_RADIUS_CM > WHEEL_TRACK_CM * 0.5)) &&
+          (Number.isFinite(CORNER_ARC_RADIUS_CM) &&
+            CORNER_ARC_RADIUS_CM > WHEEL_TRACK_CM * 0.5)) &&
         Number.isFinite(shortLinkLength(s)) && (shortLinkLength(s) === 0 ||
           (i > 0 && shortLinkLength(s) >= SHORT_LINK_MIN_CM && shortLinkLength(s) <= SHORT_LINK_MAX_CM &&
-            ordinaryRightAngle(s) && ordinaryRightAngle(steps[i - 1])));
+            ordinaryRightAngle(s) &&
+            (ordinaryRightAngle(steps[i - 1]) || steps[i - 1].corner_arc_enabled)));
     }
 
     if (this.valid && steps[this.count - 1].action !== Action.STOP) this.valid = false;
@@ -406,6 +464,7 @@ export class RoutePlannerModel {
     this.short_link_tracking = this.short_link_active = this.turn_approaching = false;
     this.post_turn_slow = false;
     this.post_turn_samples = 0;
+    this.arc_just_exited = false;
     /* Absolute corner waypoints: the anchored start pose plus the cumulative
      * (geometry - 5 cm + 5 cm, angle) chain. Computed at START so a scenario
      * test may re-anchor the start pose first. */
@@ -469,8 +528,8 @@ export class RoutePlannerModel {
 
   public usesCornerArc(): boolean {
     return (
-      this.steps[this.index].action !== Action.HEXAGON &&
-      this.steps[this.index].corner_arc_enabled &&
+      !this.passing_junction &&
+      cornerArcRow(this.steps[this.index], this.steps[this.index + 1]) &&
       Math.abs(Math.abs(this.turnTargetRad()) - JUNCTION_TURN_TARGET_RAD) < 0.0001
     );
   }
@@ -531,6 +590,11 @@ export class RoutePlannerModel {
         this.repeat_action !== Action.STRAIGHT);
     let limit = this.steps[index].turn_speed;
     if (a === Action.HEXAGON) limit = Math.min(limit, HEXAGON_SPEED_CM_S);
+    if (turn && cornerArcRow(this.steps[index], this.steps[index + 1])) {
+      // A rolling corner never stops the inner wheel, so the entry gate is the
+      // axle arc speed rather than the settle/pivot cap.
+      return CORNER_ARC_SPEED_CM_S;
+    }
     return turn ? Math.min(limit, JUNCTION_SETTLE_SPEED_CM_S) : limit;
   }
 
@@ -604,6 +668,13 @@ export class RoutePlannerModel {
     this.candidate_count = this.exit_count = this.approach_center_count = 0;
     this.have_approach_center = this.exit_candidate_pending = false;
     this.turn_capturing = this.corner_arc_complete = false;
+    this.arc_active = false;
+    this.arc_roll_cm = this.arc_progress_rad = this.arc_radius_err_cm = 0;
+    this.arc_diff_slew_cm_s = 0;
+    this.arc_desired_heading_rad = this.entry_heading;
+    this.arc_outer_cm_s = CORNER_ARC_SPEED_CM_S;
+    this.arc_diff_cm_s = 0;
+    this.arc_lateral_cm = 0;
     this.turn_rewind_active = this.turn_rewind_pending = false;
     this.line_exit_confirmed = this.turn_ended_on_line = this.capture_line_seen = false;
     this.capture_line_samples = 0;
@@ -666,6 +737,8 @@ export class RoutePlannerModel {
       Math.abs(Math.abs(this.turnTargetRad()) - JUNCTION_TURN_TARGET_RAD) < 1e-4 &&
       this.steps[this.index].action !== Action.HEXAGON;
     this.resetEvidence(now);
+    this.last_arc_ms = now;
+    this.arc_just_exited = false;
     if (this.steps[this.index].action === Action.HEXAGON && !this.passing_junction) {
       this.hexagon = {
         state: HexagonState.HEXAGON_ENTERING,
@@ -1053,6 +1126,110 @@ export class RoutePlannerModel {
       }
       return;
     }
+  }
+
+  /* Rolling corner geometry.  The corner waypoint K and the incoming segment
+   * direction u give the arc that is tangent to both legs:
+   *   entry tangent  E = K - R*u
+   *   exit tangent   X = K + R*o      (o = u rotated by +-90 deg, the turn side)
+   *   centre         C = K - R*u + R*o
+   * The axle tracks that circle; the heading target is the circle tangent, so
+   * the loop is a real path-following loop (the target depends on the pose)
+   * and cannot wind up like a pure heading bang-bang pivot. */
+  private cornerArcUpdate(h: number, px: number, py: number, dt: number): void {
+    const dir = this.turnTargetRad() < 0 ? -1 : 1;
+    const R = CORNER_ARC_RADIUS_CM;
+    const track = WHEEL_TRACK_CM;
+    const Kx = this.waypoint_x_cm[this.index];
+    const Ky = this.waypoint_y_cm[this.index];
+    const Px = this.index > 0 ? this.waypoint_x_cm[this.index - 1] : this.start_x_cm;
+    const Py = this.index > 0 ? this.waypoint_y_cm[this.index - 1] : this.start_y_cm;
+    let ux = Kx - Px;
+    let uy = Ky - Py;
+    const len = Math.hypot(ux, uy);
+    if (len > 1e-3) {
+      ux /= len;
+      uy /= len;
+    } else {
+      const w = this.entry_heading - Math.PI / 2;
+      ux = Math.cos(w);
+      uy = Math.sin(w);
+    }
+    // Turn-side normal: rotating u by dir*90 degrees.
+    const ox = dir > 0 ? -uy : uy;
+    const oy = dir > 0 ? ux : -ux;
+    const Cx = Kx - R * ux + R * ox;
+    const Cy = Ky - R * uy + R * oy;
+    const Ex = Kx - R * ux;
+    const Ey = Ky - R * uy;
+    const Xx = Kx + R * ox;
+    const Xy = Ky + R * oy;
+    // Roll-up distance to the entry tangent point along the incoming leg, and
+    // the lateral offset from that leg (a badly-off entry must not arm the arc
+    // geometry blindly).
+    const proj = (Kx - px) * ux + (Ky - py) * uy;
+    this.arc_roll_cm = proj - R;
+    this.arc_lateral_cm = (px - Ex) * ox + (py - Ey) * oy;
+    if (!this.arc_active &&
+      proj <= R + CORNER_ARC_ENTER_TOL_CM &&
+      Math.abs(this.arc_lateral_cm) <= CORNER_ARC_EXIT_TOL_CM * 4.0) {
+      this.arc_active = true;
+      this.arc_last_heading = h;
+      this.arc_yaw_rate_rad_s = 0;
+    }
+    const rx = px - Cx;
+    const ry = py - Cy;
+    const alpha = Math.atan2(ry, rx);
+    const alpha_in = Math.atan2(Ey - Cy, Ex - Cx);
+    this.arc_radius_err_cm = Math.hypot(rx, ry) - R;
+    const dphi = wrapRad(alpha - alpha_in) * dir;
+    this.arc_progress_rad = Math.max(0, Math.min(Math.PI / 2, dphi));
+    const segHeading = Math.atan2(uy, ux) + Math.PI / 2;
+    this.arc_desired_heading_rad = this.arc_active
+      ? alpha + dir * (Math.PI / 2) + Math.PI / 2
+      : segHeading;
+    const v = CORNER_ARC_SPEED_CM_S;
+    this.arc_outer_cm_s = this.arc_active ? v * (1 + track / (2 * R)) : v;
+    const diffTarget = this.arc_active ? (v * track) / (2 * R) : 0;
+    const step = CORNER_ARC_DIFF_SLEW_CM_S2 * dt;
+    if (diffTarget > this.arc_diff_slew_cm_s) {
+      this.arc_diff_slew_cm_s = Math.min(diffTarget, this.arc_diff_slew_cm_s + step);
+    } else {
+      this.arc_diff_slew_cm_s = Math.max(diffTarget, this.arc_diff_slew_cm_s - step);
+    }
+    this.arc_diff_cm_s = this.arc_diff_slew_cm_s;
+    const target = Math.abs(this.turnTargetRad());
+    // Exit contract in the outgoing leg's frame (o = along, u = across, since u
+    // and o are perpendicular for a right angle): the axle must have reached the
+    // exit tangent point, sit on the outgoing wire, and point along the outgoing
+    // leg.  The heading test is absolute (not "turned target radians since the
+    // action began") because the entry heading itself carries a couple of
+    // degrees from the previous corner.
+    const along = (px - Kx) * ox + (py - Ky) * oy;
+    const across = (px - Kx) * ux + (py - Ky) * uy;
+    this.arc_along_cm = along;
+    this.arc_across_cm = across;
+    const outHeading = Math.atan2(oy, ox) + Math.PI / 2;
+    const headingErr = wrapRad(h - outHeading);
+    this.arc_heading_err_rad = headingErr;
+    // Measured yaw rate: the arc releases its differential at the hand-off and
+    // the car keeps rotating while the wheels unwind, so the hand-off must lead
+    // the target heading by that pending rotation.
+    if (dt > 0) {
+      const raw = wrapRad(h - this.arc_last_heading) / dt;
+      const a = dt / (JUNCTION_YAW_FILTER_TAU_S + dt);
+      this.arc_yaw_rate_rad_s += a * (raw - this.arc_yaw_rate_rad_s);
+    }
+    this.arc_last_heading = h;
+    this.arc_exit_lead_rad = this.arc_yaw_rate_rad_s * CORNER_ARC_EXIT_LEAD_S;
+    const predicted = wrapRad(headingErr + this.arc_exit_lead_rad);
+    if (this.arc_active &&
+      Math.abs(predicted) <= CORNER_ARC_EXIT_ANGLE_RAD &&
+      along >= R - CORNER_ARC_EXIT_ALONG_TOL_CM &&
+      Math.abs(across) <= CORNER_ARC_EXIT_TOL_CM) {
+      this.corner_arc_complete = true;
+    }
+    void target;
   }
 
   public recoverNavigation(d: number, h: number, now: number): boolean {
@@ -1509,20 +1686,38 @@ export class RoutePlannerModel {
     // 24 cm look-ahead bar a few cm after the pivot, so the grey-only contract
     // would time out.  When the axle has reached the pivot angle at the known
     // corner, hand over to the next row immediately.
-    if (
-      action !== Action.STRAIGHT &&
+    const pose_available = action !== Action.STRAIGHT &&
       !this.passing_junction &&
       Number.isFinite(axle_x_cm) &&
       Number.isFinite(axle_y_cm) &&
-      this.waypoint_x_cm.length === this.count
-    ) {
-      const wob = h - Math.PI / 2;
-      const gap = Math.hypot(axle_x_cm - this.waypoint_x_cm[this.index], axle_y_cm - this.waypoint_y_cm[this.index]);
-      if (gap <= ROUTE_WAYPOINT_EXIT_CM && turn >= target - ROUTE_WAYPOINT_EXIT_ANGLE_RAD) {
-        this.line_exit_confirmed = true;
-        this.line_exit_heading_rad = h;
-        this.enterClear(d, now);
-        return;
+      this.waypoint_x_cm.length === this.count;
+    const arc_row = pose_available && this.usesCornerArc();
+    if (arc_row && this.state === RouteState.ROUTE_EXECUTING) {
+      const arc_dt = Math.max(0.001, Math.min(0.020, (now - this.last_arc_ms) / 1000));
+      this.cornerArcUpdate(h, axle_x_cm, axle_y_cm, arc_dt);
+      this.last_arc_ms = now;
+    }
+    if (pose_available) {
+      if (arc_row) {
+        // Rolling corner: leave on the arc's own tangent, not on the legacy
+        // "within 14 cm of the corner" hand-off, which fires ~7 degrees early.
+        // Only in EXECUTING: once CLEARING starts the exit flag stays set, and
+        // re-entering CLEARING every frame would freeze its clear timer.
+        if (this.state === RouteState.ROUTE_EXECUTING && this.corner_arc_complete) {
+          this.line_exit_confirmed = true;
+          this.line_exit_heading_rad = h;
+          this.arc_just_exited = true;
+          this.enterClear(d, now);
+          return;
+        }
+      } else {
+        const gap = Math.hypot(axle_x_cm - this.waypoint_x_cm[this.index], axle_y_cm - this.waypoint_y_cm[this.index]);
+        if (gap <= ROUTE_WAYPOINT_EXIT_CM && turn >= target - ROUTE_WAYPOINT_EXIT_ANGLE_RAD) {
+          this.line_exit_confirmed = true;
+          this.line_exit_heading_rad = h;
+          this.enterClear(d, now);
+          return;
+        }
       }
     }
 

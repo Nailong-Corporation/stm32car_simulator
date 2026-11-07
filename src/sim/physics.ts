@@ -17,6 +17,7 @@ import {
   MOTOR_BRAKE_TAU_S,
   MOTOR_MAX_ACCEL_CM_S2,
   MOTOR_MAX_DECEL_CM_S2,
+  MOTOR_REVERSE_BRAKE_DECEL_CM_S2,
 } from './config';
 import { LineState, type EncoderCounts, type GrayObservation } from './types';
 
@@ -33,8 +34,23 @@ export interface SensorPoint {
   active: boolean;
 }
 
-/** Lumped wheel + chassis inertia under rolling contact, all units cm/s. */
-export function advanceWheel(speed: number, pwmFreeSpeed: number, enabled: boolean, dt: number): number {
+/** Lumped wheel + chassis inertia under rolling contact, all units cm/s.
+ *  `reverse` selects the negative-PWM branch: the H-bridge torque opposes the
+ *  current motion, so the wheel is pulled towards the (negative) free-run speed
+ *  of the command, limited by grip/current (MOTOR_REVERSE_BRAKE_DECEL_CM_S2) and
+ *  floored at zero. A reverse command can never spin the wheel backwards. */
+export function advanceWheel(
+  speed: number,
+  pwmFreeSpeed: number,
+  enabled: boolean,
+  dt: number,
+  reverse = false
+): number {
+  if (reverse && enabled) {
+    const decel = MOTOR_REVERSE_BRAKE_DECEL_CM_S2 * dt;
+    const change = (pwmFreeSpeed - speed) * (1 - Math.exp(-dt / MOTOR_RESPONSE_TAU_S));
+    return Math.max(0, speed + Math.max(-decel, Math.min(0.0, change)));
+  }
   const tau = !enabled ? MOTOR_COAST_TAU_S : pwmFreeSpeed === 0 ? MOTOR_BRAKE_TAU_S : MOTOR_RESPONSE_TAU_S;
   const equilibrium = enabled ? pwmFreeSpeed : 0;
   const change = (equilibrium - speed) * (1 - Math.exp(-dt / tau));
@@ -185,10 +201,14 @@ export class VehicleSimulator {
     // Both-zero output means STBY low (coast); one zero wheel with STBY high
     // selects TB6612 short brake. Neither can change wheel velocity instantly.
     const enabled = cmd.standby && (cmd.left_pwm !== 0 || cmd.right_pwm !== 0);
+    // Negative PWM is the reverse-brake branch of the driver; the plant treats it
+    // as torque against motion, never as a reverse speed target.
+    const reverseLeft = enabled && cmd.left_pwm < 0;
+    const reverseRight = enabled && cmd.right_pwm < 0;
     const oldLeft = this.actual_left_speed;
     const oldRight = this.actual_right_speed;
-    this.actual_left_speed = advanceWheel(oldLeft, target_v_left, enabled, dt);
-    this.actual_right_speed = advanceWheel(oldRight, target_v_right, enabled, dt);
+    this.actual_left_speed = advanceWheel(oldLeft, target_v_left, enabled, dt, reverseLeft);
+    this.actual_right_speed = advanceWheel(oldRight, target_v_right, enabled, dt, reverseRight);
     const leftTravel = (oldLeft + this.actual_left_speed) * 0.5 * dt;
     const rightTravel = (oldRight + this.actual_right_speed) * 0.5 * dt;
 

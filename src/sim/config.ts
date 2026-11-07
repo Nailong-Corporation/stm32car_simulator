@@ -21,9 +21,54 @@ export const GRAY_FORWARD_OFFSET_CM = 24.0;
 
 export const CORNER_RADIUS_CM = 24.0;
 export const CORNER_HEADING_KP = 8.0;
-export const LEFT_COUNTS_PER_WHEEL_REV = 1560.0;
-export const RIGHT_COUNTS_PER_WHEEL_REV = 1560.0;
-export const ODOMETRY_DISTANCE_SCALE = 3.05;
+
+/* Rolling corner (2026-11-08 prototype): instead of braking to the settle speed
+ * and pivoting around the inner wheel, an ordinary 90 degree corner is a single
+ * arc of radius CORNER_ARC_RADIUS_CM that is tangent to both segments.  The arc
+ * leaves the printed wire by R*(sqrt(2)-1) at its midpoint (6.2 cm at R=15) and
+ * rejoins it exactly at the exit tangent point, so the pose carries the car
+ * through the corner and the grey bar recaptures the next leg on the way out.
+ * The axle speed is the arc speed; the wheels are
+ *   outer = v*(1 + track/(2R)),  inner = v*(1 - track/(2R)),
+ * i.e. the inner wheel keeps rolling instead of being stopped. */
+/* Values below are the merged defaults the prototype settled on; the sweep
+ * hooks it used during tuning (ARC_R/ARC_V/...) are intentionally removed so
+ * the simulator and the firmware build the same constants. */
+export const CORNER_ARC_RADIUS_CM = 13.0;
+/* Axle centre speed through the arc (cm/s). The outer wheel runs at
+ * v*(1 + track/(2*R)) = 1.47v at R=15, track=14. */
+export const CORNER_ARC_SPEED_CM_S = 70.0;
+/* Differential (cm/s) per rad of heading error against the arc tangent. */
+export const CORNER_ARC_HEADING_KP = 22.0;
+/* The outgoing leg must leave room for the exit tangent point (R past the
+ * corner) before the next corner's bar can see it: at least 2R of leg. */
+export const CORNER_ARC_MIN_LEG_MARGIN_CM = 4.0;
+/* Enter the arc when the axle is this close to the entry tangent point. */
+export const CORNER_ARC_ENTER_TOL_CM = 0.5;
+/* The wheels need CORNER_ARC_EXIT_LEAD_S to unwind after the differential is
+ * released (measured: the yaw keeps integrating for ~60 ms after the target
+ * differential drops to zero).  The arc therefore hands off CORNER_ARC_EXIT_LEAD_S
+ * earlier: the coasting car finishes the last few degrees on the same circle. */
+export const CORNER_ARC_EXIT_LEAD_S = 0.05;
+/* Pose exit: heading within this residual of the corner angle AND the axle
+ * within this distance of the exit tangent point. */
+export const CORNER_ARC_EXIT_ALONG_TOL_CM = 6.0;
+export const CORNER_ARC_EXIT_ANGLE_RAD = 0.05;
+export const CORNER_ARC_EXIT_TOL_CM = 3.0;
+/* Angular progress (rad) that also counts as reaching the exit tangent. */
+export const CORNER_ARC_EXIT_PROGRESS_RAD = 0.06;
+/* Yaw-rate damping applied while a rolling corner's differential unwinds
+ * (cm/s of differential per rad/s of measured yaw rate). */
+export const CORNER_ARC_EXIT_DAMPING = 2.5;
+/* Slew on the differential so the inner wheel is not stepped from full speed
+ * to the arc inner speed in one period (motion_config.h MOTOR_MAX_DECEL_S). */
+export const CORNER_ARC_DIFF_SLEW_CM_S2 = 900.0;
+export const LEFT_COUNTS_PER_WHEEL_REV = 780.0;
+export const RIGHT_COUNTS_PER_WHEEL_REV = 780.0;
+/* MG310 1:10 gearbox (2026-11-07): the encoder sits on the motor shaft, so a
+ * wheel revolution now yields half the quadrature counts (1560 -> 780); the
+ * distance scale halves with it so distance-per-count is unchanged. */
+export const ODOMETRY_DISTANCE_SCALE = 1.525;
 export const ODOMETRY_HEADING_SCALE = 0.77;
 
 export const VEHICLE_MAX_SPEED_CM_S = 500.0;
@@ -43,8 +88,14 @@ export const MOTOR_PWM_LIMIT = 255.0;
 export const MOTOR_RESPONSE_TAU_S = 0.120;
 export const MOTOR_COAST_TAU_S = 0.350;
 export const MOTOR_BRAKE_TAU_S = 0.080;
-export const MOTOR_MAX_ACCEL_CM_S2 = 250.0;
-export const MOTOR_MAX_DECEL_CM_S2 = 300.0;
+export const MOTOR_MAX_ACCEL_CM_S2 = 500.0;
+export const MOTOR_MAX_DECEL_CM_S2 = 500.0;
+/* Reverse-torque plant assumption (simulator only, no firmware counterpart):
+ * driving the H-bridge against the direction of travel adds torque to the
+ * rolling friction, so the achievable deceleration is higher than coasting but
+ * still grip/current limited.  The model never lets a negative command spin the
+ * wheel backwards: speed is floored at zero.  Bench calibration pending. */
+export const MOTOR_REVERSE_BRAKE_DECEL_CM_S2 = 900.0;
 
 /* Stall & Reverse Protection */
 export const SPEED_STALL_TARGET_CM_S = 3.0;
@@ -129,10 +180,35 @@ export const COMPONENT_RECOVERY_SPEED_CM_S = 16.0;
 export const COMPONENT_RECOVERY_MAX_CM = 12.0;
 export const COMPONENT_RECOVERY_TIMEOUT_MS = 1200;
 
+export const BRAKING_ACCEL_FILTER_TAU_S = 0.080;
 export const BRAKING_CALIBRATION_CONFIRMED = 1;
-export const BRAKING_SAFE_DECEL_CM_S2 = 120.0;
+export const BRAKING_SAFE_DECEL_CM_S2 = 250.0;
 export const BRAKING_DISTANCE_MARGIN_CM = 2.0;
 export const BRAKING_TARGET_JERK_CM_S3 = 800.0;
+
+/* Reverse (negative-PWM) approach braking.
+ * Mirrors include/motion_config.h: the switch is a compile-time constant in the
+ * firmware and a module constant here, so the default OFF state is bit-identical
+ * to the coast/short-brake plant.  A negative PWM command never becomes a
+ * reverse speed target: it is torque against positive motion and the plant model
+ * floors the wheel speed at zero (no reverse rotation). */
+export const MOTOR_REVERSE_BRAKE_ENABLED = 0;
+export const BRAKING_REVERSE_HARDWARE_CONFIRMED = 0;
+/* Cumulative reverse-torque time allowed per braking segment (ms). */
+export const BRAKING_REVERSE_MAX_MS = 250;
+/* Below this speed the reverse output is cut: it cannot stop the car, only
+ * start pushing it backwards. */
+export const REVERSE_BRAKE_MIN_CRUISE_CM_S = 200;
+export const BRAKING_REVERSE_MIN_SPEED_CM_S = 8.0;
+/* Distance/reaction reserve before the planned stop point. */
+export const BRAKING_REVERSE_GUARD_CM = 3.0;
+/* Only apply reverse torque when the measured speed is this far above target. */
+export const REVERSE_BRAKE_MARGIN_CM_S = 3.0;
+/* Documented in the firmware but not used by the current C PID branch (the
+ * shared speed PID gains do the mapping). Kept for parity. */
+export const REVERSE_BRAKE_KP = 4.0;
+/* Magnitude limit of the negative PWM command on the 255 scale. */
+export const REVERSE_BRAKE_MAX_PWM = 60.0;
 export const JUNCTION_SEARCH_TIMEOUT_MS = 2000;
 export const JUNCTION_SEARCH_MAX_CM = 12.0;
 export const JUNCTION_ENTRY_BRAKE_TIMEOUT_MS = 2000;
@@ -174,7 +250,7 @@ export const ROUTE_WAYPOINT_MARGIN_CM = 5.0;
 export const ROUTE_WAYPOINT_CONFIRM_CM = 2.5;
 export const ROUTE_WAYPOINT_FALLBACK_CM = 18.0;
 /* The ring entry is timed on the axle pose, not the 24 cm look-ahead bar. */
-export const ROUTE_WAYPOINT_RING_CONFIRM_CM = 3.0;
+export const ROUTE_WAYPOINT_RING_CONFIRM_CM = 6.0;
 /* A gray junction only authorises this row's action when its bar is this close
  * to the row's known corner; farther nodes are passing junctions. */
 export const ROUTE_WAYPOINT_GATE_CM = 12.0;

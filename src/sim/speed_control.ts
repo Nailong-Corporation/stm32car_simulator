@@ -17,6 +17,10 @@ import {
   SPEED_REVERSE_CONFIRM_CM,
   SPEED_REVERSE_IMMEDIATE_CM_S,
   CONTROL_MAX_INTERVAL_MS,
+  MOTOR_REVERSE_BRAKE_ENABLED,
+  BRAKING_REVERSE_MIN_SPEED_CM_S,
+  REVERSE_BRAKE_MARGIN_CM_S,
+  REVERSE_BRAKE_MAX_PWM,
 } from './config';
 
 export enum SpeedFault {
@@ -73,7 +77,8 @@ export class SpeedControlModel {
     target: number,
     measured: number,
     dt: number,
-    which: 'left' | 'right'
+    which: 'left' | 'right',
+    reverse_brake: boolean
   ): { fault: SpeedFault; pwm: number } {
     if (
       !Number.isFinite(target) ||
@@ -101,6 +106,28 @@ export class SpeedControlModel {
 
     if (stall >= SPEED_STALL_TIMEOUT_S) {
       return { fault: SpeedFault.SPEED_FAULT_STALL, pwm: 0.0 };
+    }
+
+    if (
+      MOTOR_REVERSE_BRAKE_ENABLED &&
+      reverse_brake &&
+      measured > BRAKING_REVERSE_MIN_SPEED_CM_S &&
+      measured > target + REVERSE_BRAKE_MARGIN_CM_S
+    ) {
+      /* Same speed PID error and anti-windup as forward drive, but bounded to
+       * negative PWM: this is torque against positive motion, never a reverse
+       * speed target. */
+      const brake = pid.updateBounded(
+        target - measured,
+        dt,
+        -REVERSE_BRAKE_MAX_PWM,
+        0.0,
+        0.0
+      );
+      return {
+        fault: brake.success ? SpeedFault.SPEED_FAULT_NONE : SpeedFault.SPEED_FAULT_PID,
+        pwm: brake.output,
+      };
     }
 
     const res = pid.updateBounded(
@@ -157,7 +184,8 @@ export class SpeedControlModel {
     rt: number,
     lm: number,
     rm: number,
-    dt: number
+    dt: number,
+    reverse_brake = false
   ): { success: boolean; command: MotorCommand } {
     const emptyCommand: MotorCommand = {
       left_pwm: 0,
@@ -204,13 +232,13 @@ export class SpeedControlModel {
     let l = 0;
     let r = 0;
     if (fault === SpeedFault.SPEED_FAULT_NONE) {
-      const res = this.wheel(this.left, lt, lm, dt, 'left');
+      const res = this.wheel(this.left, lt, lm, dt, 'left', reverse_brake);
       fault = res.fault;
       l = res.pwm;
       failed_wheel = 1;
     }
     if (fault === SpeedFault.SPEED_FAULT_NONE) {
-      const res = this.wheel(this.right, rt, rm, dt, 'right');
+      const res = this.wheel(this.right, rt, rm, dt, 'right', reverse_brake);
       fault = res.fault;
       r = res.pwm;
       failed_wheel = 2;

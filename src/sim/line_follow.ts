@@ -34,9 +34,17 @@ import {
   COMPONENT_CROSS_MS,
   POSE_BOUNDED_LOSS_MS,
   POSE_BOUNDED_LOSS_CM,
+  BRAKING_ACCEL_FILTER_TAU_S,
   BRAKING_SAFE_DECEL_CM_S2,
   BRAKING_DISTANCE_MARGIN_CM,
   BRAKING_TARGET_JERK_CM_S3,
+  BRAKING_REVERSE_MAX_MS,
+  BRAKING_REVERSE_MIN_SPEED_CM_S,
+  BRAKING_REVERSE_GUARD_CM,
+  BRAKING_REVERSE_HARDWARE_CONFIRMED,
+  MOTOR_REVERSE_BRAKE_ENABLED,
+  REVERSE_BRAKE_MARGIN_CM_S,
+  REVERSE_BRAKE_MIN_CRUISE_CM_S,
   JUNCTION_PASS_SPEED_CM_S,
   JUNCTION_SETTLE_BAND_RAD,
   JUNCTION_PASS_ALIGNED_RAD,
@@ -55,6 +63,11 @@ import {
   NAVIGATION_RECOVERY_SPEED_CM_S,
   CORNER_RADIUS_CM,
   CORNER_HEADING_KP,
+  CORNER_ARC_RADIUS_CM,
+  CORNER_ARC_SPEED_CM_S,
+  CORNER_ARC_HEADING_KP,
+  CORNER_ARC_DIFF_SLEW_CM_S2,
+  CORNER_ARC_EXIT_DAMPING,
   GRAY_FORWARD_OFFSET_CM,
   WHEEL_TRACK_CM,
   JUNCTION_EXIT_REWIND_RAD,
@@ -117,6 +130,14 @@ export class LineFollowModel {
   public braking_origin_cm = 0;
   public braking_active = false;
   public braking_reverse_active = false;
+  /* Reverse-brake diagnostics, mirroring line_follow.c: cumulative reverse-torque
+   * time per braking segment, the planner's required deceleration and the
+   * filtered observed deceleration used to decide that reverse torque is needed. */
+  public braking_reverse_ms = 0;
+  public braking_required_cm_s2 = 0;
+  public braking_accel_cm_s2 = 0;
+  public braking_speed_primed = false;
+  public braking_previous_speed_cm_s = 0;
   public have_reliable = false;
   public abnormal = false;
   public valid_count = 0;
@@ -178,6 +199,11 @@ export class LineFollowModel {
 
     this.braking_active = false;
     this.braking_reverse_active = false;
+    this.braking_reverse_ms = 0;
+    this.braking_required_cm_s2 = 0;
+    this.braking_accel_cm_s2 = 0;
+    this.braking_speed_primed = false;
+    this.braking_previous_speed_cm_s = 0;
     this.have_reliable = false;
     this.abnormal = false;
     this.valid_count = 0;
@@ -371,6 +397,12 @@ export class LineFollowModel {
         this.have_reliable = true;
         this.last_reliable_ms = now_ms;
         this.reliable_position = obs.position;
+        this.braking_slew.reset();
+        this.braking_active = false;
+        this.braking_speed_primed = false;
+        this.braking_reverse_ms = 0;
+        this.braking_reverse_active = false;
+        this.braking_required_cm_s2 = 0;
         this.route.start(this.odometry.distance_cm, now_ms);
       } else {
         return;
@@ -519,6 +551,9 @@ export class LineFollowModel {
         this.braking_slew.acceleration = 0;
         this.braking_origin_cm = planning_origin;
         this.braking_active = true;
+        this.braking_speed_primed = false;
+        this.braking_reverse_ms = 0;
+        this.braking_reverse_active = false;
       }
       const exitAdvance = this.route.planningIndex() > 0 ? WHEEL_TRACK_CM : 0;
       const target_dist = Math.max(0, planning_step.segment_length_cm - GRAY_FORWARD_OFFSET_CM - exitAdvance);
@@ -538,6 +573,59 @@ export class LineFollowModel {
       }
       navigation_wheel_cap = Math.min(navigation_wheel_cap, plan.allowed_speed);
       this.braking_active = true;
+      /* Reverse-brake arming, mirroring line_follow.c: the planner says the
+       * passive envelope (BRAKING_SAFE_DECEL_CM_S2) cannot meet the stop point,
+       * the line is a stable narrow centre, and both wheels are fast enough that
+       * reverse torque cannot push the car backwards.  It is an arming
+       * threshold, never a physical stopping boundary; the pump is capped by
+       * BRAKING_REVERSE_MAX_MS and cut below BRAKING_REVERSE_MIN_SPEED_CM_S.
+       * Gated on the two switches so the default (OFF) build executes nothing
+       * new here: the replay output stays bit-identical. */
+      if (BRAKING_REVERSE_HARDWARE_CONFIRMED && MOTOR_REVERSE_BRAKE_ENABLED) {
+        const braking_speed = Math.max(
+          Math.abs(this.odometry.left_speed_cm_s),
+          Math.abs(this.odometry.right_speed_cm_s)
+        );
+        const raw_accel = this.braking_speed_primed
+          ? (braking_speed - this.braking_previous_speed_cm_s) / dt
+          : 0;
+        this.braking_previous_speed_cm_s = braking_speed;
+        if (!this.braking_speed_primed) this.braking_accel_cm_s2 = raw_accel;
+        else {
+          this.braking_accel_cm_s2 +=
+            dt / (BRAKING_ACCEL_FILTER_TAU_S + dt) * (raw_accel - this.braking_accel_cm_s2);
+        }
+        this.braking_speed_primed = true;
+        const decision = brakingDecide(
+          braking_speed,
+          planning_entry_speed,
+          plan.remaining_cm,
+          -this.braking_accel_cm_s2,
+          BRAKING_SAFE_DECEL_CM_S2,
+          BRAKING_REVERSE_GUARD_CM
+        );
+        this.braking_required_cm_s2 = decision.required_decel;
+        this.braking_reverse_active = false;
+        if (decision.distance_exhausted && braking_speed > planning_entry_speed + REVERSE_BRAKE_MARGIN_CM_S) {
+          this.route.navigation_warning = RouteFailure.ROUTE_FAILURE_BRAKE_DISTANCE;
+        }
+        if (
+          decision.reverse_needed &&
+          !decision.distance_exhausted &&
+          narrow &&
+          stable &&
+          this.route.state === RouteState.ROUTE_FOLLOW &&
+          this.route.steps[this.route.index].cruise_speed >= REVERSE_BRAKE_MIN_CRUISE_CM_S &&
+          Math.min(this.odometry.left_speed_cm_s, this.odometry.right_speed_cm_s) >
+            BRAKING_REVERSE_MIN_SPEED_CM_S &&
+          this.braking_reverse_ms < BRAKING_REVERSE_MAX_MS
+        ) {
+          const frame_ms = Math.round(dt * 1000);
+          if (frame_ms <= BRAKING_REVERSE_MAX_MS - this.braking_reverse_ms) {
+            this.braking_reverse_active = true;
+          }
+        }
+      }
       base_speed = brakingSlew(
         this.braking_slew,
         plan.allowed_speed,
@@ -554,12 +642,22 @@ export class LineFollowModel {
       base_speed = Math.min(base_speed, planning_entry_speed);
     }
 
+    // A rolling corner exits on the outgoing wire, so it keeps its arc speed
+    // through the clearance and the post-turn phase instead of braking to the
+    // pivot exit speed: the asymmetric spin-down of a 60 -> 20 cm/s drop adds
+    // several tenths of a radian of yaw on top of the arc's own unwind.
+    const rolled_corner = this.route.usesCornerArc() || this.route.arc_just_exited;
     if (this.route.state === RouteState.ROUTE_CLEARING && this.route.currentAction() !== Action.STRAIGHT) {
-      base_speed = Math.min(base_speed, Math.min(step.turn_speed, JUNCTION_EXIT_SPEED_CM_S));
+      base_speed = Math.min(
+        base_speed,
+        rolled_corner
+          ? CORNER_ARC_SPEED_CM_S
+          : Math.min(step.turn_speed, JUNCTION_EXIT_SPEED_CM_S)
+      );
     }
     // Pose mode keeps the exit speed until the outgoing line is re-centred; the
     // printed symbol beside a corner must not be chased at cruise speed.
-    if (this.route.post_turn_slow) {
+    if (this.route.post_turn_slow && !rolled_corner) {
       base_speed = Math.min(base_speed, Math.min(step.turn_speed, JUNCTION_EXIT_SPEED_CM_S));
     }
     // Pose-mode corner approach: pre-slow so the brake phase does not eat the
@@ -622,6 +720,12 @@ export class LineFollowModel {
       let corr = HEADING_KP_CM_S_PER_RAD *
         Math.atan2(Math.sin(desired - this.odometry.heading_rad),
           Math.cos(desired - this.odometry.heading_rad));
+      // Right after a rolling corner the released differential keeps yawing the
+      // car for ~0.1-0.3 s; damping the measured yaw rate stops the drift much
+      // sooner than the cross-track term alone.
+      if (this.route.arc_just_exited) {
+        corr -= CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s;
+      }
       const cap = 0.5 * Math.max(base_speed, 1);
       corr = Math.max(-cap, Math.min(cap, corr));
       this.state = usable ? LineState.LINE_TRACKING : LineState.LINE_GAP_HOLD;
@@ -726,6 +830,26 @@ export class LineFollowModel {
         this.pid.reset();
         this.straightTargets(outer,
           HEADING_KP_CM_S_PER_RAD * (this.route.action_start_heading - this.odometry.heading_rad), dt);
+      } else if (this.route.pose_mode && this.route.usesCornerArc()) {
+        // Rolling corner: hold the axle at the arc speed and set the wheel
+        // differential to v*track/(2R). The feed-forward differential makes the
+        // radius; the heading error against the tangent (route supplies the
+        // desired heading from the circle, so this is real path following)
+        // steers back onto the circle. The inner wheel keeps rolling.
+        this.pid.reset();
+        const axle = CORNER_ARC_SPEED_CM_S;
+        const err = Math.atan2(
+          Math.sin(this.route.arc_desired_heading_rad - this.odometry.heading_rad),
+          Math.cos(this.route.arc_desired_heading_rad - this.odometry.heading_rad)
+        );
+        let differential = direction * this.route.arc_diff_cm_s + CORNER_ARC_HEADING_KP * err;
+        differential = Math.max(-0.9 * axle, Math.min(0.9 * axle, differential));
+        this.left_target_cm_s = Math.max(0, Math.min(WHEEL_TARGET_MAX_CM_S, axle + differential));
+        this.right_target_cm_s = Math.max(0, Math.min(WHEEL_TARGET_MAX_CM_S, axle - differential));
+        this.base = 0.5 * (this.left_target_cm_s + this.right_target_cm_s);
+        this.correction = 0.5 * (this.left_target_cm_s - this.right_target_cm_s);
+        this.startup_elapsed_s = Math.min(STARTUP_RAMP_TIME_S, this.startup_elapsed_s + dt);
+        this.exit_accelerating = true;
       } else if (this.route.pose_mode && this.route.currentAction() !== Action.STRAIGHT) {
         // Pose-mode pivot: saturated heading feedback towards the exact corner
         // heading. The grey line is deliberately not used inside the turn, so a
@@ -755,26 +879,7 @@ export class LineFollowModel {
           dt
         );
       } else {
-        if (
-          this.route.usesCornerArc() &&
-          !this.route.corner_arc_complete &&
-          !settling &&
-          !this.route.capture_line_seen
-        ) {
-          const track = this.odometry.calibration.track_cm;
-          const arcBase = outer / (1 + track / (2 * CORNER_RADIUS_CM));
-          const lead = GRAY_FORWARD_OFFSET_CM - CORNER_RADIUS_CM;
-          const planned = Math.max(
-            0,
-            Math.min(
-              Math.abs(target),
-              (this.odometry.distance_cm - this.route.entry_cm - lead) / CORNER_RADIUS_CM
-            )
-          );
-          correction =
-            direction *
-            ((arcBase * track) / (2 * CORNER_RADIUS_CM) + CORNER_HEADING_KP * (planned - turn));
-        } else if (this.route.turn_capturing || this.route.capture_line_seen || settling) {
+        if (this.route.turn_capturing || this.route.capture_line_seen || settling) {
           let line = 0;
           if (this.route.turn_capturing) {
             const res = this.pid.update(obs.position, dt, base);
@@ -888,11 +993,11 @@ export class LineFollowModel {
         correction = Math.max(-0.5 * base, Math.min(0.5 * base, correction));
       }
       if (
-        this.route.state === RouteState.ROUTE_CLEARING &&
+        (this.route.state === RouteState.ROUTE_CLEARING || this.route.arc_just_exited) &&
         this.route.line_exit_confirmed &&
         this.route.currentAction() !== Action.STRAIGHT
       ) {
-        correction -= JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
+        correction -= CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s;
         this.outerTargets(base, correction, dt);
       } else {
         this.targets(base, correction, dt);
@@ -908,12 +1013,29 @@ export class LineFollowModel {
       this.correction = 0.5 * (this.left_target_cm_s - this.right_target_cm_s);
     }
 
+    /* The reverse output is only valid while both wheels are measurably faster
+     * than their targets; once the PID has caught up (or the line is no longer
+     * a stable narrow centre) it must be released, otherwise the negative torque
+     * would start pushing the car backwards. */
+    if (
+      this.state !== LineState.LINE_TRACKING ||
+      Math.min(
+        this.odometry.left_speed_cm_s - this.left_target_cm_s,
+        this.odometry.right_speed_cm_s - this.right_target_cm_s
+      ) <= REVERSE_BRAKE_MARGIN_CM_S
+    ) {
+      this.braking_reverse_active = false;
+    }
+    if (this.braking_reverse_active) {
+      this.braking_reverse_ms += Math.round(dt * 1000);
+    }
     const { success, command } = this.speed.update(
       this.left_target_cm_s,
       this.right_target_cm_s,
       this.odometry.left_speed_cm_s,
       this.odometry.right_speed_cm_s,
-      dt
+      dt,
+      this.braking_reverse_active && this.state === LineState.LINE_TRACKING && narrow
     );
 
     if (!success) {
