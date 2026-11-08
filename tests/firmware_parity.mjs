@@ -108,6 +108,14 @@ try {
       assert.ok(Math.abs(actual[i][7]-expected[i][7])<0.5,`scheme ${scheme.id} odometry drift at ${i}`);
       assert.ok(Math.abs(actual[i][8]-expected[i][8])<0.02,`scheme ${scheme.id} heading drift at ${i}`);
     }
+    /* Every formal route must reach its final STOP, not merely agree on the
+     * frames before a shared failure.  (Scheme 0 is the four-step debug table
+     * and is only run in the legacy -DPOSE_NAV_ENABLED=0 build.) */
+    if (poseNav) {
+      assert.equal(f.route.state, RouteState.ROUTE_FINISHED,
+        `scheme ${scheme.id} must finish, final index ${f.route.index}/${scheme.steps.length - 1}, ` +
+        `state=${RouteState[f.route.state]}, failure=${f.route.failure}`);
+    }
     const meanSpeedError=totalSpeedError/Math.max(comparedFrames*2,1);
     assert.ok(outlierFrames<=12,
       `scheme ${scheme.id}: ${outlierFrames} frames diverge by >=6 cm/s (limit 12)`);

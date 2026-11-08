@@ -67,6 +67,20 @@ function runLap(schemeId: number) {
 }
 
 {
+  /* Scheme 2 skips the dashed leg, so r26 intentionally never enters the route;
+   * r5 is a 6.1 cm graze of the 6 cm gate.  The car still has to finish the
+   * whole 28-step no-dash lap. */
+  const { f, sim, scheme, best } = runLap(2);
+  assert.equal(f.route.state, RouteState.ROUTE_FINISHED,
+    `scheme 2 must finish: index=${f.route.index}/${scheme.steps.length - 1}, ` +
+    `state=${RouteState[f.route.state]}, failure=${RouteFailure[f.route.failure]}, ` +
+    `pose=(${sim.pose.x.toFixed(1)},${sim.pose.y.toFixed(1)})`);
+  const covered = [...best.values()].filter((b) => b.near <= PASS_CM).length;
+  assert.ok(covered >= 25, `no-dash lap must scan at least 25 components, got ${covered}`);
+  console.log(`PASS: scheme 2 no-dash lap finishes and scans ${covered} components`);
+}
+
+{
   const { f, sim, scheme, best } = runLap(3);
   assert.equal(f.route.state, RouteState.ROUTE_FINISHED,
     `scheme 3 outer loop must finish: index=${f.route.index}/${scheme.steps.length - 1}, ` +

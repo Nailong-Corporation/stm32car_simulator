@@ -6,13 +6,14 @@
 
 ## ✅ 2026-11-08 全圈修复状态（最新）
 
-**结论：仿真器方案 1（走虚线、全元件）已能完整跑完 30 步回到 P，27/27 个印刷元件全部被 8 路探头扫过；方案 3（外框测试圈）也能闭合。** 方案 2（不走虚线）目前仍停在 21/27 步，是下一轮的工作项。
+**结论：仿真器/C 固件的所有正式方案都能跑完整圈。** 方案 1（走虚线、全元件）30/30 步回到 P，27/27 个印刷元件全部被车轴或 8 路探头杆扫过（最差 4.76 cm）；方案 2（不走虚线）28/28 步、覆盖 25 个元件（r26 只属于虚线支路，r5 为 6.1 cm 擦边）；方案 3/7（外框圈）闭合并覆盖 14 个；方案 4/5/6 也都能到最终 STOP，其中方案 5 同样覆盖 27/27。
 
 - 定位方法：对 `1faaec2`（赛道地图修正）做逐文件二分。把 `168cd77` 的 `src/sim/route.ts` / `src/sim/line_follow.ts` 放回去、保留新版 `map_data.ts`、电阻/三极管图形和现场编码器标定（`0.95 / 0.641`、`SPEED_KP=1.2`）后，方案 1 立即从“第 2 步停车”恢复到整圈完成。回归来自 `1faaec2` 引入的严格出弯（`turn_exit_search` 12 cm/1200 ms 居中窗口 + 短连接投影）在 28 cm/s 滚动弯后多转约 0.48 rad、出弯线偏 1.5 cm 时直接判 `EXIT_RECAPTURE`。
 - 保留的旧版控制常数：`CORNER_ARC_SPEED_CM_S=70`、`CORNER_ARC_EXIT_ALONG_TOL_CM=6`、`CORNER_ARC_EXIT_TOL_CM=3`；现场编码器数据、轮距/轮径/传感器前伸等硬件参数一个未动。
-- `npm test`：45 PASS，新增 `tests/full_lap.test.ts` 强制“方案 1 完成 + 27 个元件任一时刻进入车轴或探头杆 6 cm 内”“方案 3 完成并覆盖 ≥12 个元件”。`ROUTE_NEW_ALGO_TESTS=1 npm test` 可运行 11-08 严格出弯/几何授权的旧用例（当前默认跳过，它们断言的是导致整圈回归的行为）。
-- C/TS 锁步：`firmware/legacy-full-lap.patch` 把固件 `route.c/route.h/line_follow.c/line_follow.h` 恢复到 `4477434` 的出弯契约，并在其之上重放 `7569a50` 的 START 单线计数修复与当前 `route_table.c`。已应用到独立固件 worktree `/Users/zhendong/Documents/car_stm32_full_lap`（分支 `fix/full-lap-legacy`，提交 `600b6e9`，`pio run` SUCCESS：RAM 10884 / Flash 51712）；`FW_DIR=<该目录> npm run parity` **7 个方案逐帧全 PASS**（方案 1 15072 帧、目标轮速均值误差 0.0029 cm/s，最终 index 29）。
-- 固件主机测试：`run_pose_node_authorization / run_turn_angle_exit / run_short_link / run_pass_heading / run_maneuver_loss / run_total_distance / run_pending_rewrite` 仍断言 11-08 严格出弯行为，和本次回退冲突；下一轮要么把这些用例迁到“旧出弯基线”，要么在 C 侧引入显式 `legacy exit` 开关后再合并。**目前不要把这些失败当成整圈已通过。**
+- 方案 2/6 边界弯修正（路线表参数，非硬件参数）：右上角 `(375,110)` 的右转若用内轮枢轴，轴心会摆到 `x≈382` 出界；该行改为 `corner_arc_enabled=true, short_link_cm=0` 后用 R=13 圆弧切线出弯，方案 2/6 从 21/27 步恢复到整圈（方案 2 为 25 个元件，方案 6 为 26 个）。C 表与仿真器内置表已同步。
+- `npm test`：46 PASS，`tests/full_lap.test.ts` 强制方案 1（27/27 元件）、方案 2（整圈 + ≥25 元件）、方案 3（整圈 + ≥12 元件）。`ROUTE_NEW_ALGO_TESTS=1 npm test` 可运行 11-08 严格出弯/几何授权的旧用例（默认跳过，它们断言的是导致整圈回归的行为）。
+- C/TS 锁步：`firmware/legacy-full-lap.patch` 已合并进固件 `main`（提交 `07fb2d9`）；`pio run` SUCCESS（RAM 10884 / Flash 51712），`npm run parity` 默认直接用固件主树，**7 个方案逐帧一致且全部 FINISHED**（方案 1 15072 帧、方案 2 13443 帧、目标轮速均值误差 ≤0.0029 cm/s）。
+- 固件主机测试：主树基线本身已有与本次改动无关的红项（`test_motor_hal`、`test_logic`、`test_heading_scale` 的旧比例、`test_reverse_feedback` 的旧编码器极性）；严格出弯/几何授权用例已用 `ROUTE_NEW_ALGO_TESTS=1` 隔离。它们是下一轮清理项，**不要据此宣称固件主机套件全绿**。
 
 ---
 
