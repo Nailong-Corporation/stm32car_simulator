@@ -68,6 +68,7 @@ import {
   CORNER_ARC_HEADING_KP,
   CORNER_ARC_DIFF_SLEW_CM_S2,
   CORNER_ARC_EXIT_DAMPING,
+  STRAIGHT_YAW_DAMPING,
   GRAY_FORWARD_OFFSET_CM,
   WHEEL_TRACK_CM,
   JUNCTION_EXIT_REWIND_RAD,
@@ -79,7 +80,6 @@ import {
   JUNCTION_CENTER_LIMIT,
   JUNCTION_CROSS_KP,
   POSE_PURSUIT_LOOKAHEAD_CM,
-  POSE_GRAY_TRIM,
   ROUTE_WAYPOINT_GATE_CM,
   HEXAGON_TURN_TOL_RAD,
 } from './config';
@@ -331,16 +331,32 @@ export class LineFollowModel {
       ? this.exit_heading_rad : fallback;
   }
 
-  /** A grey reading is trusted only when its lateral offset agrees with the
-   * pose's offset from the active segment line (+-3 cm). A printed transistor
-   * branch or resistor arm reads like a line but sits where the pose says the
-   * car is centred, so it is rejected and the pose bearing takes over. */
+  /** A rolling corner has just released its differential, or the route is still
+   * clearing the exit: those frames keep the stronger corner-exit damping
+   * (line_follow.c `arc_just_exited || state==ROUTE_CLEARING`). It is spelled as
+   * a helper because the FOLLOW straight branch has already narrowed the route
+   * state, where the CLEARING arm is unreachable in this controller. */
+  private inCornerExit(): boolean {
+    return this.route.arc_just_exited || this.route.state === RouteState.ROUTE_CLEARING;
+  }
+
+  /** Which grey reading may steer, now that the straight branch trusts grey.
+   * Mirrors line_follow.c gray_plausible() exactly:
+   *  - a centred narrow line is unambiguous, always trusted (after a pivot the
+   *    pose can be several cm off);
+   *  - a pose cross-track beyond ROUTE_WAYPOINT_GATE_CM means the pose itself is
+   *    the suspect side, so the visible narrow line is trusted (field 2026-11-08:
+   *    pose_cross≈-16.5 cm, mask=0x04 = real line, old code vetoed it and the car
+   *    drove blind along its heading);
+   *  - the pose says "still on the segment" and the narrow reading disagrees: that
+   *    is most likely the 24 cm look-ahead bar already sitting on another real
+   *    wire (hexagon NW edge) or a printed stroke, so the pose hold keeps
+   *    authority. Wide/multi-region patterns are never trusted here. */
   private grayPlausible(obs: GrayObservation): boolean {
     if (!this.route.pose_mode || !this.route.pose_cross_valid) return true;
-    // A centred narrow line is unambiguous: after a fast pivot the pose can be
-    // several cm off, and rejecting this reading would leave the car without
-    // the very line it needs to recover on.
-    if (routeIsNarrowLine(obs) && Math.abs(obs.position) <= JUNCTION_CENTER_LIMIT) return true;
+    if (!routeIsNarrowLine(obs)) return false;
+    if (Math.abs(obs.position) <= JUNCTION_CENTER_LIMIT) return true;
+    if (Math.abs(this.route.pose_cross_cm) > ROUTE_WAYPOINT_GATE_CM) return true;
     const expected = -this.route.pose_cross_cm / 0.55;
     return Math.abs(obs.position - expected) <= JUNCTION_POSE_GRAY_SPREAD;
   }
@@ -715,20 +731,30 @@ export class LineFollowModel {
       this.route.state === RouteState.ROUTE_FOLLOW &&
       step.action !== Action.HEXAGON
     ) {
-      // Unified pose path-following for FOLLOW: the car is on a known straight
-      // segment between two table corners, so track that line directly. The
-      // 8-channel reading trims the cross-track estimate only while it agrees
-      // with the pose; this survives printed symbols, dead-end short legs and
-      // the 24 cm look-ahead leaving the wire at a corner.
+      // 2026-11-08 field fix: on a straight the lateral correction must be owned
+      // by the grey position PID. The old branch treated the pose segment as the
+      // control target with the 8-channel reading only trimming it by
+      // POSE_GRAY_TRIM=25%, so position=3 produced ~0.16 cm/s of differential
+      // (no correction at all): the car followed its IMU heading, drifted off a
+      // visible wire and finally lost it into GAP_HOLD (field route_index=0,
+      // pose_cross≈-16.5 cm, mask=0x04).
+      // Now: grey visible (single narrow line) -> ordinary position PID steering;
+      // pose/heading only hold the segment when grey is unusable (loss, wide or
+      // multi-region pattern, printed symbol). The gyro only damps yaw jitter; it
+      // never generates the straight steering command.
       const trusted = this.grayPlausible(obs);
       const usable = trusted && narrow;
-      let cross = this.route.pose_cross_cm;
       if (usable) {
-        cross = (1 - POSE_GRAY_TRIM) * cross + POSE_GRAY_TRIM * (-obs.position * 0.55);
         if (stable) {
           this.have_reliable = true;
           this.last_reliable_ms = now_ms;
           this.reliable_position = obs.position;
+        }
+        // Coming back from an unusable stretch: rebuild the PID history instead
+        // of resuming with a stale derivative/integral.
+        if (this.abnormal) {
+          this.pid.reset();
+          this.speed.reset();
         }
         this.abnormal = false;
       } else if (!this.abnormal &&
@@ -739,22 +765,44 @@ export class LineFollowModel {
         this.abnormal = true;
         this.abnormal_origin_cm = this.odometry.distance_cm;
       }
-      const desired = this.route.pose_seg_heading_rad +
-        Math.atan2(-cross, POSE_PURSUIT_LOOKAHEAD_CM);
-      let corr = HEADING_KP_CM_S_PER_RAD *
-        Math.atan2(Math.sin(desired - this.odometry.heading_rad),
-          Math.cos(desired - this.odometry.heading_rad));
-      // Right after a rolling corner the released differential keeps yawing the
-      // car for ~0.1-0.3 s; damping the measured yaw rate stops the drift much
-      // sooner than the cross-track term alone.
-      if (this.route.arc_just_exited) {
-        corr -= CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s;
+      if (usable) {
+        const base = base_speed * (1.0 - (POSITION_CURVE_SLOWDOWN * Math.abs(obs.position)) / 7.0);
+        const next = this.nextOuter(base, dt);
+        const pid = this.pid.update(obs.position, dt, 0.5 * next);
+        if (!pid.success) {
+          this.stop(LineStopReason.LINE_STOP_FAULT);
+          return;
+        }
+        // Yaw-rate damping only presses the measured yaw rate back to zero; the
+        // lateral error is always decided by the grey PID.
+        const correction = pid.output -
+          (this.inCornerExit()
+            ? CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s
+            : STRAIGHT_YAW_DAMPING * this.turn_yaw_rate_rad_s);
+        this.state = LineState.LINE_TRACKING;
+        this.outerTargets(base, correction, dt);
+      } else {
+        // Grey unusable: hold the pose segment direction and pull the car back
+        // onto that segment with the cross-track term (inside the bounded window
+        // while a printed symbol hides the wire or the narrow line is lost).
+        const cross = this.route.pose_cross_cm;
+        const desired = this.route.pose_seg_heading_rad +
+          Math.atan2(-cross, POSE_PURSUIT_LOOKAHEAD_CM);
+        let corr = HEADING_KP_CM_S_PER_RAD *
+          Math.atan2(Math.sin(desired - this.odometry.heading_rad),
+            Math.cos(desired - this.odometry.heading_rad));
+        // Right after a rolling corner the released differential keeps yawing the
+        // car for ~0.1-0.3 s; damping the measured yaw rate stops the drift much
+        // sooner than the cross-track term alone.
+        if (this.inCornerExit()) {
+          corr -= CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s;
+        }
+        const cap = 0.5 * Math.max(base_speed, 1);
+        corr = Math.max(-cap, Math.min(cap, corr));
+        this.state = LineState.LINE_GAP_HOLD;
+        this.pid.reset();
+        this.outerTargets(base_speed, corr, dt);
       }
-      const cap = 0.5 * Math.max(base_speed, 1);
-      corr = Math.max(-cap, Math.min(cap, corr));
-      this.state = usable ? LineState.LINE_TRACKING : LineState.LINE_GAP_HOLD;
-      this.pid.reset();
-      this.outerTargets(base_speed, corr, dt);
     } else if (this.route.state === RouteState.ROUTE_CANDIDATE && !this.route.targetReady(this.odometry.distance_cm, true)) {
       this.state = LineState.LINE_JUNCTION;
       this.abnormal = false;

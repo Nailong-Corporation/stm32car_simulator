@@ -61,6 +61,12 @@ export const CORNER_ARC_EXIT_PROGRESS_RAD = 0.06;
 /* Yaw-rate damping applied while a rolling corner's differential unwinds
  * (cm/s of differential per rad/s of measured yaw rate). */
 export const CORNER_ARC_EXIT_DAMPING = 2.5;
+/* Straight-line yaw-rate damping (motion_config.h STRAIGHT_YAW_DAMPING):
+ * the measured yaw rate is only damped back to zero so the differential does
+ * not jitter; the lateral error is always the grey position PID's job. The
+ * 2026-11-08 field failure was exactly "heading hold replaced the grey PID",
+ * so the heading must never generate the straight steering command again. */
+export const STRAIGHT_YAW_DAMPING = 1.2;
 /* Slew on the differential so the inner wheel is not stepped from full speed
  * to the arc inner speed in one period (motion_config.h MOTOR_MAX_DECEL_S). */
 export const CORNER_ARC_DIFF_SLEW_CM_S2 = 900.0;
@@ -271,14 +277,23 @@ export const ROUTE_WAYPOINT_EXIT_ANGLE_RAD = 0.12;
 /* Start braking for the corner this far before the bar reaches its waypoint. */
 export const ROUTE_WAYPOINT_SLOW_CM = 30.0;
 /* Allowed disagreement between the grey position (weight units, ~0.55 cm each)
- * and the pose-predicted lateral offset before the reading is distrusted. */
+ * and the pose-predicted lateral offset before an off-centre narrow reading is
+ * distrusted. Still live (motion_config.h JUNCTION_POSE_GRAY_SPREAD): since
+ * 2026-11-08 a centred narrow line is always trusted and a pose cross-track past
+ * ROUTE_WAYPOINT_GATE_CM gives the reading priority; only "pose says still on
+ * the segment but the line disagrees" keeps using this spread to distrust it. */
 export const JUNCTION_POSE_GRAY_SPREAD = 4.0;
 /* cm/s of differential correction per cm of pose cross-track error. */
 export const JUNCTION_CROSS_KP = 2.0;
-/* Pose path-following on the known segment: desired heading = segment heading
- * + atan2(-cross_track, lookahead). The grey line is only a trim when it is
- * plausible, so a printed symbol/branch cannot drag the car off the segment. */
+/* Pose-segment hold used when the grey line is unusable: desired heading =
+ * segment heading + atan2(-cross_track, lookahead), so the car drives parallel
+ * to and then back onto the known segment while a printed symbol hides the
+ * wire. Since 2026-11-08 the straight branch no longer uses this while a
+ * plausible narrow line is visible (the grey PID owns the steering there). */
 export const POSE_PURSUIT_LOOKAHEAD_CM = 30.0;
+/* Legacy (motion_config.h POSE_GRAY_TRIM): the straight branch is now driven by
+ * the grey position PID, so the pose no longer trims the cross-track by this
+ * weight. Kept only because motion_config.h keeps it for the C build. */
 export const POSE_GRAY_TRIM = 0.25;
 /* Pose-mode clearance: two cm is enough to keep the order; no line dedup. */
 export const ROUTE_CLEAR_POSE_CM = 2.0;
