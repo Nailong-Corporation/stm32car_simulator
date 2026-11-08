@@ -14,8 +14,9 @@ export const SENSOR_CONTINUITY_MARGIN = 1.0;
 export const LINE_CONFIRM_SAMPLES = 3;
 
 /* Wheel & Vehicle Dimensions */
-export const LEFT_WHEEL_DIAMETER_CM = 6.5;
-export const RIGHT_WHEEL_DIAMETER_CM = 6.5;
+/* 2026-11-08 实测轮径改为 4.8 cm（用户更新为 48 mm），左右轮同值。 */
+export const LEFT_WHEEL_DIAMETER_CM = 4.8;
+export const RIGHT_WHEEL_DIAMETER_CM = 4.8;
 export const WHEEL_TRACK_CM = 14.0;
 export const GRAY_FORWARD_OFFSET_CM = 24.0;
 
@@ -63,14 +64,14 @@ export const CORNER_ARC_EXIT_DAMPING = 2.5;
 /* Slew on the differential so the inner wheel is not stepped from full speed
  * to the arc inner speed in one period (motion_config.h MOTOR_MAX_DECEL_S). */
 export const CORNER_ARC_DIFF_SLEW_CM_S2 = 900.0;
-export const LEFT_COUNTS_PER_WHEEL_REV = 780.0;
-export const RIGHT_COUNTS_PER_WHEEL_REV = 780.0;
-/* MG310 1:10 gearbox (2026-11-07): the encoder sits on the motor shaft, so a
- * wheel revolution now yields half the quadrature counts (1560 -> 780); the
- * distance scale halves with it so distance-per-count is unchanged. */
+/* 2026-11-08 ST-Link 架空手转左轮 10 整圈实测 10641 计数：1064 计数/圈。
+ * 旧配置 780 计数/圈 × 0.95 让里程/轮速虚高，现改为实测值并令距离系数为 1：
+ * π×4.8/1064 = 0.01417 cm/计数。轮径与贴地滚动周长仍待赛道实测复核。 */
+export const LEFT_COUNTS_PER_WHEEL_REV = 1064.0;
+export const RIGHT_COUNTS_PER_WHEEL_REV = 1064.0;
 export const ENCODER_LEFT_SIGN = -1;
 export const ENCODER_RIGHT_SIGN = 1;
-export const ODOMETRY_DISTANCE_SCALE = 0.95;
+export const ODOMETRY_DISTANCE_SCALE = 1.0;
 export const ODOMETRY_HEADING_SCALE = 0.641;
 
 export const VEHICLE_MAX_SPEED_CM_S = 500.0;
@@ -222,7 +223,9 @@ export const JUNCTION_APPROACH_TIMEOUT_MS = 3000;
 // 24 cm ahead, bar half-span ~3.85 cm) and the car then brakes, so this value
 // trades an early pivot (exit line just outside the bar) against overrunning a
 // dead-end corner. Calibrated against the reference routes below.
-export const TURN_PIVOT_APPROACH_CM = 17.0;
+// 2026-11-08 实测：灰度确认路口后仍走约 17 cm 才起转，偏迟；按用户“检测到
+// 路口再走 10 cm 就起转”改为 17 -> 10（可直接微调的旋钮，改回 17 即旧行为）。
+export const TURN_PIVOT_APPROACH_CM = 10.0;
 // After a turn has confirmed its exit and then loses the line, bias the hold
 // heading toward the inside of the corner: the pivot can start a few cm early
 // (the bar sees the branch with its outer channel first), leaving the exit line
@@ -256,6 +259,10 @@ export const ROUTE_WAYPOINT_RING_CONFIRM_CM = 6.0;
 /* A gray junction only authorises this row's action when its bar is this close
  * to the row's known corner; farther nodes are passing junctions. */
 export const ROUTE_WAYPOINT_GATE_CM = 12.0;
+/* 2026-11-08：位姿“已过角点”的最大滞后。超过该值说明位姿与表格不再一致（例如
+ * 上电后旋转过车体、或表内该行段长为 0 导致 waypoint 退化），此时必须由灰度节点
+ * 决定，禁止在 d≈0 就把第一行动作交出去（现场表现：一按 START 就左转）。 */
+export const ROUTE_WAYPOINT_MAX_PASSED_LAG_CM = 30.0;
 /* Pose-mode turn hand-off: when the axle has reached the pivot angle within
  * this distance of the row's corner, the grey exit contract is bypassed. */
 export const ROUTE_WAYPOINT_EXIT_CM = 14.0;

@@ -113,6 +113,11 @@ export class LineFollowModel {
   public state: LineState = LineState.LINE_IDLE;
   public stop_reason: LineStopReason = LineStopReason.LINE_STOP_NONE;
   public heading_source: HeadingSource = HeadingSource.HEADING_IMU;
+  /* 2026-11-08 START 时对齐 IMU 相对航向的零点：位姿导航假设「START 瞬间车头朝向
+   * 赛道起点航向、里程位姿为零」。上电后被搬动/旋转过的车体会让相对航向不为 0，
+   * 旧换算 world = h − π/2 会把本行 waypoint 算到车后，位姿触发在 d≈0 就接受动作
+   * （现场表现为一按 START 就左转，而不是先直行）。 */
+  public imu_heading_offset_rad = 0;
 
   public odometry: OdometryModel;
   public route: RoutePlannerModel;
@@ -191,6 +196,7 @@ export class LineFollowModel {
     this.state = LineState.LINE_IDLE;
     this.stop_reason = LineStopReason.LINE_STOP_NONE;
     this.heading_source = HeadingSource.HEADING_IMU;
+    this.imu_heading_offset_rad = 0;
     this.odometry.init(defaultOdometryCalibration());
     this.speed.reset();
     this.braking_slew.reset();
@@ -364,7 +370,11 @@ export class LineFollowModel {
     const previous_heading = this.odometry.heading_rad;
     const previous_route = this.route.state;
 
-    if (!this.odometry.updateWithHeading(counts, dt, imu_valid, imu_heading_rad)) {
+    /* START 是位姿原点：IMU 相对航向统一减去 START 时刻的读数（见
+     * imu_heading_offset_rad）。灰度/编码器兜底时沿用编码器航向。 */
+    const use_imu = this.heading_source === HeadingSource.HEADING_IMU && imu_valid;
+    if (!this.odometry.updateWithHeading(counts, dt, use_imu,
+      imu_heading_rad - this.imu_heading_offset_rad)) {
       this.stop(LineStopReason.LINE_STOP_ENCODER);
       return;
     }
@@ -403,6 +413,20 @@ export class LineFollowModel {
         this.braking_reverse_ms = 0;
         this.braking_reverse_active = false;
         this.braking_required_cm_s2 = 0;
+        /* START 是位姿原点。旧的位姿导航假设「START 时相对航向 = 0、里程位姿 = 0」，
+         * 但上电后把车搬上赛道时会转动车体，IMU 相对航向在 START 已不是 0；此时
+         * world = h − π/2 的换算把本行 waypoint 算到车后（bar_proj<0 → passed），
+         * 位姿触发在 d≈0 立刻接受动作 —— 现场表现就是一按 START 就左转、不先直行。
+         * 这里在每次 START 重新对齐：航向零点取当前 IMU 读数，里程位姿清零。 */
+        this.imu_heading_offset_rad =
+          this.heading_source === HeadingSource.HEADING_IMU && imu_valid &&
+          Number.isFinite(imu_heading_rad)
+            ? imu_heading_rad
+            : 0.0;
+        this.odometry.heading_rad = 0.0;
+        this.odometry.x_cm = this.odometry.y_cm = 0.0;
+        this.odometry.sensor_x_cm = GRAY_FORWARD_OFFSET_CM;
+        this.odometry.sensor_y_cm = 0.0;
         this.route.start(this.odometry.distance_cm, now_ms);
       } else {
         return;
@@ -823,7 +847,7 @@ export class LineFollowModel {
       const remaining = Math.abs(target) - turn;
       const band = Math.min(JUNCTION_SETTLE_BAND_RAD, 0.4 * Math.abs(target));
       const settling = this.route.currentAction() !== Action.STRAIGHT && band > 0 && remaining <= band;
-      const base = 0.5 * outer;
+      let base = 0.5 * outer;
       let correction = direction * base;
 
       if (this.route.turn_approaching) {
@@ -871,6 +895,23 @@ export class LineFollowModel {
           corr = Math.max(-base, Math.min(base, corr));
         }
         this.turnTargets(outer, corr, dt);
+      } else if (this.route.usesCornerArc() && !this.route.corner_arc_complete &&
+        !settling && !this.route.capture_line_seen) {
+        // Legacy grey-only rolling corner (POSE_NAV_ENABLED=0 build): same law
+        // as firmware line_follow.c, with the fixed CORNER_RADIUS_CM. Pose mode
+        // uses the table-driven arc above instead.
+        const track = this.odometry.calibration.track_cm;
+        if (CORNER_RADIUS_CM <= track * 0.5) {
+          this.stop(LineStopReason.LINE_STOP_CALIBRATION);
+          return;
+        }
+        base = outer / (1 + track / (2 * CORNER_RADIUS_CM));
+        const lead = GRAY_FORWARD_OFFSET_CM - CORNER_RADIUS_CM;
+        const planned = Math.max(0, Math.min(Math.abs(target),
+          (this.odometry.distance_cm - this.route.entry_cm - lead) / CORNER_RADIUS_CM));
+        correction = direction * (base * track / (2 * CORNER_RADIUS_CM) +
+          CORNER_HEADING_KP * (planned - turn));
+        this.turnTargets(outer, correction, dt);
       } else if (this.route.currentAction() === Action.STRAIGHT) {
         const pass = Math.min(base_speed, Math.max(outer, JUNCTION_PASS_SPEED_CM_S));
         this.straightTargets(

@@ -78,6 +78,7 @@ import {
   ROUTE_WAYPOINT_FALLBACK_CM,
   ROUTE_WAYPOINT_RING_CONFIRM_CM,
   ROUTE_WAYPOINT_GATE_CM,
+  ROUTE_WAYPOINT_MAX_PASSED_LAG_CM,
   ROUTE_WAYPOINT_EXIT_CM,
   ROUTE_WAYPOINT_EXIT_ANGLE_RAD,
   ROUTE_WAYPOINT_SLOW_CM,
@@ -1406,8 +1407,13 @@ export class RoutePlannerModel {
       // Parallel pose trigger (2026-11-06): the table corner is known in track
       // coordinates, so encoders+IMU can confirm it even when a printed symbol
       // hides the wire or the leg is shorter than the 24 cm look-ahead bar.
+      /* 表内 segment_length_cm==0 的行没有可用的角点（waypoint 退化到起点/上一角），
+       * 这时位姿不能代替灰度交棒，否则启动第一帧就会把角点判成“已过”并立即执行
+       * 第一行动作（2026-11-08 现场：在线上启动就左转）。该类行只按灰度节点计数执行。 */
       if (
+        this.pose_mode &&
         this.state === RouteState.ROUTE_FOLLOW &&
+        this.steps[this.index].segment_length_cm > 0 &&
         Number.isFinite(axle_x_cm) &&
         Number.isFinite(axle_y_cm) &&
         this.waypoint_x_cm.length === this.count
@@ -1429,7 +1435,11 @@ export class RoutePlannerModel {
         // (short leg started late) must still hand the row over instead of
         // driving by until the next corner.
         const barProj = proj - GRAY_FORWARD_OFFSET_CM;
-        const passed = barProj <= ROUTE_WAYPOINT_CONFIRM_CM && lateral <= ROUTE_WAYPOINT_GATE_CM;
+        /* “已过角点”只允许合理滞后：位姿一旦错位/退化，几十厘米以外的角点
+         * 也会满足 bar_proj<=确认半径，从而在 d≈0 直接触发动作。 */
+        const passed = barProj <= ROUTE_WAYPOINT_CONFIRM_CM &&
+          barProj >= -ROUTE_WAYPOINT_MAX_PASSED_LAG_CM &&
+          lateral <= ROUTE_WAYPOINT_GATE_CM;
         const reached = barGap <= ROUTE_WAYPOINT_CONFIRM_CM || passed;
         const fallback = st.segment_length_cm > 0 &&
           d - this.origin_cm >= st.segment_length_cm + ROUTE_WAYPOINT_FALLBACK_CM;
@@ -1592,7 +1602,9 @@ export class RoutePlannerModel {
       // target. Keeps the 8-channel proof but stops an over-counted node from
       // starting the turn tens of cm early.
       let poseMatches = true;
-      if (Number.isFinite(axle_x_cm) && Number.isFinite(axle_y_cm) &&
+      /* 0 段长的行没有角点可核对，退化为纯灰度节点行（距离 0 = 忽略距离）。 */
+      if (this.pose_mode && this.steps[this.index].segment_length_cm > 0 &&
+        Number.isFinite(axle_x_cm) && Number.isFinite(axle_y_cm) &&
         this.waypoint_x_cm.length === this.count) {
         const wh = h - Math.PI / 2;
         const sx = axle_x_cm + GRAY_FORWARD_OFFSET_CM * Math.cos(wh);
@@ -1686,7 +1698,8 @@ export class RoutePlannerModel {
     // 24 cm look-ahead bar a few cm after the pivot, so the grey-only contract
     // would time out.  When the axle has reached the pivot angle at the known
     // corner, hand over to the next row immediately.
-    const pose_available = action !== Action.STRAIGHT &&
+    const pose_available = this.pose_mode &&
+      action !== Action.STRAIGHT &&
       !this.passing_junction &&
       Number.isFinite(axle_x_cm) &&
       Number.isFinite(axle_y_cm) &&
@@ -1860,7 +1873,7 @@ export class RoutePlannerModel {
     // Pose mode: the corner is known, so the clearance dedup cannot gain any
     // information; a couple of cm keeps the same order without letting the
     // outgoing line loss stop a short leg.
-    if (Number.isFinite(axle_x_cm) && d - this.clear_cm >= ROUTE_CLEAR_POSE_CM) {
+    if (this.pose_mode && Number.isFinite(axle_x_cm) && d - this.clear_cm >= ROUTE_CLEAR_POSE_CM) {
       this.completeClear(d, now);
       return;
     }

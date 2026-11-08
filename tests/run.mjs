@@ -10,6 +10,7 @@ const server = await createServer({
 });
 try {
   await server.ssrLoadModule('/tests/distance_node.test.ts');
+  await server.ssrLoadModule('/tests/firmware_sync.test.ts');
   // 2026-11-08: the strict turn-exit / geometric-node-authorisation files below
   // assert the post-Nov-8 algorithm that regressed the full lap (scheme 1 stopped
   // after two corners).  The restored exit contract is covered by full_lap.test.ts;
