@@ -4,6 +4,18 @@
 
 ---
 
+## ✅ 2026-11-08 全圈修复状态（最新）
+
+**结论：仿真器方案 1（走虚线、全元件）已能完整跑完 30 步回到 P，27/27 个印刷元件全部被 8 路探头扫过；方案 3（外框测试圈）也能闭合。** 方案 2（不走虚线）目前仍停在 21/27 步，是下一轮的工作项。
+
+- 定位方法：对 `1faaec2`（赛道地图修正）做逐文件二分。把 `168cd77` 的 `src/sim/route.ts` / `src/sim/line_follow.ts` 放回去、保留新版 `map_data.ts`、电阻/三极管图形和现场编码器标定（`0.95 / 0.641`、`SPEED_KP=1.2`）后，方案 1 立即从“第 2 步停车”恢复到整圈完成。回归来自 `1faaec2` 引入的严格出弯（`turn_exit_search` 12 cm/1200 ms 居中窗口 + 短连接投影）在 28 cm/s 滚动弯后多转约 0.48 rad、出弯线偏 1.5 cm 时直接判 `EXIT_RECAPTURE`。
+- 保留的旧版控制常数：`CORNER_ARC_SPEED_CM_S=70`、`CORNER_ARC_EXIT_ALONG_TOL_CM=6`、`CORNER_ARC_EXIT_TOL_CM=3`；现场编码器数据、轮距/轮径/传感器前伸等硬件参数一个未动。
+- `npm test`：45 PASS，新增 `tests/full_lap.test.ts` 强制“方案 1 完成 + 27 个元件任一时刻进入车轴或探头杆 6 cm 内”“方案 3 完成并覆盖 ≥12 个元件”。`ROUTE_NEW_ALGO_TESTS=1 npm test` 可运行 11-08 严格出弯/几何授权的旧用例（当前默认跳过，它们断言的是导致整圈回归的行为）。
+- C/TS 锁步：`firmware/legacy-full-lap.patch` 把固件 `route.c/route.h/line_follow.c/line_follow.h` 恢复到 `4477434` 的出弯契约，并在其之上重放 `7569a50` 的 START 单线计数修复与当前 `route_table.c`。已应用到独立固件 worktree `/Users/zhendong/Documents/car_stm32_full_lap`（分支 `fix/full-lap-legacy`，提交 `600b6e9`，`pio run` SUCCESS：RAM 10884 / Flash 51712）；`FW_DIR=<该目录> npm run parity` **7 个方案逐帧全 PASS**（方案 1 15072 帧、目标轮速均值误差 0.0029 cm/s，最终 index 29）。
+- 固件主机测试：`run_pose_node_authorization / run_turn_angle_exit / run_short_link / run_pass_heading / run_maneuver_loss / run_total_distance / run_pending_rewrite` 仍断言 11-08 严格出弯行为，和本次回退冲突；下一轮要么把这些用例迁到“旧出弯基线”，要么在 C 侧引入显式 `legacy exit` 开关后再合并。**目前不要把这些失败当成整圈已通过。**
+
+---
+
 ## 🌟 核心特性
 
 1. **固件算法与参数的 TypeScript 移植**：
@@ -14,7 +26,7 @@
      - `odometry.c`：差速轮系里程计、TI12 四倍频与航向融合（Sinc 转向航向积分、编码器/IMU 双模）。
      - `speed_control.c`：双轮独立 PID 速度闭环与前馈 PWM 混流（量程 $500\text{ cm/s}$、满标尺 255）。
      - `pid.c`：含微分低通滤波与积分抗饱和的抗风移 PID。
-   - **与固件的单源参数同步（2026-11-07）**：编码器极性 `LEFT=-1 / RIGHT=+1`、里程比例 `0.95`、航向比例 `0.641`、速度环 `SPEED_KP=1.2`、圆弧速度 `60 cm/s`、圆弧出口容差 `8 cm / 8 cm` 等全部取自 `motion_config.h`，不再保留旧的仿真器调参值。`npm run parity` 会编译固件当前源码并用同一份观测/编码器输入回放，逐帧比较路线状态机、路口计数、目标轮速与里程；7 个内置方案全部通过（阈值帧 0）。
+   - **与固件的单源参数同步（2026-11-07）**：编码器极性 `LEFT=-1 / RIGHT=+1`、里程比例 `0.95`、航向比例 `0.641`、速度环 `SPEED_KP=1.2` 全部取自 `motion_config.h`；圆弧控制常数因整圈回归恢复为 `70 cm/s / 6 cm / 3 cm`（见上方 2026-11-08 状态，属于控制器参数而非硬件/编码器数据）。`npm run parity` 会编译固件当前源码并用同一份观测/编码器输入回放，逐帧比较路线状态机、路口计数、目标轮速与里程；7 个内置方案全部通过（阈值帧 0）。
    - 所有物理参数严格对齐 `motion_config.h`、`control_config.h`、`board_config.h`：
      - 控制周期：$5\text{ ms}$（$200\text{ Hz}$）
      - 轮轴中心间距（轮距）：$14.0\text{ cm}$

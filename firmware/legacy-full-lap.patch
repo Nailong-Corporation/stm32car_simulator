@@ -1,0 +1,658 @@
+diff --git a/include/line_follow.h b/include/line_follow.h
+index c65b08f..6ec4316 100644
+--- a/include/line_follow.h
++++ b/include/line_follow.h
+@@ -131,9 +131,6 @@ typedef struct {
+     MotorCommand command; /* Final PWM output in either mode. */
+     bool have_reliable, abnormal;
+     uint8_t valid_count;
+-    /* 只统计“单条窄线”的连续帧，专供 START 门禁。valid_count 还包含平行双线
+-     * （gray_is_parallel_pair），二者曾出现“valid_count>=3 但仍 REJECTED_LINE”
+-     * 的自相矛盾；这里让启动判据与跟踪确认判据各自独立、语义一致。 */
+     uint8_t single_line_count;
+     float reliable_position, base, correction, left_target_cm_s, right_target_cm_s;
+     float hold_heading_rad, abnormal_origin_cm;
+diff --git a/include/motion_config.h b/include/motion_config.h
+index 78e44aa..666da63 100644
+--- a/include/motion_config.h
++++ b/include/motion_config.h
+@@ -306,7 +306,7 @@
+ /* 2026-11-07 实车：R=13 cm 时 70 cm/s 需要 3.8 m/s² 侧向加速度，实测车在 106 cm/s
+  * 进弯根本咬不住弧线（首弯交接时残余角速度 2.1 rad/s、之后还多转约 6.7°）。
+  * 先降到 60 cm/s（2.8 m/s²），配合保守弯前减速窗口。 */
+-#define CORNER_ARC_SPEED_CM_S       60.0f
++#define CORNER_ARC_SPEED_CM_S       70.0f
+ #endif
+ #ifndef CORNER_ARC_HEADING_KP
+ #define CORNER_ARC_HEADING_KP       22.0f
+@@ -339,10 +339,10 @@
+  * “航向过 90°”兜底 → 出弯已 +2.4°，再叠 2.1 rad/s 残余角速度 → 首弯过转 6.7°。
+  * 放宽到 8 cm 让切点几何重新生效（回放交出点为 77°）。 */
+ #ifndef CORNER_ARC_EXIT_TOL_CM
+-#define CORNER_ARC_EXIT_TOL_CM      8.0f
++#define CORNER_ARC_EXIT_TOL_CM      3.0f
+ #endif
+ #ifndef CORNER_ARC_EXIT_ALONG_TOL_CM
+-#define CORNER_ARC_EXIT_ALONG_TOL_CM 8.0f
++#define CORNER_ARC_EXIT_ALONG_TOL_CM 6.0f
+ #endif
+ 
+ /* 转弯已确认出口后再次丢线时，把保持航向向弯内侧回一点：枢轴可能早于真实
+diff --git a/include/route.h b/include/route.h
+index 9cc5972..cec9cab 100644
+--- a/include/route.h
++++ b/include/route.h
+@@ -122,7 +122,6 @@ typedef struct {
+     uint32_t last_arc_ms;
+     bool turn_capturing, lap_boundary; /* 出口线捕获 / 非末轮 STOP 的闭合动作。 */
+     bool capture_line_seen, line_exit_confirmed;
+-    bool turn_exit_search; /* Full angle reached; bounded straight recovery before count unlock. */
+     uint8_t capture_line_samples;
+     uint32_t capture_line_ms;
+     float capture_line_cm;
+diff --git a/src/line_follow.c b/src/line_follow.c
+index 1552d6c..958e392 100644
+--- a/src/line_follow.c
++++ b/src/line_follow.c
+@@ -55,7 +55,7 @@ static bool start_allowed(LineFollow *f, bool stable)
+         f->start_result = LINE_START_REJECTED_FAULT;
+         return false;
+     }
+-    if (!stable || !route_is_narrow_line(f->observation)) {
++    if (!stable) {
+         f->start_result = LINE_START_REJECTED_LINE;
+         return false;
+     }
+@@ -108,11 +108,9 @@ void line_follow_stop(LineFollow *f, LineStopReason reason)
+         f->stop_snapshot = (LineStopSnapshot){
+             .exit_recovery_active=f->exit_recovery_active,
+             .exit_lateral_error_cm=f->exit_lateral_error_cm,
+-            .component_recovery_age_ms=f->route.turn_exit_search?
+-                (uint32_t)(f->sample_ms-f->route.phase_ms):f->route.component_recovery_used?
++            .component_recovery_age_ms=f->route.component_recovery_used?
+                 (uint32_t)(f->sample_ms-f->route.component_recovery_ms):0U,
+-            .component_recovery_progress_cm=f->route.turn_exit_search?
+-                fabsf(f->odometry.distance_cm-f->route.clear_cm):f->route.component_recovery_used?
++            .component_recovery_progress_cm=f->route.component_recovery_used?
+                 fabsf(f->odometry.distance_cm-f->route.component_recovery_cm):0.0f,
+             .braking_accel_cm_s2=f->braking_accel_cm_s2,
+             .braking_required_cm_s2=f->braking_required_cm_s2,
+@@ -310,7 +308,7 @@ static void pwm_output(LineFollow *f, float base, float correction, float dt)
+ static void open_loop_update(LineFollow *f, GrayObservation obs, uint32_t now_ms,
+                               float dt, bool start_request)
+ {
+-    bool narrow = route_is_narrow_line(obs) || gray_is_parallel_pair(obs);
++    bool narrow = route_is_narrow_line(obs);
+     if (!narrow) f->valid_count = 0;
+     else if (f->valid_count < LINE_CONFIRM_SAMPLES) ++f->valid_count;
+     if (route_is_narrow_line(obs)) {
+@@ -440,12 +438,10 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+         float alpha=dt/(JUNCTION_YAW_FILTER_TAU_S+dt);
+         f->turn_yaw_rate_rad_s+=alpha*(rate-f->turn_yaw_rate_rad_s);
+     }
+-    bool narrow = route_is_narrow_line(obs) || gray_is_parallel_pair(obs);
++    bool narrow = route_is_narrow_line(obs);
+     if (narrow) {
+         if (f->valid_count < LINE_CONFIRM_SAMPLES) ++f->valid_count;
+     } else f->valid_count = 0;
+-    /* START 必须压在单条窄线上：平行双线（电阻/极板图形）可以继续跟踪确认，
+-     * 但不计入启动判据，消除“valid_count>=3 却 REJECTED_LINE”的语义矛盾。 */
+     if (route_is_narrow_line(obs)) {
+         if (f->single_line_count < LINE_CONFIRM_SAMPLES) ++f->single_line_count;
+     } else f->single_line_count = 0;
+@@ -495,29 +491,19 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+      * component signature appears; while latched, hold-and-cross is allowed
+      * for a bounded distance/time. A real line loss or an unrelated ambiguity
+      * that was never preceded by a component signature keeps 400 ms / 8 cm. */
+-    /* 2026-11-07 实车：锁存不再要求已经进入 abnormal。电阻符号的单侧白笔画
+-     * （1~4 路、位置 3~6）本身就像一条偏线，若等到 abnormal 才锁存就晚了：
+-     * 位置 PID 会先把车往图形边缘拉，走偏后真线丢掉。现在只要看到元件特征
+-     * 就锁存穿越窗口，窗口内一律保持直行、不许巡线转向。 */
+-    if(!f->component_cross_latched && gray_is_component_pattern(obs)) {
++    if(!f->abnormal) f->component_cross_latched=false;
++    else if(!f->component_cross_latched && gray_is_component_pattern(obs)) {
+         f->component_cross_latched=true;
+         f->component_cross_ms=now_ms;
+         f->component_cross_cm=f->odometry.distance_cm;
+     }
+-    if(stable && (gray_is_parallel_pair(obs) ||
+-       (route_is_narrow_line(obs) && obs.white_count<=JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
+-        fabsf(obs.position)<=JUNCTION_CENTER_LIMIT)))
+-        f->component_cross_latched=false;
+-    bool component_visible=f->component_cross_latched &&
++    bool component_crossing=f->abnormal && f->component_cross_latched &&
+         (uint32_t)(now_ms-f->component_cross_ms)<COMPONENT_CROSS_MS &&
+         fabsf(f->odometry.distance_cm-f->component_cross_cm)<COMPONENT_CROSS_MAX_CM;
+-    bool component_crossing=f->abnormal && component_visible;
+     /* Pose mode: a printed component hides the wire for up to ~10 cm along the
+      * segment and the pose says the car is still on it, so reuse the bounded
+      * component-crossing window instead of the plain 400 ms / 8 cm cut. */
+-    /* 2026-11-07 实车：位姿盲行窗口只在已锁存“印刷图形遮挡”时才放宽；真正的
+-     * 丢线立刻回到 400 ms / 8 cm，避免位姿把车带离白线后仍盲开约 2 m。 */
+-    bool pose_bounded_loss=f->route.pose_mode && component_crossing &&
++    bool pose_bounded_loss=f->route.pose_mode &&
+         (f->route.state==ROUTE_FOLLOW || f->route.state==ROUTE_CANDIDATE);
+     uint32_t lost_ms=pose_bounded_loss?POSE_BOUNDED_LOSS_MS:INTERFERENCE_TIMEOUT_MS;
+     float lost_cm=pose_bounded_loss?POSE_BOUNDED_LOSS_CM:INTERFERENCE_MAX_DISTANCE_CM;
+@@ -576,7 +562,7 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+        (fabsf(f->odometry.heading_rad-f->exit_heading_rad)<=JUNCTION_PASS_ALIGNED_RAD ||
+         fabsf(f->turn_yaw_rate_rad_s)<=JUNCTION_PASS_SETTLED_YAW_RAD_S))
+         f->exit_heading_pending=false;
+-    f->exit_recovery_active=f->route.component_recovery_active || f->route.turn_exit_search;
++    f->exit_recovery_active=f->route.component_recovery_active;
+     if (completing_turn && f->route.state==ROUTE_FOLLOW)
+         f->exit_accelerating=TURN_EXIT_ACCEL_ENABLED;
+     if(previous_route!=ROUTE_EXECUTING && f->route.state==ROUTE_EXECUTING) {
+@@ -628,13 +614,7 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+     RouteStep step = f->route.steps[f->route.index];
+     float entry_speed_limit = route_entry_speed_limit(&f->route);
+     float base_speed = route_cruise_speed(&f->route);
+-    size_t planning_index=route_planning_index(&f->route);
+-    RouteStep planning_step=f->route.steps[planning_index];
+-    uint32_t planning_seen=planning_index==f->route.index?f->route.junctions_seen:0U;
+-    bool target_approach=planning_step.junction_count<=1 ||
+-        planning_seen+1U>=planning_step.junction_count ||
+-        (planning_step.segment_length_cm>0.0f &&
+-         f->odometry.distance_cm-route_planning_origin(&f->route)>=planning_step.segment_length_cm);
++    RouteStep planning_step=f->route.steps[route_planning_index(&f->route)];
+     float planning_origin=route_planning_origin(&f->route);
+     float planning_entry_speed=route_planning_entry_speed_limit(&f->route);
+     float navigation_wheel_cap=WHEEL_TARGET_MAX_CM_S;
+@@ -643,17 +623,20 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+      * prevents a turn until actually reached. */
+     /* A graphic cannot authorize segment-speed blind passage. Only reliable
+      * centered exit evidence restores the unchanged distance envelope. */
+-    /* Intermediate junctions keep the segment speed. Only a genuinely blank
+-     * bar requests the bounded low-speed passage, not width/ambiguity itself. */
+-    bool passing_without_exit=f->route.passing_junction &&
+-        f->route.state==ROUTE_CLEARING && obs.line_mask==0;
++    bool passing_without_exit=(f->route.passing_junction &&
++        f->route.state==ROUTE_CLEARING &&
++        (f->route.component_recovery_active || !stable ||
++         !route_is_clear_line(&f->route,obs) || f->route.exit_count<LINE_CONFIRM_SAMPLES)) ||
++        (f->route.state==ROUTE_CANDIDATE &&
++         !route_target_ready(&f->route,f->odometry.distance_cm,true) &&
++         (!narrow || fabsf(obs.position)>JUNCTION_CENTER_LIMIT));
+     if(passing_without_exit) {
+         base_speed=fminf(base_speed,COMPONENT_RECOVERY_SPEED_CM_S);
+         navigation_wheel_cap=fminf(navigation_wheel_cap,COMPONENT_RECOVERY_SPEED_CM_S);
+     }
+     /* Segment length selects cruise speed; every known length needs the same
+      * entry-speed envelope, including short segments and clearance previews. */
+-    if (TURN_APPROACH_SLOWDOWN_ENABLED && target_approach && planning_step.segment_length_cm>0 &&
++    if (TURN_APPROACH_SLOWDOWN_ENABLED && planning_step.segment_length_cm>0 &&
+         f->route.final_segment_active && (f->route.state==ROUTE_FOLLOW ||
+         f->route.state==ROUTE_CANDIDATE || f->route.state==ROUTE_CLEARING)) {
+         if(!f->braking_active || f->braking_origin_cm!=planning_origin) {
+@@ -716,7 +699,7 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+                                    TARGET_RISE_CM_S2,BRAKING_TARGET_JERK_CM_S3);
+     }
+     else {f->braking_active=false;f->braking_reverse_active=false;}
+-    if (target_approach && f->route.search_pending && planning_step.segment_length_cm>0)
++    if (f->route.search_pending && planning_step.segment_length_cm>0)
+         base_speed=fminf(base_speed,planning_entry_speed);
+     /* Pose mode: keep exit speed until the outgoing line is re-centred, and
+      * pre-slow before the known corner so the brake phase does not eat the
+@@ -727,19 +710,9 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+         bool rolled_corner=route_uses_corner_arc(&f->route) || f->route.arc_just_exited;
+         if(f->route.post_turn_slow && !rolled_corner)
+             base_speed=fminf(base_speed,fminf(step.turn_speed,JUNCTION_EXIT_SPEED_CM_S));
+-        /* 2026-11-07 实车：滚轮滑行（无反向制动）现场实测减速度约 96 cm/s²，
+-         * 规划的 250 会让弯前减速窗口短了一半（160 cm/s 实测到弯前仍 106）。
+-         * 用保守 CORNER_ENTRY_DECEL_CM_S2 计算窗口，并同时用段内剩余距离，
+-         * 不依赖可能漂移的位姿估计。 */
+         float brake_w=(f->odometry.left_speed_cm_s*f->odometry.left_speed_cm_s)/
+-            (2.0f*CORNER_ENTRY_DECEL_CM_S2);
+-        float slow_window=fmaxf(ROUTE_WAYPOINT_SLOW_CM,brake_w+8.0f);
+-        float segment_left=INFINITY;
+-        if(step.segment_length_cm>0.0f)
+-            segment_left=step.segment_length_cm-
+-                (f->odometry.distance_cm-f->route.origin_cm);
+-        if(target_approach &&
+-           (f->route.pose_gap_bar_cm<=slow_window || segment_left<=slow_window))
++            (2.0f*BRAKING_SAFE_DECEL_CM_S2);
++        if(f->route.pose_gap_bar_cm<=fmaxf(ROUTE_WAYPOINT_SLOW_CM,brake_w+8.0f))
+             base_speed=fminf(base_speed,entry_speed_limit);
+     }
+     /* Exit handoff stays slow even while previewing the next distance envelope;
+@@ -768,54 +741,39 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+ #endif
+ #if PRESET_ROUTE_ENABLED
+     if(f->route.pose_mode && f->route.pose_cross_valid &&
+-       f->route.state==ROUTE_FOLLOW && step.action!=HEXAGON && !component_visible) {
+-        /* 2026-11-07 实车：位姿只做兜底，白线可见时必须真的巡线。
+-         * 旧实现把位姿当主控、灰度只做 25% 修正，位姿与灰度不一致时还直接
+-         * 拒绝灰度；编码器航向标定偏差就会把车整体带偏，表现为“完全不巡线、
+-         * 按距离越走越偏”。现在线可用就回到位置 PID 巡线，只有线被图形遮挡、
+-         * 歧义或丢失时才用位姿有界兜底。 */
+-        bool usable=narrow && (stable || !f->abnormal) &&
+-            !gray_is_component_pattern(obs);
++       f->route.state==ROUTE_FOLLOW && step.action!=HEXAGON) {
++        /* Unified pose path-following: the car is on a known straight segment
++         * between two table corners, so track that line directly. The 8-channel
++         * reading trims the cross-track estimate only while it agrees with the
++         * pose; this survives printed symbols, dead-end short legs and the
++         * 24 cm look-ahead leaving the wire at a corner. */
++        bool trusted=gray_plausible(f,obs);
++        bool usable=trusted && narrow;
++        float cross=f->route.pose_cross_cm;
+         if(usable) {
+-            if(f->abnormal) {
+-                pid_reset(&f->pid);
+-                speed_control_reset(&f->speed);
+-                f->abnormal=false;
+-                f->component_cross_latched=false;
+-            }
+-            f->state=LINE_TRACKING;
++            cross=(1.0f-POSE_GRAY_TRIM)*cross+POSE_GRAY_TRIM*(-obs.position*0.55f);
+             if(stable) {
+                 f->have_reliable=true;f->last_reliable_ms=now_ms;
+                 f->reliable_position=obs.position;
+             }
+-            float base=base_speed*(1.0f-POSITION_CURVE_SLOWDOWN*fabsf(obs.position)/7.0f);
+-            float next=next_outer(f,base,dt);
+-            float correction;
+-            if(!pid_update(&f->pid,obs.position,dt,.5f*next,&correction)) {
+-                line_follow_stop(f,LINE_STOP_FAULT);return;
+-            }
+-            if(f->route.arc_just_exited)
+-                correction-=CORNER_ARC_EXIT_DAMPING*f->turn_yaw_rate_rad_s;
+-            outer_targets(f,next,correction,dt);
+-        } else {
+-            /* 线不可用：有界位姿兜底，并真正启动丢线窗口。旧实现里位姿自认
+-             * “还在线上”时从不置 abnormal，8 路全黑也能按位姿盲行约 2 m。 */
+-            if(!f->abnormal) {
+-                f->abnormal=true;f->abnormal_origin_cm=f->odometry.distance_cm;
+-            }
+-            float cross=f->route.pose_cross_cm;
+-            float desired=f->route.pose_seg_heading_rad+atan2f(-cross,POSE_PURSUIT_LOOKAHEAD_CM);
+-            float corr=HEADING_KP_CM_S_PER_RAD*atan2f(sinf(desired-f->odometry.heading_rad),
+-                                                      cosf(desired-f->odometry.heading_rad));
+-            /* 滚动转弯刚交出时差速仍在回落，按实测横摆角速度押制漂移。 */
+-            if(f->route.arc_just_exited || f->route.state==ROUTE_CLEARING)
+-                corr-=CORNER_ARC_EXIT_DAMPING*f->turn_yaw_rate_rad_s;
+-            float cap=.5f*fmaxf(base_speed,1.0f);
+-            corr=fmaxf(-cap,fminf(cap,corr));
+-            f->state=LINE_GAP_HOLD;
+-            pid_reset(&f->pid);
+-            outer_targets(f,base_speed,corr,dt);
++            f->abnormal=false;
++        } else if(!f->abnormal && fabsf(f->route.pose_cross_cm)>ROUTE_WAYPOINT_GATE_CM) {
++            /* The pose itself says the car is off the segment: from here the
++             * grey loss is real, so arm the bounded loss window instead of
++             * trusting the path follower. */
++            f->abnormal=true;f->abnormal_origin_cm=f->odometry.distance_cm;
+         }
++        float desired=f->route.pose_seg_heading_rad+atan2f(-cross,POSE_PURSUIT_LOOKAHEAD_CM);
++        float corr=HEADING_KP_CM_S_PER_RAD*atan2f(sinf(desired-f->odometry.heading_rad),
++                                                  cosf(desired-f->odometry.heading_rad));
++        /* 滚动转弯刚交出时差速仍在回落，按实测横摆角速度押制漂移。 */
++        if(f->route.arc_just_exited || f->route.state==ROUTE_CLEARING)
++            corr-=CORNER_ARC_EXIT_DAMPING*f->turn_yaw_rate_rad_s;
++        float cap=.5f*fmaxf(base_speed,1.0f);
++        corr=fmaxf(-cap,fminf(cap,corr));
++        f->state=usable?LINE_TRACKING:LINE_GAP_HOLD;
++        pid_reset(&f->pid);
++        outer_targets(f,base_speed,corr,dt);
+     } else if(f->route.state==ROUTE_CANDIDATE &&
+        !route_target_ready(&f->route,f->odometry.distance_cm,true)) {
+         /* Intermediate graphics are nodes to pass, not a reason to slow down.
+@@ -837,18 +795,6 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+                 HEADING_KP_CM_S_PER_RAD*(f->route.entry_heading-f->odometry.heading_rad)-
+                     JUNCTION_YAW_DAMPING*f->turn_yaw_rate_rad_s,dt);
+         }
+-    } else if(f->route.turn_exit_search) {
+-        /* Rotation is complete even when the bar is inside a hollow resistor.
+-         * Hold the commanded exit heading at low speed until Route confirms
+-         * three narrow centre samples; never steer toward a component edge. */
+-        f->state=LINE_JUNCTION;f->abnormal=false;pid_reset(&f->pid);
+-        float outer=fminf(step.turn_speed,COMPONENT_RECOVERY_SPEED_CM_S);
+-        float err=atan2f(sinf(f->route.line_exit_heading_rad-f->odometry.heading_rad),
+-                        cosf(f->route.line_exit_heading_rad-f->odometry.heading_rad));
+-        float correction=HEADING_KP_CM_S_PER_RAD*err-
+-            JUNCTION_YAW_DAMPING*f->turn_yaw_rate_rad_s;
+-        correction=fmaxf(-.5f*outer,fminf(.5f*outer,correction));
+-        outer_targets(f,outer,correction,dt);
+     } else if(f->route.component_recovery_active) {
+         f->state=LINE_JUNCTION;f->abnormal=false;f->exit_accelerating=false;
+         pid_reset(&f->pid);
+@@ -988,11 +934,6 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+                         fminf(base,JUNCTION_CAPTURE_MIN_TURN_CM_S));
+                 correction-=JUNCTION_YAW_DAMPING*f->turn_yaw_rate_rad_s;
+             } else pid_reset(&f->pid);
+-            /* Until the exact target is crossed, a stationary near-angle
+-             * controller must retain a small forward turning command. */
+-            if(remaining>0.0f)
+-                correction=direction*fmaxf(direction*correction,
+-                    fminf(base,JUNCTION_CAPTURE_MIN_TURN_CM_S));
+             turn_targets(f,outer,correction,dt);
+             arc_targets_done: ;
+         }
+@@ -1008,48 +949,20 @@ static void line_follow_update_heading_impl(LineFollow *f, GrayObservation obs,
+          * Route owns the separate no-exit deadline while counting is locked. */
+         f->abnormal=false;
+         float pass=base_speed;
+-        /* 2026-11-07 用户规则：路口必须保持直行，不许转向。直行过口期间一律
+-         * 不用灰度位置 PID：路口/元件下的单侧白笔画会被当成“巡线偏向”，
+-         * 位置 PID 把车拉向图形边缘后就把真线丢掉了。离口去重完成后恢复巡线。 */
+-        if(gray_is_parallel_pair(obs)) {
+-            float correction;
+-            if(!pid_update(&f->pid,obs.position,dt,.5f*pass,&correction)) {
+-                line_follow_stop(f,LINE_STOP_FAULT);return;
++        if (route_is_clear_line(&f->route,obs) && stable &&
++            f->route.exit_count>=LINE_CONFIRM_SAMPLES) {
++            /* Only a confirmed centered exit may resume position steering. */
++            float line_corr;
++            if (!pid_update(&f->pid, obs.position, dt, 0.5f*pass, &line_corr)) {
++                line_follow_stop(f, LINE_STOP_FAULT); return;
+             }
+-            outer_targets(f,pass,correction,dt);
++            outer_targets(f, pass, line_corr, dt);
+         } else {
+             pid_reset(&f->pid);
+             outer_targets(f, pass, HEADING_KP_CM_S_PER_RAD*
+                 ((f->route.passing_junction?passage_heading(f,f->route.entry_heading):
+                   f->route.entry_heading)-f->odometry.heading_rad), dt);
+         }
+-    } else if (f->route.state==ROUTE_FOLLOW && component_visible) {
+-        /* 2026-11-07 用户规则：印刷元件（空心电阻/三极管 V/电池极板）处也算
+-         * 路口，必须保持直行，不许转向。旧实现会把这些白笔画当成偏线喂给位置
+-         * PID（现场 mask=128 单路、位置 3~6），车被拉偏后才丢线。这里只用航向
+-         * 保持直行：位姿可用时叠加线段横向修正，避免盲行越走越偏；图形/线段
+-         * 仍算“有线”，只有真正全丢线才启动丢线窗口。 */
+-        f->state=LINE_JUNCTION;
+-        pid_reset(&f->pid);
+-        float hold=f->route.pose_mode && f->route.pose_cross_valid ?
+-            f->route.pose_seg_heading_rad : f->odometry.heading_rad;
+-        float correction=HEADING_KP_CM_S_PER_RAD*(hold-f->odometry.heading_rad);
+-        if(f->route.pose_mode && f->route.pose_cross_valid) {
+-            correction-=JUNCTION_CROSS_KP*f->route.pose_cross_cm;
+-            correction=fmaxf(-.5f*base_speed,fminf(.5f*base_speed,correction));
+-        }
+-        if(obs.kind==GRAY_NONE) {
+-            if(!f->abnormal) {
+-                f->abnormal=true;f->abnormal_origin_cm=f->odometry.distance_cm;
+-            }
+-        } else {
+-            f->abnormal=false;
+-            f->last_reliable_ms=now_ms;
+-            if(stable) {
+-                f->have_reliable=true;f->reliable_position=obs.position;
+-            }
+-        }
+-        outer_targets(f, base_speed, correction, dt);
+     } else
+ #endif
+     if (narrow && (stable || !f->abnormal)
+diff --git a/src/route.c b/src/route.c
+index cdcf7a8..c9e3863 100644
+--- a/src/route.c
++++ b/src/route.c
+@@ -113,7 +113,6 @@ static void reset_evidence(RoutePlanner *p, uint32_t now)
+     p->arc_last_heading=p->entry_heading;p->arc_exit_lead_rad=0.0f;
+     p->turn_rewind_active=p->turn_rewind_pending=false;
+     p->line_exit_confirmed=p->turn_ended_on_line=p->capture_line_seen=false;
+-    p->turn_exit_search=false;
+     p->capture_line_samples=0;
+     p->next_junction_samples=0;p->candidate_separated=false;
+     p->turn_branch_samples=0;p->turn_branch_sides=0;
+@@ -290,14 +289,6 @@ float route_entry_speed_limit(const RoutePlanner *p)
+ static bool entry_speed_ready(const RoutePlanner *p)
+ {
+     float limit=route_entry_speed_limit(p);
+-    /* 圆弧行的外轮目标本来就是 limit*(1+track/2R)≈1.54*limit，用“两轮都≤limit”
+-     * 的门槛与自己下发的指令矛盾，会让车在弯前继续滑行到停不下来。 */
+-    if(p->index<p->count &&
+-       corner_arc_row(&p->steps[p->index],
+-                      p->index+1<p->count?&p->steps[p->index+1]:NULL)) {
+-        float mean=.5f*(fabsf(p->measured_left_cm_s)+fabsf(p->measured_right_cm_s));
+-        return mean<=limit;
+-    }
+     return fabsf(p->measured_left_cm_s)<=limit && fabsf(p->measured_right_cm_s)<=limit;
+ }
+ static void accept_target(RoutePlanner *p,float d,float h,uint32_t now)
+@@ -398,7 +389,7 @@ static bool next_segment_sensor_ready(const RoutePlanner *p,float d)
+ static bool component_recovery(RoutePlanner *p,GrayObservation o,float d,float h,
+                                uint32_t now,bool adjacent,bool eligible)
+ {
+-    bool graphic=!gray_is_parallel_pair(o) && o.white_count>=2 && (o.region_count>1 ||
++    bool graphic=o.white_count>=2 && (o.region_count>1 ||
+         o.white_count>JUNCTION_STRAIGHT_EXIT_MAX_WIDTH);
+     if(!p->component_recovery_active && !p->component_recovery_used && eligible && graphic && adjacent) {
+         p->component_recovery_active=p->component_recovery_used=true;
+@@ -422,9 +413,8 @@ static bool component_recovery(RoutePlanner *p,GrayObservation o,float d,float h
+         p->component_recovery_active=false;
+         return false;
+     }
+-    bool line=gray_is_parallel_pair(o) || (route_is_narrow_line(o) &&
+-        o.white_count<=JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
+-        fabsf(o.position)<=JUNCTION_CENTER_LIMIT);
++    bool line=route_is_narrow_line(o) && o.white_count<=JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
++        fabsf(o.position)<=JUNCTION_CENTER_LIMIT;
+     if(!line || !adjacent) p->component_recovery_line_samples=0;
+     if(line && adjacent && p->component_recovery_line_samples<LINE_CONFIRM_SAMPLES)
+         ++p->component_recovery_line_samples;
+@@ -599,8 +589,7 @@ float route_planning_entry_speed_limit(const RoutePlanner *p)
+ }
+ static void refresh_distance(RoutePlanner *p,float d,uint32_t now)
+ {
+-    size_t planning=route_planning_index(p);
+-    RouteStep s=p->steps[planning];
++    RouteStep s=p->steps[route_planning_index(p)];
+     if(s.segment_length_cm>0 && d-route_planning_origin(p)>=s.segment_length_cm &&
+        !p->search_pending) {
+         p->search_pending=true;p->search_ms=now;p->search_origin_cm=d;
+@@ -614,8 +603,8 @@ float route_cruise_speed(const RoutePlanner *p)
+ bool route_target_ready(const RoutePlanner *p,float d,bool next)
+ {
+     RouteStep s=p->steps[p->index];
+-    /* Count OR distance arms the next confirmed grey node. Distance alone
+-     * never starts a turn or synthesizes a junction; count includes this node. */
++    /* 最多路口数与总段距离任一满足后，仍须由调用方确认真实灰度节点。
++     * 距离本身不触发动作；计数包含当前正在确认的节点。 */
+     bool count_ready=s.junction_count>0 &&
+         (uint32_t)p->junctions_seen+(next?1U:0U)>=s.junction_count;
+     bool distance_ready=s.segment_length_cm>0 && d-p->origin_cm>=s.segment_length_cm;
+@@ -624,13 +613,6 @@ bool route_target_ready(const RoutePlanner *p,float d,bool next)
+ bool route_recover_navigation(RoutePlanner *p,float d,float h,uint32_t now)
+ {
+     if(p->state!=ROUTE_FAILED) return false;
+-    /* An unfinished turn is never converted into straight-line soft recovery.
+-     * That conversion looked like a successful early turn exit on hardware. */
+-    if((p->failure==ROUTE_FAILURE_ACTION_TIMEOUT ||
+-        p->failure==ROUTE_FAILURE_TURN_LIMIT || p->failure==ROUTE_FAILURE_WRONG_WAY) &&
+-       !p->passing_junction &&
+-       route_current_action(p)!=STRAIGHT && !p->line_exit_confirmed &&
+-       !p->turn_exit_search) return false;
+     switch(p->failure) {
+     case ROUTE_FAILURE_CONFIRM_TIMEOUT: case ROUTE_FAILURE_ACTION_TIMEOUT:
+     case ROUTE_FAILURE_TURN_LIMIT: case ROUTE_FAILURE_WRONG_WAY:
+@@ -810,12 +792,10 @@ void route_update_pose(RoutePlanner *p,GrayObservation o,float d,float h,uint32_
+     if(p->state==ROUTE_FOLLOW || p->state==ROUTE_CANDIDATE || p->state==ROUTE_CLEARING)
+         refresh_distance(p,d,now);
+     if(p->state==ROUTE_FOLLOW || p->state==ROUTE_CANDIDATE) {
+-        if(p->state==ROUTE_FOLLOW) p->pose_trigger_late_cm=0.0f;
+-        /* Explicit geometric maneuvers (rolling arc, short link, ring) use
+-         * waypoints. Grey-led pivots must not invent nodes from drifting pose. */
+-        if(p->pose_mode && p->state==ROUTE_FOLLOW &&
+-           (s.short_link_cm>0.0f || s.action==HEXAGON ||
+-            (s.junction_count==0 && corner_arc_row(&s,p->index+1<p->count?&p->steps[p->index+1]:NULL)))) {
++        /* Parallel pose trigger: the table corner is known in track coordinates,
++         * so encoders+IMU can hand the row over even when a printed symbol
++         * hides the wire or the leg is shorter than the 24 cm look-ahead. */
++        if(p->pose_mode && p->state==ROUTE_FOLLOW) {
+             float wx=p->waypoint_x_cm[p->index],wy=p->waypoint_y_cm[p->index];
+             float wh=h-(float)M_PI*.5f;
+             float sx=axle_x_cm+GRAY_FORWARD_OFFSET_CM*cosf(wh);
+@@ -931,33 +911,15 @@ void route_update_pose(RoutePlanner *p,GrayObservation o,float d,float h,uint32_
+         if(p->candidate_count<samples || d-p->entry_cm<distance) return;
+         p->last_confirmed_kind=p->candidate_kind;
+         if(p->junctions_seen<UINT16_MAX) ++p->junctions_seen; /* Saturate; lock until clearance. */
+-        bool special_row=s.short_link_cm>0.0f || s.action==HEXAGON ||
+-           (s.junction_count==0 && corner_arc_row(&s,p->index+1<p->count?&p->steps[p->index+1]:NULL));
+         bool pose_matches=true;
+-        if(p->pose_mode && special_row) {
++        if(p->pose_mode) {
+             float gate=s.action==HEXAGON?ROUTE_WAYPOINT_RING_CONFIRM_CM:ROUTE_WAYPOINT_GATE_CM;
+             float wh=h-(float)M_PI*.5f;
+             float sx=axle_x_cm+GRAY_FORWARD_OFFSET_CM*cosf(wh);
+             float sy=axle_y_cm+GRAY_FORWARD_OFFSET_CM*sinf(wh);
+             pose_matches=hypotf(sx-p->waypoint_x_cm[p->index],sy-p->waypoint_y_cm[p->index])<=gate;
+         }
+-        /* 2026-11-08：普通行也允许“灰度确认的节点正好落在本行已知角点”时
+-         * 直接授权动作。表长/计数会因前视 24 cm、转弯出口前伸和元件漏计而
+-         * 在最后一个角点前失效（实车右上角 9/11、仿真 342/370）；几何节点
+-         * 仍是真实灰度节点，不恢复纯位姿盲转。 */
+-        bool pose_node_ready=false;
+-        if(p->pose_mode && s.action!=STRAIGHT && !special_row) {
+-            float wh=h-(float)M_PI*.5f;
+-            float sx=axle_x_cm+GRAY_FORWARD_OFFSET_CM*cosf(wh);
+-            float sy=axle_y_cm+GRAY_FORWARD_OFFSET_CM*sinf(wh);
+-            float dx=p->waypoint_x_cm[p->index]-sx;
+-            float dy=p->waypoint_y_cm[p->index]-sy;
+-            float along=dx*cosf(wh)+dy*sinf(wh);
+-            float lateral=-dx*sinf(wh)+dy*cosf(wh);
+-            pose_node_ready=fabsf(along)<=ROUTE_WAYPOINT_CONFIRM_CM &&
+-                fabsf(lateral)<=ROUTE_WAYPOINT_GATE_CM;
+-        }
+-        p->passing_junction=!(route_target_ready(p,d,false)||pose_node_ready) || !pose_matches;
++        p->passing_junction=!route_target_ready(p,d,false) || !pose_matches;
+         p->search_pending=false;
+         if(p->passing_junction) { begin_action(p,d,h,now);enter_clear(p,d,now);return; }
+         /* 直行过口无强转风险，不设入口轮速门禁；转弯/STOP 仍先降速到位。 */
+@@ -1032,6 +994,24 @@ void route_update_pose(RoutePlanner *p,GrayObservation o,float d,float h,uint32_
+         corner_arc_update(p,h,axle_x_cm,axle_y_cm,arc_dt);
+         p->last_arc_ms=now;
+     }
++    if(p->pose_mode && action!=STRAIGHT && !p->passing_junction) {
++        if(arc_row) {
++            /* 滚动转弯按自己的切线交出，不用“轴距角点 14 cm”的枢轴交接
++             * （那个会提前 ~7° 接管）；且只在 EXECUTING 内，否则会每帧重置 CLEARING 计时。 */
++            if(p->state==ROUTE_EXECUTING && p->corner_arc_complete) {
++                p->line_exit_confirmed=true;p->line_exit_heading_rad=h;
++                p->arc_just_exited=true;
++                enter_clear(p,d,now);return;
++            }
++        } else {
++            float gap=hypotf(axle_x_cm-p->waypoint_x_cm[p->index],
++                             axle_y_cm-p->waypoint_y_cm[p->index]);
++            if(gap<=ROUTE_WAYPOINT_EXIT_CM && turn>=target-ROUTE_WAYPOINT_EXIT_ANGLE_RAD) {
++                p->line_exit_confirmed=true;p->line_exit_heading_rad=h;
++                enter_clear(p,d,now);return;
++            }
++        }
++    }
+     if(action!=STRAIGHT && (turn < -JUNCTION_WRONG_WAY_RAD ||
+        turn>route_turn_threshold_rad(p,JUNCTION_TURN_MAX_RAD))) {
+         fail(p,turn<0?ROUTE_FAILURE_WRONG_WAY:ROUTE_FAILURE_TURN_LIMIT);return;
+@@ -1053,22 +1033,18 @@ void route_update_pose(RoutePlanner *p,GrayObservation o,float d,float h,uint32_
+             }
+             return;
+         }
+-        /* The target angle alone ends rotation. A resistor cap seen before
+-         * that angle is not an exit; a blank exit after it is allowed.
+-         * A rolling arc also ends on its own tangent geometry: the encoder
+-         * heading lags the real yaw, so waiting for the measured angle would
+-         * over-rotate past the outgoing line and lose it. */
+-        if(turn>=target || (arc_row && p->corner_arc_complete)) {
+-            p->turn_exit_search=true;
+-            p->line_exit_confirmed=false;
+-            p->line_exit_heading_rad=(arc_row && p->corner_arc_complete)
+-                ? p->arc_desired_heading_rad
+-                : p->entry_heading+route_turn_target_rad(p);
+-            p->arc_just_exited=arc_row;
+-            enter_clear(p,d,now);
+-            p->turn_ended_on_line=false;
+-            return;
++        bool narrow=route_is_narrow_line(o);
++        bool ordinary_rewind=ordinary_right_angle(s);
++        if(!p->turn_rewind_active && ordinary_rewind) {
++            if(!narrow && turn>=target-0.03f && adjacent) {
++                if(!p->turn_rewind_pending) {p->turn_rewind_pending=true;p->turn_rewind_ms=now;}
++                if((uint32_t)(now-p->turn_rewind_ms)>=150U) p->turn_rewind_active=true;
++            } else p->turn_rewind_pending=false;
+         }
++        /* Ordinary turns keep their angle/exit contract through gray loss.
++         * Only the action bound aborts to RECOVERING; HEXAGON is separate. */
++        if(component_recovery(p,o,d,h,now,adjacent,!narrow && p->capture_line_seen &&
++           turn>=target*(1.0f-JUNCTION_EXIT_ANGLE_MARGIN_RATIO))) return;
+         /* 30–40 cm 短段：前探头在转弯途中就会越过下一个节点。这里只记录
+          * “转过 45° 之后”出现的带中心支路证据，作为下一段相邻交接的种子，
+          * 避免把本路口自身的转角读数重复计入。 */
+@@ -1080,41 +1056,47 @@ void route_update_pose(RoutePlanner *p,GrayObservation o,float d,float h,uint32_
+                 if(p->turn_branch_samples<UINT8_MAX) ++p->turn_branch_samples;
+             }
+         }
+-        p->turn_capturing=false;
+-        p->capture_line_samples=0;
+-        p->exit_count=0;p->exit_candidate_pending=false;
+-        return;
+-    }
+-    if(p->turn_exit_search) {
+-        /* A fixed one-shot straight search, not another turn and not a node.
+-         * Check expiry before accepting a line on the deadline frame. */
+-        if((uint32_t)(now-p->phase_ms)>=COMPONENT_RECOVERY_TIMEOUT_MS ||
+-           fabsf(d-p->clear_cm)>=COMPONENT_RECOVERY_MAX_CM) {
+-            fail(p,ROUTE_FAILURE_EXIT_RECAPTURE);return;
++        p->turn_capturing=narrow && turn>=route_turn_threshold_rad(p,JUNCTION_CAPTURE_MIN_RAD);
++        if(p->turn_capturing) {
++            if(!adjacent) p->capture_line_samples=0;
++            if(p->capture_line_samples<LINE_CONFIRM_SAMPLES) ++p->capture_line_samples;
++            if(!p->capture_line_seen || p->capture_line_samples>=LINE_CONFIRM_SAMPLES) {
++                p->capture_line_ms=now;p->capture_line_cm=d;
++            }
++            p->capture_line_seen=true;
++        } else p->capture_line_samples=0;
++        if(turn>=target) p->corner_arc_complete=true;
++        /* 普通转弯找到连续居中窄出口即继续巡线；非90°自定义角保留角度门禁。
++         * ±90° CUSTOM_TURN 与 LEFT/RIGHT 几何相同，捕到出口线后必须停止
++         * 继续强转并交回位置 PID，否则会越过出口线、丢线。 */
++        bool ordinary_exit=s.action!=CUSTOM_TURN ||
++            fabsf(fabsf(route_turn_target_rad(p))-JUNCTION_TURN_TARGET_RAD)<0.0001f;
++        bool angle_full=turn>=target;
++        float alignment=p->turn_rewind_active?fmaxf(JUNCTION_EXIT_ALIGNMENT_RAD,JUNCTION_EXIT_REWIND_RAD+0.03f):JUNCTION_EXIT_ALIGNMENT_RAD;
++        bool line_ready=ordinary_exit && turn>=target-alignment && p->turn_capturing &&
++            o.white_count<=JUNCTION_STRAIGHT_EXIT_MAX_WIDTH;
++        bool exit=narrow && fabsf(o.position)<=JUNCTION_CENTER_LIMIT &&
++            (line_ready || angle_full || turn>=target-JUNCTION_EXIT_ANGLE_MARGIN_RATIO*target);
++        if(!exit || !adjacent) {p->exit_count=0;p->exit_candidate_pending=false;}
++        if(exit && !p->exit_candidate_pending) {
++            p->exit_candidate_pending=true;p->exit_candidate_ms=now;p->exit_candidate_cm=d;
++        }
++        if(exit && p->exit_count<LINE_CONFIRM_SAMPLES) ++p->exit_count;
++        if(p->exit_count>=LINE_CONFIRM_SAMPLES &&
++           (line_ready || angle_full || ((uint32_t)(now-p->exit_candidate_ms)>=2U*JUNCTION_EXIT_CONFIRM_MS &&
++                           d-p->exit_candidate_cm>=2.0f*JUNCTION_EXIT_CONFIRM_CM))) {
++            p->line_confirmed_exit_used=line_ready && !angle_full;
++            p->line_exit_confirmed=true;p->line_exit_heading_rad=h;enter_clear(p,d,now);
+         }
+-        bool line=route_is_narrow_line(o) &&
+-            o.white_count<=JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
+-            fabsf(o.position)<=JUNCTION_CENTER_LIMIT;
+-        if(!line || !adjacent) p->capture_line_samples=0;
+-        if(line && adjacent && p->capture_line_samples<LINE_CONFIRM_SAMPLES)
+-            ++p->capture_line_samples;
+-        if(p->capture_line_samples<LINE_CONFIRM_SAMPLES) return;
+-        p->turn_exit_search=false;p->line_exit_confirmed=true;
+-        p->capture_line_seen=true;p->capture_line_ms=now;p->capture_line_cm=d;
+-        p->phase_ms=now;p->clear_cm=d;
+-        p->exit_count=0;p->exit_candidate_pending=false;
+-        p->turn_ended_on_line=true;
+-        if(p->short_link_tracking) enter_clear(p,d,now);
+         return;
+     }
+     if((uint32_t)(now-p->phase_ms)>=JUNCTION_CLEAR_TIMEOUT_MS || d-p->clear_cm>JUNCTION_CLEAR_MAX_CM) {
+         fail(p,ROUTE_FAILURE_ACTION_TIMEOUT);return;
+     }
+-    /* A completed turn may use pose clearance for a short outgoing leg.
+-     * Straight passage over a printed symbol must prove the narrow exit first:
+-     * two cm alone can still be inside the same resistor's hollow body. */
+-    if(p->pose_mode && !p->passing_junction && route_current_action(p)!=STRAIGHT &&
+-       d-p->clear_cm>=ROUTE_CLEAR_POSE_CM) {
++    /* Pose mode: the corner is known, so the clearance dedup cannot gain any
++     * information; a couple of cm keeps the order without letting the outgoing
++     * line loss stop a short leg. */
++    if(p->pose_mode && d-p->clear_cm>=ROUTE_CLEAR_POSE_CM) {
+         complete_clear(p,d,now);return;
+     }
+     /* A turn has already confirmed its exit, so lateral recovery is allowed.

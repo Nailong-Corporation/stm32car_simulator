@@ -10,7 +10,6 @@ import {
   type GrayObservation,
   GrayKind,
 } from './types';
-import { grayIsParallelPair } from './gray_sensor';
 import {
   CONTROL_MAX_INTERVAL_MS,
   LINE_CONFIRM_SAMPLES,
@@ -32,9 +31,13 @@ import {
   JUNCTION_STRAIGHT_TIMEOUT_MS,
   JUNCTION_CLEAR_TIMEOUT_MS,
   JUNCTION_TURN_MIN_RAD,
+  JUNCTION_EXIT_CONFIRM_MS,
+  JUNCTION_EXIT_CONFIRM_CM,
+  JUNCTION_EXIT_ANGLE_MARGIN_RATIO,
   JUNCTION_TURN_MAX_RAD,
   JUNCTION_WRONG_WAY_RAD,
   JUNCTION_CENTER_LIMIT,
+  JUNCTION_CAPTURE_MIN_RAD,
   JUNCTION_YAW_FILTER_TAU_S,
   JUNCTION_CLEAR_MAX_CM,
   JUNCTION_TURN_TARGET_RAD,
@@ -45,6 +48,8 @@ import {
   BRAKING_SAFE_DECEL_CM_S2,
   JUNCTION_ENTRY_BRAKE_TIMEOUT_MS,
   JUNCTION_ENTRY_BRAKE_MAX_CM,
+  JUNCTION_EXIT_ALIGNMENT_RAD,
+  JUNCTION_EXIT_REWIND_RAD,
   JUNCTION_APPROACH_TIMEOUT_MS,
   JUNCTION_COUNT_CLEAR_MS,
   JUNCTION_COUNT_CLEAR_CM,
@@ -73,6 +78,8 @@ import {
   ROUTE_WAYPOINT_FALLBACK_CM,
   ROUTE_WAYPOINT_RING_CONFIRM_CM,
   ROUTE_WAYPOINT_GATE_CM,
+  ROUTE_WAYPOINT_EXIT_CM,
+  ROUTE_WAYPOINT_EXIT_ANGLE_RAD,
   ROUTE_WAYPOINT_SLOW_CM,
   HEXAGON_ENTRY_APPROACH_MAX_CM,
   HEXAGON_LEG_CROSS_MAX_CM,
@@ -338,7 +345,6 @@ export class RoutePlannerModel {
   public arc_exit_lead_rad = 0;
   public last_arc_ms = 0;
   public turn_capturing = false;
-  public turn_exit_search = false;
   public lap_boundary = false;
   public capture_line_seen = false;
   public line_exit_confirmed = false;
@@ -594,15 +600,6 @@ export class RoutePlannerModel {
 
   private entrySpeedReady(): boolean {
     const limit = this.entrySpeedLimit();
-    // A rolling-corner row commands the outer wheel at limit*(1+track/2R), so
-    // "both wheels <= limit" contradicts its own target and lets the car coast
-    // into the pivot. Use the axle mean instead (mirror of route.c:290-302).
-    if (this.index < this.count &&
-      cornerArcRow(this.steps[this.index], this.steps[this.index + 1])) {
-      const mean = 0.5 *
-        (Math.abs(this.measured_left_cm_s) + Math.abs(this.measured_right_cm_s));
-      return mean <= limit;
-    }
     return (
       Math.abs(this.measured_left_cm_s) <= limit &&
       Math.abs(this.measured_right_cm_s) <= limit
@@ -654,8 +651,7 @@ export class RoutePlannerModel {
   }
 
   private refreshDistance(d: number, now: number): void {
-    const planning = this.planningIndex();
-    const s = this.steps[planning];
+    const s = this.steps[this.planningIndex()];
     if (
       s.segment_length_cm > 0 &&
       d - this.planningOrigin() >= s.segment_length_cm &&
@@ -671,7 +667,7 @@ export class RoutePlannerModel {
     this.next_segment_origin_valid = false;
     this.candidate_count = this.exit_count = this.approach_center_count = 0;
     this.have_approach_center = this.exit_candidate_pending = false;
-    this.turn_capturing = this.corner_arc_complete = this.turn_exit_search = false;
+    this.turn_capturing = this.corner_arc_complete = false;
     this.arc_active = false;
     this.arc_roll_cm = this.arc_progress_rad = this.arc_radius_err_cm = 0;
     this.arc_diff_slew_cm_s = 0;
@@ -679,12 +675,6 @@ export class RoutePlannerModel {
     this.arc_outer_cm_s = CORNER_ARC_SPEED_CM_S;
     this.arc_diff_cm_s = 0;
     this.arc_lateral_cm = 0;
-    this.arc_along_cm = 0;
-    this.arc_across_cm = 0;
-    this.arc_heading_err_rad = 0;
-    this.arc_yaw_rate_rad_s = 0;
-    this.arc_last_heading = this.entry_heading;
-    this.arc_exit_lead_rad = 0;
     this.turn_rewind_active = this.turn_rewind_pending = false;
     this.line_exit_confirmed = this.turn_ended_on_line = this.capture_line_seen = false;
     this.capture_line_samples = 0;
@@ -785,7 +775,7 @@ export class RoutePlannerModel {
   private acceptTarget(d: number, h: number, now: number): void {
     if (this.steps[this.index].action === Action.STOP) {
       const repeat = this.anotherLap();
-      if (this.completed_laps < 0xffffffff) this.completed_laps++;
+      this.completed_laps++;
       if (!repeat) {
         this.state = RouteState.ROUTE_FINISHED;
         this.stop_pending = true;
@@ -897,7 +887,7 @@ export class RoutePlannerModel {
     eligible: boolean
   ): boolean {
     const graphic =
-      !grayIsParallelPair(o) && o.white_count >= 2 &&
+      o.white_count >= 2 &&
       (o.region_count > 1 || o.white_count > JUNCTION_STRAIGHT_EXIT_MAX_WIDTH);
     if (
       !this.component_recovery_active &&
@@ -931,10 +921,10 @@ export class RoutePlannerModel {
       return false;
     }
 
-    const line = grayIsParallelPair(o) || (
+    const line =
       routeIsNarrowLine(o) &&
       o.white_count <= JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
-      Math.abs(o.position) <= JUNCTION_CENTER_LIMIT);
+      Math.abs(o.position) <= JUNCTION_CENTER_LIMIT;
     if (!line || !adjacent) this.component_recovery_line_samples = 0;
     if (line && adjacent && this.component_recovery_line_samples < LINE_CONFIRM_SAMPLES) {
       this.component_recovery_line_samples++;
@@ -1077,7 +1067,7 @@ export class RoutePlannerModel {
       const nextAngle = Math.abs(turnAngles[x.turn_index + 1]);
       const lead = WHEEL_TRACK_CM * 0.5 * Math.tan(0.5 * nextAngle);
       const gap = Math.hypot(x.vertex_x_cm - axle_x_cm, x.vertex_y_cm - axle_y_cm);
-      if (gap <= lead + (this.pose_mode ? 0.6 : 0)) {
+      if (gap <= lead + (Number.isFinite(axle_x_cm) ? 0.6 : 0)) {
         ++x.turn_index;
         x.turning = true;
         x.target_heading = h0 + dir * cumulative[x.turn_index];
@@ -1097,7 +1087,7 @@ export class RoutePlannerModel {
       } else {
         x.cross_cm = 0;
       }
-      if (this.pose_mode && Math.abs(x.cross_cm) > HEXAGON_LEG_CROSS_MAX_CM) {
+      if (Number.isFinite(axle_x_cm) && Math.abs(x.cross_cm) > HEXAGON_LEG_CROSS_MAX_CM) {
         this.fail(RouteFailure.ROUTE_FAILURE_EXIT_LOST);
         return;
       }
@@ -1244,10 +1234,6 @@ export class RoutePlannerModel {
 
   public recoverNavigation(d: number, h: number, now: number): boolean {
     if (this.state !== RouteState.ROUTE_FAILED) return false;
-    if ([RouteFailure.ROUTE_FAILURE_ACTION_TIMEOUT, RouteFailure.ROUTE_FAILURE_TURN_LIMIT,
-         RouteFailure.ROUTE_FAILURE_WRONG_WAY].includes(this.failure) &&
-        !this.passing_junction && this.currentAction() !== Action.STRAIGHT &&
-        !this.line_exit_confirmed && !this.turn_exit_search) return false;
     switch (this.failure) {
       case RouteFailure.ROUTE_FAILURE_CONFIRM_TIMEOUT:
       case RouteFailure.ROUTE_FAILURE_ACTION_TIMEOUT:
@@ -1417,14 +1403,14 @@ export class RoutePlannerModel {
     }
 
     if (this.state === RouteState.ROUTE_FOLLOW || this.state === RouteState.ROUTE_CANDIDATE) {
-      if (this.state === RouteState.ROUTE_FOLLOW) this.pose_trigger_late_cm = 0;
-      // Explicit rolling arcs, short links and HEXAGON use geometric entry.
-      // Positive-count rows require a confirmed target node; count-zero rows retain distance authorization.
+      // Parallel pose trigger (2026-11-06): the table corner is known in track
+      // coordinates, so encoders+IMU can confirm it even when a printed symbol
+      // hides the wire or the leg is shorter than the 24 cm look-ahead bar.
       if (
-        this.pose_mode &&
         this.state === RouteState.ROUTE_FOLLOW &&
-        (shortLinkLength(s) > 0 || s.action === Action.HEXAGON ||
-          (s.junction_count === 0 && cornerArcRow(s, this.steps[this.index + 1])))
+        Number.isFinite(axle_x_cm) &&
+        Number.isFinite(axle_y_cm) &&
+        this.waypoint_x_cm.length === this.count
       ) {
         const st = this.steps[this.index];
         const wh = h - Math.PI / 2;
@@ -1600,12 +1586,14 @@ export class RoutePlannerModel {
       if (this.candidate_count < samples || d - this.entry_cm < distance) return;
 
       this.last_confirmed_kind = this.candidate_kind;
-      if (this.junctions_seen < 65535) this.junctions_seen++;
-      // A drifting pose cannot veto grey-led pivots; geometric actions keep their gate.
-      const specialRow = shortLinkLength(s) > 0 || s.action === Action.HEXAGON ||
-        (s.junction_count === 0 && cornerArcRow(s, this.steps[this.index + 1]));
+      this.junctions_seen++;
+      // Pose gate: a real junction far from this table row's known corner is a
+      // passing node (printed elements and swept nodes included), not the
+      // target. Keeps the 8-channel proof but stops an over-counted node from
+      // starting the turn tens of cm early.
       let poseMatches = true;
-      if (this.pose_mode && specialRow) {
+      if (Number.isFinite(axle_x_cm) && Number.isFinite(axle_y_cm) &&
+        this.waypoint_x_cm.length === this.count) {
         const wh = h - Math.PI / 2;
         const sx = axle_x_cm + GRAY_FORWARD_OFFSET_CM * Math.cos(wh);
         const sy = axle_y_cm + GRAY_FORWARD_OFFSET_CM * Math.sin(wh);
@@ -1615,27 +1603,10 @@ export class RoutePlannerModel {
         const gate = this.steps[this.index].action === Action.HEXAGON
           ? ROUTE_WAYPOINT_RING_CONFIRM_CM
           : ROUTE_WAYPOINT_GATE_CM;
-        const gap = Math.hypot(sx - this.waypoint_x_cm[this.index], sy - this.waypoint_y_cm[this.index]);
-        poseMatches = gap <= gate;
+        const __gap = Math.hypot(sx - this.waypoint_x_cm[this.index], sy - this.waypoint_y_cm[this.index]);
+        poseMatches = __gap <= gate;
       }
-      // 2026-11-08 controller-layer authorization: for ordinary rows a grey node
-      // that lands on this row's known corner IS the target, even when the
-      // precomputed count/length have not armed (look-ahead + pivot exit + missed
-      // symbols make both unreliable at the last corner). The node is still a
-      // real grey confirmation; pure pose triggering stays disabled.
-      let poseNodeReady = false;
-      if (this.pose_mode && s.action !== Action.STRAIGHT && !specialRow) {
-        const wh = h - Math.PI / 2;
-        const sx = axle_x_cm + GRAY_FORWARD_OFFSET_CM * Math.cos(wh);
-        const sy = axle_y_cm + GRAY_FORWARD_OFFSET_CM * Math.sin(wh);
-        const dx = this.waypoint_x_cm[this.index] - sx;
-        const dy = this.waypoint_y_cm[this.index] - sy;
-        const along = dx * Math.cos(wh) + dy * Math.sin(wh);
-        const lateral = -dx * Math.sin(wh) + dy * Math.cos(wh);
-        poseNodeReady = Math.abs(along) <= ROUTE_WAYPOINT_CONFIRM_CM &&
-          Math.abs(lateral) <= ROUTE_WAYPOINT_GATE_CM;
-      }
-      this.passing_junction = !(this.targetReady(d, false) || poseNodeReady) || !poseMatches;
+      this.passing_junction = !this.targetReady(d, false) || !poseMatches;
       this.search_pending = false;
 
       if (this.passing_junction) {
@@ -1711,18 +1682,43 @@ export class RoutePlannerModel {
     const turn = (h - this.entry_heading) * sign;
     const target = Math.abs(this.turnTargetRad());
 
-    // Arc geometry still controls the rolling turn.  The target angle alone
-    // ends a normal pivot; a rolling arc also ends on its own tangent geometry,
-    // because the encoder heading lags the real yaw and waiting for the measured
-    // angle would over-rotate past the outgoing line and lose it.
-    const pose_available = this.pose_mode &&
-      action !== Action.STRAIGHT &&
-      !this.passing_junction;
+    // Pose exit (2026-11-06): a short leg's outgoing line can run out under the
+    // 24 cm look-ahead bar a few cm after the pivot, so the grey-only contract
+    // would time out.  When the axle has reached the pivot angle at the known
+    // corner, hand over to the next row immediately.
+    const pose_available = action !== Action.STRAIGHT &&
+      !this.passing_junction &&
+      Number.isFinite(axle_x_cm) &&
+      Number.isFinite(axle_y_cm) &&
+      this.waypoint_x_cm.length === this.count;
     const arc_row = pose_available && this.usesCornerArc();
     if (arc_row && this.state === RouteState.ROUTE_EXECUTING) {
       const arc_dt = Math.max(0.001, Math.min(0.020, (now - this.last_arc_ms) / 1000));
       this.cornerArcUpdate(h, axle_x_cm, axle_y_cm, arc_dt);
       this.last_arc_ms = now;
+    }
+    if (pose_available) {
+      if (arc_row) {
+        // Rolling corner: leave on the arc's own tangent, not on the legacy
+        // "within 14 cm of the corner" hand-off, which fires ~7 degrees early.
+        // Only in EXECUTING: once CLEARING starts the exit flag stays set, and
+        // re-entering CLEARING every frame would freeze its clear timer.
+        if (this.state === RouteState.ROUTE_EXECUTING && this.corner_arc_complete) {
+          this.line_exit_confirmed = true;
+          this.line_exit_heading_rad = h;
+          this.arc_just_exited = true;
+          this.enterClear(d, now);
+          return;
+        }
+      } else {
+        const gap = Math.hypot(axle_x_cm - this.waypoint_x_cm[this.index], axle_y_cm - this.waypoint_y_cm[this.index]);
+        if (gap <= ROUTE_WAYPOINT_EXIT_CM && turn >= target - ROUTE_WAYPOINT_EXIT_ANGLE_RAD) {
+          this.line_exit_confirmed = true;
+          this.line_exit_heading_rad = h;
+          this.enterClear(d, now);
+          return;
+        }
+      }
     }
 
     if (
@@ -1757,16 +1753,25 @@ export class RoutePlannerModel {
         return;
       }
 
-      this.turn_capturing = false;
-      if (turn >= target || (arc_row && this.corner_arc_complete)) {
-        this.turn_exit_search = true;
-        this.line_exit_confirmed = false;
-        this.line_exit_heading_rad = (arc_row && this.corner_arc_complete)
-          ? this.arc_desired_heading_rad
-          : this.entry_heading + this.turnTargetRad();
-        this.arc_just_exited = arc_row;
-        this.enterClear(d, now);
-        this.turn_ended_on_line = false;
+      const narrow = routeIsNarrowLine(o);
+      if (!this.turn_rewind_active && ordinaryRightAngle(s) && !this.short_link_active) {
+        if (!narrow && turn >= target - 0.03 && adjacent) {
+          if (!this.turn_rewind_pending) { this.turn_rewind_pending = true; this.turn_rewind_ms = now; }
+          if (now - this.turn_rewind_ms >= 150) this.turn_rewind_active = true;
+        } else this.turn_rewind_pending = false;
+      }
+      if (
+        this.componentRecovery(
+          o,
+          d,
+          h,
+          now,
+          adjacent,
+          !narrow &&
+            this.capture_line_seen &&
+            turn >= target * (1.0 - JUNCTION_EXIT_ANGLE_MARGIN_RATIO)
+        )
+      ) {
         return;
       }
 
@@ -1781,39 +1786,65 @@ export class RoutePlannerModel {
           if (this.turn_branch_samples < 255) this.turn_branch_samples++;
         }
       }
-      this.capture_line_samples = 0;
-      this.exit_count = 0;
-      this.exit_candidate_pending = false;
-      return;
-    }
-
-    // Strict turn exit search owns CLEARING until a real centered line is
-    // recovered. Check both hard limits before accepting even the third frame.
-    if (this.turn_exit_search) {
-      if (now - this.phase_ms >= COMPONENT_RECOVERY_TIMEOUT_MS ||
-        Math.abs(d - this.clear_cm) >= COMPONENT_RECOVERY_MAX_CM) {
-        this.fail(RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE);
-        return;
-      }
-      const centered = routeIsNarrowLine(o) &&
-        o.white_count <= JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
-        Math.abs(o.position) <= JUNCTION_CENTER_LIMIT;
-      if (!centered || !adjacent) this.capture_line_samples = 0;
-      if (centered && this.capture_line_samples < LINE_CONFIRM_SAMPLES) this.capture_line_samples++;
-      if (this.capture_line_samples >= LINE_CONFIRM_SAMPLES) {
-        this.turn_exit_search = false;
-        this.line_exit_confirmed = true;
-        this.turn_ended_on_line = true;
+      this.turn_capturing =
+        narrow && turn >= this.turnThresholdRad(JUNCTION_CAPTURE_MIN_RAD);
+      if (this.turn_capturing) {
+        if (!adjacent) this.capture_line_samples = 0;
+        if (this.capture_line_samples < LINE_CONFIRM_SAMPLES) this.capture_line_samples++;
+        if (!this.capture_line_seen || this.capture_line_samples >= LINE_CONFIRM_SAMPLES) {
+          this.capture_line_ms = now;
+          this.capture_line_cm = d;
+        }
         this.capture_line_seen = true;
-        this.capture_line_ms = now;
-        this.capture_line_cm = d;
+      } else {
+        this.capture_line_samples = 0;
+      }
+
+      if (turn >= target) this.corner_arc_complete = true;
+
+      const ordinary_exit =
+        s.action !== Action.CUSTOM_TURN ||
+        Math.abs(Math.abs(this.turnTargetRad()) - JUNCTION_TURN_TARGET_RAD) < 0.0001;
+      const angle_full = turn >= target;
+      const alignment = this.turn_rewind_active ? Math.max(JUNCTION_EXIT_ALIGNMENT_RAD, JUNCTION_EXIT_REWIND_RAD + 0.03) : JUNCTION_EXIT_ALIGNMENT_RAD;
+      const line_ready =
+        ordinary_exit && turn >= target - alignment &&
+        this.turn_capturing &&
+        o.white_count <= JUNCTION_STRAIGHT_EXIT_MAX_WIDTH;
+      // A completed pivot may leave the axle 1-2 cm off the exit line (coast,
+      // printed symbol edge).  Once the full angle is reached, a narrow
+      // single-region line is the exit even if the centroid is one channel
+      // beyond the strict centre window; blind wide/edge reads still fail.
+      const exit =
+        narrow &&
+        (Math.abs(o.position) <= JUNCTION_CENTER_LIMIT || angle_full) &&
+        (line_ready || angle_full || turn >= target - JUNCTION_EXIT_ANGLE_MARGIN_RATIO * target);
+
+      if (!exit || !adjacent) {
         this.exit_count = 0;
         this.exit_candidate_pending = false;
-        this.phase_ms = now;
-        this.clear_cm = d;
-        // Short links may transfer only after this real line confirmation;
-        // ordinary rows retain their next-segment origin anchored at full yaw.
-        if (this.short_link_tracking) this.enterClear(d, now);
+      }
+      if (exit && !this.exit_candidate_pending) {
+        this.exit_candidate_pending = true;
+        this.exit_candidate_ms = now;
+        this.exit_candidate_cm = d;
+      }
+      if (exit && this.exit_count < LINE_CONFIRM_SAMPLES) this.exit_count++;
+
+      // The line exit stays available in pose mode: on some corners the grey
+      // bar confirms the outgoing line before the axle finishes the last few
+      // degrees, which keeps the next short leg on its wire.
+      if (
+        this.exit_count >= LINE_CONFIRM_SAMPLES &&
+        (line_ready ||
+          angle_full ||
+          (now - this.exit_candidate_ms >= 2 * JUNCTION_EXIT_CONFIRM_MS &&
+            d - this.exit_candidate_cm >= 2.0 * JUNCTION_EXIT_CONFIRM_CM))
+      ) {
+        this.line_confirmed_exit_used = line_ready && !angle_full;
+        this.line_exit_confirmed = true;
+        this.line_exit_heading_rad = h;
+        this.enterClear(d, now);
       }
       return;
     }
@@ -1826,10 +1857,10 @@ export class RoutePlannerModel {
       return;
     }
 
-    // Pose clearance is only for completed turns. Passing a printed component
-    // must retain the lock until a real narrow exit, or its two bars count twice.
-    if (this.pose_mode && !this.passing_junction && this.currentAction() !== Action.STRAIGHT &&
-      d - this.clear_cm >= ROUTE_CLEAR_POSE_CM) {
+    // Pose mode: the corner is known, so the clearance dedup cannot gain any
+    // information; a couple of cm keeps the same order without letting the
+    // outgoing line loss stop a short leg.
+    if (Number.isFinite(axle_x_cm) && d - this.clear_cm >= ROUTE_CLEAR_POSE_CM) {
       this.completeClear(d, now);
       return;
     }
