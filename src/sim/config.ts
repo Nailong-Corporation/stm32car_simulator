@@ -38,7 +38,7 @@ export const CORNER_HEADING_KP = 8.0;
 export const CORNER_ARC_RADIUS_CM = 13.0;
 /* Axle centre speed through the arc (cm/s). The outer wheel runs at
  * v*(1 + track/(2*R)) = 1.47v at R=15, track=14. */
-export const CORNER_ARC_SPEED_CM_S = 70.0;
+export const CORNER_ARC_SPEED_CM_S = 45.0; /* 实车 a≈144 时 v_arc≤46，取 45（仿真验证可完赛）。 */
 /* Differential (cm/s) per rad of heading error against the arc tangent. */
 export const CORNER_ARC_HEADING_KP = 22.0;
 /* The outgoing leg must leave room for the exit tangent point (R past the
@@ -80,7 +80,7 @@ export const ENCODER_RIGHT_SIGN = 1;
 export const ODOMETRY_DISTANCE_SCALE = 1.0;
 export const ODOMETRY_HEADING_SCALE = 0.641;
 
-export const VEHICLE_MAX_SPEED_CM_S = 500.0;
+export const VEHICLE_MAX_SPEED_CM_S = 190.0; /* 2026-11-08 实测满 PWM≈190 cm/s（pwm/v≈1.33）。 */
 export const ODOMETRY_MAX_SPEED_CM_S = 650.0;
 export const SPEED_FILTER_TAU_S = 0.030;
 export const WHEEL_TARGET_MAX_CM_S = 500.0;
@@ -98,7 +98,7 @@ export const MOTOR_RESPONSE_TAU_S = 0.120;
 export const MOTOR_COAST_TAU_S = 0.350;
 export const MOTOR_BRAKE_TAU_S = 0.080;
 export const MOTOR_MAX_ACCEL_CM_S2 = 500.0;
-export const MOTOR_MAX_DECEL_CM_S2 = 500.0;
+export const MOTOR_MAX_DECEL_CM_S2 = 150.0; /* 2026-11-08 实车滑行实测 a≈144–168。 */
 /* Reverse-torque plant assumption (simulator only, no firmware counterpart):
  * driving the H-bridge against the direction of travel adds torque to the
  * rolling friction, so the achievable deceleration is higher than coasting but
@@ -171,6 +171,8 @@ export const JUNCTION_WRONG_WAY_RAD = 0.35;
 export const JUNCTION_CENTER_LIMIT = 2.0;
 export const JUNCTION_CAPTURE_MIN_RAD = 0.70;
 export const JUNCTION_CLEAR_MAX_CM = 20.0;
+// Normal tracking limits common target lead instead of cutting just the inner wheel.
+export const TRACKING_SPEED_LEAD_CM_S = 10.0;
 export const STEERING_FEEDBACK_MIN_CM_S = 5.0;
 export const STEERING_FEEDBACK_MIN_HALF_CM_S = 0.1;
 export const JUNCTION_CAPTURE_MIN_TURN_CM_S = 0.8;
@@ -191,7 +193,7 @@ export const COMPONENT_RECOVERY_TIMEOUT_MS = 1200;
 
 export const BRAKING_ACCEL_FILTER_TAU_S = 0.080;
 export const BRAKING_CALIBRATION_CONFIRMED = 1;
-export const BRAKING_SAFE_DECEL_CM_S2 = 250.0;
+export const BRAKING_SAFE_DECEL_CM_S2 = 115.0; /* 0.8×实测 min(144.45)。 */
 export const BRAKING_DISTANCE_MARGIN_CM = 2.0;
 export const BRAKING_TARGET_JERK_CM_S3 = 800.0;
 

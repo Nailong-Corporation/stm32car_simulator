@@ -15,6 +15,7 @@ import {
 import {
   WHEEL_TARGET_MAX_CM_S,
   STARTUP_RAMP_TIME_S,
+  TRACKING_SPEED_LEAD_CM_S,
   TARGET_RISE_CM_S2,
   TURN_EXIT_ACCEL_CM_S2,
   LINE_FOLLOW_SPEED_CM_S,
@@ -284,12 +285,19 @@ export class LineFollowModel {
   private outerTargets(outer: number, correction: number, dt: number): void {
     const requested = outer;
     outer = this.nextOuter(outer, dt);
+    if (this.state === LineState.LINE_TRACKING) {
+      const measured = Math.max(0, this.odometry.left_speed_cm_s, this.odometry.right_speed_cm_s);
+      outer = Math.min(outer, measured + TRACKING_SPEED_LEAD_CM_S);
+    }
     if (outer >= requested) this.exit_accelerating = false;
     correction = Math.max(-outer * 0.5, Math.min(outer * 0.5, correction));
     const mean = outer - Math.abs(correction);
     this.left_target_cm_s = mean + correction;
     this.right_target_cm_s = mean - correction;
-    if (Math.abs(correction) >= STEERING_FEEDBACK_MIN_HALF_CM_S && outer > 0) {
+    // Tracking preserves the grey PID/yaw half-difference despite common wheel
+    // lag. Keep the legacy manoeuvre/hold compensation, matching the firmware.
+    if (this.state !== LineState.LINE_TRACKING &&
+        Math.abs(correction) >= STEERING_FEEDBACK_MIN_HALF_CM_S && outer > 0) {
       const measured = correction > 0 ? this.odometry.left_speed_cm_s : this.odometry.right_speed_cm_s;
       let inner = correction > 0 ? this.right_target_cm_s : this.left_target_cm_s;
       if (measured >= STEERING_FEEDBACK_MIN_CM_S && measured < outer) {

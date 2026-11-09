@@ -127,10 +127,11 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
   const scheme0 = parsed.schemes.find((s) => s.id === 0);
   assert.ok(scheme0);
-  assert.equal(scheme0.steps.length, 3,
-    'scheme 0 has one commented-out row; it must not be parsed as a step');
-  assert.equal(scheme0.steps[0].junction_count, 4);
-  assert.equal(scheme0.steps[0].segment_length_cm, 220);
+  assert.equal(scheme0.steps.length, 4,
+    'scheme 0 has one commented-out row plus four active rows');
+  // 2026-11-08 调试路线第 0 行改为 junction_count=5 / arc=true（230 cm），随表同步。
+  assert.equal(scheme0.steps[0].junction_count, 5);
+  assert.equal(scheme0.steps[0].segment_length_cm, 230);
 
   const custom = [
     'const RouteStep route[] = {',
