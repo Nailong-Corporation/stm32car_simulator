@@ -52,10 +52,10 @@ next firmware task; do not report "host suite green" until then.
 
 ## Firmware advanced after this patch
 
-The firmware `main` branch is now at `b167058` ("转弯参数和编码器参数修正").
-That commit changes only firmware parameters/algorithm (wheel 4.8 cm, 1064
-counts/rev, `ODOMETRY_DISTANCE_SCALE=1.0`, `TURN_PIVOT_APPROACH_CM=10`, START
-IMU/odometry realign, `ROUTE_WAYPOINT_MAX_PASSED_LAG_CM=30`, scheme-0 debug
-table) and was **not edited by the simulator work**. The simulator mirrors those
-values/algorithms; see the top-level `README.md` section
-"2026-11-08 固件参数/算法同步" for the verification.
+The firmware `main` went through `b167058` ("转弯参数和编码器参数修正"),
+`cf5d30d`, `285efd5`, `f944a47`, and then an uncommitted 2026-11-10 working tree
+(off-centre exit search plus `ROUTE_SCHEME_SELECT=4`). None of those firmware
+changes were edited by the simulator work. The simulator mirrors the current
+working tree; see the top-level `README.md` section
+"2026-11-10 固件工作树（`f944a47` 之后）实车环岛入口同步" for the verification
+and the remaining physical-model limitation.

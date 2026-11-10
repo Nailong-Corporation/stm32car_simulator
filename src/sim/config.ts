@@ -203,6 +203,13 @@ export const JUNCTION_YAW_FILTER_TAU_S = 0.030;
 export const JUNCTION_EXIT_SEARCH_SPEED_CM_S = 16.0;
 export const JUNCTION_EXIT_SEARCH_MAX_CM = 12.0;
 export const JUNCTION_EXIT_SEARCH_TIMEOUT_MS = 1200;
+/* 2026-11-10 实车（索引 9，Q13 左转 90° 后去环岛）：搜索期间灰度 PID 冻结、
+ * 只按出口航向直行，枢轴留下的横向残差让出口线停在 8 路杆最外侧（0x03，
+ * position=-6），旧的“连续 3 帧居中 ±2”在 12 cm 预算内永远不成立。
+ * 持续可见的窄单区域线本身就是出口证据，交给离口位置 PID 回中；但必须连续
+ * 可见 250 ms / 6 cm，单帧笔画与扫线残影仍不算出口。 */
+export const JUNCTION_EXIT_SEARCH_EDGE_STABLE_MS = 250;
+export const JUNCTION_EXIT_SEARCH_EDGE_STABLE_CM = 6.0;
 export const JUNCTION_EXIT_SPEED_CM_S = 20.0;
 export const COMPONENT_RECOVERY_SPEED_CM_S = 60.0;
 export const COMPONENT_RECOVERY_MAX_CM = 12.0;

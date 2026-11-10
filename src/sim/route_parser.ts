@@ -289,7 +289,7 @@ export const DEFAULT_ROUTE_TABLE_C = `#include "route.h"
  * 本文件由 test/sync_new_track_routes.py 生成。
  */
 #ifndef ROUTE_SCHEME_SELECT
-#define ROUTE_SCHEME_SELECT 1
+#define ROUTE_SCHEME_SELECT 4
 #endif
 
 const RouteStep route[] = {
@@ -384,36 +384,40 @@ const RouteStep route[] = {
 
 #elif (ROUTE_SCHEME_SELECT == 4)
     /* 走虚线、不进六边形环岛（普通） */
-    { 2, 28.0f, CUSTOM_TURN, 160,    90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 0: P 北上至 (0,0)；几何 110 - 5 = 105 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   50.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 1: 顶边东至 (55,0)；R2 在上一转弯传感器扫过区内，不再计数；几何 55 - 5 = 50 cm */
-    { 2, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,  135.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 2: x55 南下至 (55,140)，过 R3；几何 140 - 5 = 135 cm */
-    { 2, 28.0f, CUSTOM_TURN, 160,    90.0f,false,  185.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 3: y140 东至 Q6(245,140)，右转南下；Q4 位于上一转弯传感器扫过区，计 R5/目标；几何 190 - 5 = 185 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   25.0f, 30.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 4: x245 南下至 (245,170)；几何 30 - 5 = 25 cm */
-    { 2, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,  145.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 5: y170 西至 (95,170)，过 Q11；几何 150 - 5 = 145 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   45.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 6: x95 南下至 (95,220)；几何 50 - 5 = 45 cm */
-    { 5, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,  275.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 7: 底边东至 (375,220)，过 R8/R9/R10；几何 280 - 5 = 275 cm */
-    { 2, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 8: x375 北上至 (375,110)，过 R12；几何 110 - 5 = 105 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   25.0f, 30.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 9: y110 西至 Q13(345,110)；几何 30 - 5 = 25 cm */
-    { 1, 28.0f, STRAIGHT   , 160,     0.0f,false,   50.0f, 0.0f, 0.0f}, /* 10: x345 南下过环岛分叉（不进环），直行至 (345,165)；几何 55 - 5 = 50 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   50.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 11: x345 南下至 (345,220)；几何 55 - 5 = 50 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   25.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 12: 底边东至 (375,220)，左转北上；几何 30 - 5 = 25 cm */
-    { 6, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,  215.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 13: x375 北上至 (375,0)，过 R12/R15/y110/y50；几何 220 - 5 = 215 cm */
-    { 3, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   95.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 14: 顶边西至 (275,0)，过 Q16/R17；几何 100 - 5 = 95 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   45.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 15: x275 南下至 Q18(275,50)；几何 50 - 5 = 45 cm */
-    { 2, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   65.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 16: y50 东至 (345,50)，过 R19；几何 70 - 5 = 65 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   45.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 17: x345 北上至 Q16(345,0)；几何 50 - 5 = 45 cm */
-    { 6, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,  245.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 18: 顶边西至 Q22(95,0)，过 R17/x275/x245/R20/R21；几何 250 - 5 = 245 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 19: x95 南下至 (95,40)；几何 40 - 5 = 35 cm */
-    { 2, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   65.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 20: y40 东至 (165,40)，过 R23；几何 70 - 5 = 65 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 21: x165 南下至 (165,80)；几何 40 - 5 = 35 cm */
-    { 2, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   75.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 22: y80 东至 (245,80)，过 R24；几何 80 - 5 = 75 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 23: x245 北上至 (245,40)；几何 40 - 5 = 35 cm */
-    { 4, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,  145.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 24: y40 西至 (95,40)，过 R25/x165/R23；几何 150 - 5 = 145 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   95.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 25: x95 南下至 Q4(95,140)；几何 100 - 5 = 95 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 26: y140 西至 (55,140)，左转进入虚线；几何 40 - 5 = 35 cm */
-    { 2, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   75.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 27: x55 虚线仅南下至 (55,220)，过 R26；几何 80 - 5 = 75 cm */
-    { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   50.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 28: 底边西至 (0,220)；几何 55 - 5 = 50 cm */
-    { 2, 28.0f, STOP       , 160,     0.0f,false,  105.0f, 0.0f, 0.0f}, /* 29: STOP：x0 北上过 R27 至 P；几何 110 - 5 = 105 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 0: P 北上至 (0,0)；几何 110 - 5 = 105 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   30.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 1: 顶边东至 (55,0)；R2 在上一转弯传感器扫过区内，不再计数；几何 55 - 5 = 50 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  135.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 2: x55 南下至 (55,140)，过 R3；几何 140 - 5 = 135 cm */
+    { 3, 28.0f, CUSTOM_TURN,  80,    90.0f,false,  185.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM + 5.0f}, /* 3: y140 东至 Q6(245,140)，右转南下；Q4 位于上一转弯传感器扫过区，计 R5/目标；几何 190 - 5 = 185 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   25.0f, 30.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 4: x245 南下至 (245,170)；几何 30 - 5 = 25 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  130.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 5: y170 西至 (95,170)，过 Q11；几何 150 - 5 = 145 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   45.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 6: x95 南下至 (95,220)；几何 50 - 5 = 45 cm */
+    /* 2026-11-10 实车：角点在段进度239.61确认，275门禁247.15已晚7.54 cm。
+     * 本行按动作完成点的实测里程校准为265，门禁237.15；前节点205.56仍只通过。
+     * 几何原长280不变；此列现为实车门禁标定值，生成器会覆盖手工标定。 */
+    { 5, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  265.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 7: 底边东至 (375,220)，过 R8/R9/R10；段距门禁实车校准265 cm */
+    // 右下角
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 8: x375 北上至 (375,110)，过 R12；几何 110 - 5 = 105 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   25.0f, 30.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 9: y110 西至 Q13(345,110)；几何 30 - 5 = 25 cm */
+    //{ 1, 28.0f, HEXAGON    ,  80,   360.0f,false,   50.0f, 0.0f, 0.0f}, /* 10: HEXAGON：x345 南下入环（北进），绕环一周后从南侧 x345 出环到 (345,220)；几何 55 - 5 = 50 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  100.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 11: x345 南下至 (345,220)；几何 55 - 5 = 50 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   25.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 12: 底边东至 (375,220)，左转北上；几何 30 - 5 = 25 cm */
+    { 6, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  215.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 13: x375 北上至 (375,0)，过 R12/R15/y110/y50；几何 220 - 5 = 215 cm */
+    { 3, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   95.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 14: 顶边西至 (275,0)，过 Q16/R17；几何 100 - 5 = 95 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   45.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 15: x275 南下至 Q18(275,50)；几何 50 - 5 = 45 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   65.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 16: y50 东至 (345,50)，过 R19；几何 70 - 5 = 65 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   45.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 17: x345 北上至 Q16(345,0)；几何 50 - 5 = 45 cm */
+    { 6, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  245.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 18: 顶边西至 Q22(95,0)，过 R17/x275/x245/R20/R21；几何 250 - 5 = 245 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 19: x95 南下至 (95,40)；几何 40 - 5 = 35 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   65.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 20: y40 东至 (165,40)，过 R23；几何 70 - 5 = 65 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 21: x165 南下至 (165,80)；几何 40 - 5 = 35 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   75.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 22: y80 东至 (245,80)，过 R24；几何 80 - 5 = 75 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 23: x245 北上至 (245,40)；几何 40 - 5 = 35 cm */
+    { 4, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  145.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 24: y40 西至 (95,40)，过 R25/x165/R23；几何 150 - 5 = 145 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   95.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 25: x95 南下至 Q4(95,140)；几何 100 - 5 = 95 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 26: y140 西至 (55,140)，左转进入虚线；几何 40 - 5 = 35 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   75.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 27: x55 虚线仅南下至 (55,220)，过 R26；几何 80 - 5 = 75 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   50.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 28: 底边西至 (0,220)；几何 55 - 5 = 50 cm */
+    { 2, 28.0f, STOP       ,  80,     0.0f,false,  105.0f, 0.0f, 0.0f}, /* 29: STOP：x0 北上过 R27 至 P；几何 110 - 5 = 105 cm */
 
 #elif (ROUTE_SCHEME_SELECT == 5)
     /* 快速版：走虚线、含环岛（尽速） */

@@ -43,6 +43,8 @@ import {
   JUNCTION_EXIT_SEARCH_SPEED_CM_S,
   JUNCTION_EXIT_SEARCH_MAX_CM,
   JUNCTION_EXIT_SEARCH_TIMEOUT_MS,
+  JUNCTION_EXIT_SEARCH_EDGE_STABLE_MS,
+  JUNCTION_EXIT_SEARCH_EDGE_STABLE_CM,
   JUNCTION_CAPTURE_MIN_RAD,
   JUNCTION_YAW_FILTER_TAU_S,
   JUNCTION_CLEAR_MAX_CM,
@@ -1033,14 +1035,32 @@ export class RoutePlannerModel {
     const positionLimit = shortExit
       ? JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT
       : JUNCTION_CENTER_LIMIT;
-    const exit = adjacent && routeIsNarrowLine(o) &&
+    const narrowExit = adjacent && routeIsNarrowLine(o) &&
       o.white_count <= JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
-      Math.abs(o.position) <= positionLimit &&
       (!shortExit || Math.abs(h - this.short_link_heading) <= SHORT_LINK_MAX_HEADING_RAD);
-    if (!exit) this.exit_count = 0;
+    const centered = narrowExit && Math.abs(o.position) <= positionLimit;
+    if (!centered) this.exit_count = 0;
     else if (this.exit_count < LINE_CONFIRM_SAMPLES) this.exit_count++;
     this.capture_line_samples = this.exit_count;
-    if (this.exit_count < LINE_CONFIRM_SAMPLES) return;
+    let confirmed = this.exit_count >= LINE_CONFIRM_SAMPLES;
+    /* 2026-11-10 实车（索引 9 → 环岛）：搜索只保持出口航向、冻结灰度位置 PID，
+     * 枢轴留下的横向残差会让真正的出口线一直停在 8 路杆最外侧（0x03,
+     * position=-6），在 12 cm 预算内不可能自己回中；旧的“连续 3 帧居中”规则
+     * 必然超限 EXIT_RECAPTURE，车停在环岛斜边与 x=345 线的交点之前。
+     * 持续可见的窄单区域线本身就是出口证据，交给离口位置 PID 回中即可；
+     * 宽线/多区域/空心图形和单帧笔画仍不满足下面的稳定窗口。 */
+    if (narrowExit && !shortExit && !confirmed) {
+      if (!this.exit_candidate_pending) {
+        this.exit_candidate_pending = true;
+        this.exit_candidate_ms = now;
+        this.exit_candidate_cm = d;
+      } else if (now - this.exit_candidate_ms >= JUNCTION_EXIT_SEARCH_EDGE_STABLE_MS &&
+        d - this.exit_candidate_cm >= JUNCTION_EXIT_SEARCH_EDGE_STABLE_CM) {
+        confirmed = true;
+      }
+    } else if (!narrowExit) this.exit_candidate_pending = false;
+    if (!confirmed) return;
+    this.exit_candidate_pending = false;
     this.turn_exit_search = false;
     this.capture_line_seen = true;
     this.line_exit_confirmed = true;

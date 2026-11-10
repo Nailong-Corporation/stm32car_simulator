@@ -134,7 +134,7 @@ console.log('PASS: short-link projected turn-in geometry stays unchanged for 0/4
 // The bundled table keeps every existing route value and only changes column 9.
 {
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
-  assert.equal(parsed.activeSchemeId, 1); /* firmware ROUTE_SCHEME_SELECT=1 */
+  assert.equal(parsed.activeSchemeId, 4); /* firmware ROUTE_SCHEME_SELECT=4 */
   assert.equal(parsed.schemes.length, 8);
   for (const scheme of parsed.schemes) {
     for (const s of scheme.steps) {

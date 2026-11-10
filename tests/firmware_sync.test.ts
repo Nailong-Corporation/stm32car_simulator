@@ -21,6 +21,8 @@ import {
   JUNCTION_EXIT_SEARCH_SPEED_CM_S,
   JUNCTION_EXIT_SEARCH_MAX_CM,
   JUNCTION_EXIT_SEARCH_TIMEOUT_MS,
+  JUNCTION_EXIT_SEARCH_EDGE_STABLE_MS,
+  JUNCTION_EXIT_SEARCH_EDGE_STABLE_CM,
   JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT,
   LINE_CONFIRM_SAMPLES,
 } from '../src/sim/config';
@@ -56,8 +58,10 @@ assert.equal(JUNCTION_SETTLE_MIN_DIFF_CM_S, 6.0);
 assert.equal(JUNCTION_EXIT_SEARCH_SPEED_CM_S, 16.0);
 assert.equal(JUNCTION_EXIT_SEARCH_MAX_CM, 12.0);
 assert.equal(JUNCTION_EXIT_SEARCH_TIMEOUT_MS, 1200);
+assert.equal(JUNCTION_EXIT_SEARCH_EDGE_STABLE_MS, 250);
+assert.ok(Math.abs(JUNCTION_EXIT_SEARCH_EDGE_STABLE_CM - 6.0) < 1e-9);
 assert.equal(JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT, 3.0);
-console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064 counts, scale 1.0, heading 0.748, gate 27.85, max steps 64)');
+console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064 counts, scale 1.0, heading 0.748, gate 27.85, max steps 64, edge exit 250 ms/6 cm)');
 
 // 2) START is the pose origin: a body rotated after power-on must not leave a
 //    non-zero heading, and the first row must not be accepted at d ~ 0.
@@ -148,7 +152,7 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
   const scheme0 = parsed.schemes.find((s) => s.id === 0);
   assert.ok(scheme0);
-  assert.equal(parsed.activeSchemeId, 1, 'bundled default must match firmware ROUTE_SCHEME_SELECT=1');
+  assert.equal(parsed.activeSchemeId, 4, 'bundled default must match firmware ROUTE_SCHEME_SELECT=4');
   assert.equal(scheme0.steps.length, 2, 'only the two active debug rows are parsed');
   const fields = ['junction_count', 'turn_speed', 'action', 'cruise_speed',
     'angle_deg', 'corner_arc_enabled', 'segment_length_cm', 'short_link_cm', 'turn_approach_cm'] as const;
@@ -162,6 +166,18 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   assert.equal(scheme1.steps[3].turn_approach_cm, 19, 'Q6 row: 14 cm transistor hold + 5 cm calibration');
   assert.equal(scheme1.steps[7].segment_length_cm, 265, 'bottom-right gate calibrated on the car');
   assert.equal(scheme1.steps[29].action, Action.STOP);
+  const scheme4 = parsed.schemes.find((s) => s.id === 4);
+  assert.ok(scheme4);
+  assert.equal(scheme4.steps.length, 29, 'scheme 4 skips the commented HEXAGON row (29 active rows)');
+  assert.equal(scheme4.steps[0].junction_count, 1, 'scheme 4 exit search fixture starts with one node');
+  assert.equal(scheme4.steps[0].turn_speed, 28);
+  assert.equal(scheme4.steps[10].action, Action.CUSTOM_TURN,
+    'the commented-out HEXAGON row must not be parsed');
+  assert.equal(scheme4.steps[10].junction_count, 2);
+  assert.equal(scheme4.steps[10].segment_length_cm, 100,
+    'x=345 south leg measures to the bottom edge, not the ring centre');
+  assert.equal(scheme4.steps[7].segment_length_cm, 265);
+  assert.equal(scheme4.steps[28].action, Action.STOP);
   // ROUTE_REPEAT_COUNT=1 must reach a freshly initialised planner.
   const planner = new RoutePlannerModel();
   planner.init(scheme0.steps);
@@ -183,4 +199,77 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   console.log('PASS: commented-out route steps are ignored by the parser');
 }
 
-console.log('PASS: firmware sync contract (params, START realign, grey authorization, current debug table and default)');
+// 6) 2026-11-10 field regression (index 9, Q13 left turn -> ring entrance):
+//    the post-pivot search holds the exit heading and freezes the grey PID, so
+//    the real outgoing line can sit at the outermost pair (0x03, position=-6)
+//    for the whole 12 cm budget. A continuously visible narrow edge line is
+//    exit evidence after 250 ms / 6 cm; a single-frame stroke is not.
+{
+  const steps = [
+    { junction_count: 1, turn_speed: 28, action: Action.STRAIGHT, cruise_speed: 80,
+      angle_deg: 0, corner_arc_enabled: false, segment_length_cm: 50, short_link_cm: 0 },
+    { junction_count: 1, turn_speed: 28, action: Action.STRAIGHT, cruise_speed: 80,
+      angle_deg: 0, corner_arc_enabled: false, segment_length_cm: 50, short_link_cm: 0 },
+    { junction_count: 1, turn_speed: 28, action: Action.STRAIGHT, cruise_speed: 80,
+      angle_deg: 0, corner_arc_enabled: false, segment_length_cm: 50, short_link_cm: 0 },
+    { junction_count: 3, turn_speed: 28, action: Action.CUSTOM_TURN, cruise_speed: 80,
+      angle_deg: 90, corner_arc_enabled: false, segment_length_cm: 185, short_link_cm: 0,
+      turn_approach_cm: 19 },
+    { junction_count: 1, turn_speed: 28, action: Action.CUSTOM_TURN, cruise_speed: 80,
+      angle_deg: 90, corner_arc_enabled: false, segment_length_cm: 25, short_link_cm: 0,
+      turn_approach_cm: 9 },
+    { junction_count: 1, turn_speed: 28, action: Action.STOP, cruise_speed: 80,
+      angle_deg: 0, corner_arc_enabled: false, segment_length_cm: 100, short_link_cm: 0 },
+  ];
+  const r = new RoutePlannerModel();
+  r.init(steps);
+  r.start(0, 0);
+  r.setSpeed(10, 10);
+  // Arm the field fixture directly: index 9 reached full 90 deg and the search
+  // is running with the outgoing line at the bar edge.
+  r.index = 3;
+  r.state = RouteState.ROUTE_EXECUTING;
+  r.entry_heading = 0;
+  r.phase_ms = 0;
+  r.capture_line_ms = 0;
+  r.capture_line_cm = 0;
+  r.exit_count = 0;
+  r.exit_candidate_pending = false;
+  r.turn_exit_search = true;
+  let now = 0;
+  let d = 0;
+  const edge = grayClassify(0x03, true, 0); // outermost single region, position -6
+  const tick = (o: typeof edge, ds: number) => {
+    now += 5;
+    d += ds;
+    r.update(o, d, 0, now);
+  };
+
+  tick(edge, 0.1);
+  assert.equal(r.exit_count, 0);
+  assert.equal(r.turn_exit_search, true);
+  assert.equal(r.line_exit_confirmed, false);
+  for (let i = 0; i < 20; i++) tick(grayClassify(0, true, 0), 0.1); // 2 cm gap resets
+  assert.equal(r.turn_exit_search, true);
+  assert.equal(r.line_exit_confirmed, false);
+  tick(edge, 0.1);
+  assert.equal(r.exit_count, 0);
+  assert.equal(r.turn_exit_search, true);
+
+  let frames = 0;
+  while (r.turn_exit_search && frames < 200) {
+    tick(edge, 0.1);
+    frames++;
+  }
+  assert.equal(r.turn_exit_search, false, 'stable edge line must confirm the exit');
+  assert.equal(r.line_exit_confirmed, true);
+  assert.equal(r.capture_line_seen, true);
+  assert.equal(r.state, RouteState.ROUTE_CLEARING);
+  assert.equal(r.index, 3);
+  assert.ok(d - r.capture_line_cm >= 5.5, `edge hand-off must travel >=5.5 cm, got ${(d - r.capture_line_cm).toFixed(2)}`);
+  assert.ok(d - r.capture_line_cm < JUNCTION_EXIT_SEARCH_MAX_CM);
+  assert.ok(now - 0 < JUNCTION_EXIT_SEARCH_TIMEOUT_MS);
+  console.log(`PASS: stable off-centre (0x03) exit line confirms after ${(d - r.capture_line_cm).toFixed(1)} cm / ${now} ms; single-frame strokes are rejected`);
+}
+
+console.log('PASS: firmware sync contract (params, START realign, grey authorization, current debug table, default scheme 4 and edge exit)');
