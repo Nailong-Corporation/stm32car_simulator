@@ -255,10 +255,10 @@ export const JUNCTION_ADJACENT_EXIT_CM = 0.30;
 /* Preset-route pose (dead-reckoning) navigation (2026-11-06).
  * The route table stores geometry lengths reduced by the 5 cm distance margin;
  * the absolute corner waypoint is recovered from the start pose and the
- * cumulative (length, angle) chain.  The 8-channel bar still confirms every
- * corner it can see; the pose check runs in parallel so a printed symbol that
- * hides the wire (Q22 transistor) or a leg shorter than the 24 cm look-ahead
- * cannot stall the run.  Clockwise positive heading in the track frame:
+ * cumulative (length, angle) chain. Ordinary FOLLOW/CANDIDATE actions require
+ * a confirmed grey node after the positive segment distance (zero distance
+ * uses count); pose predicts steering/speed/turn geometry and cannot authorize
+ * the node or veto its grey confirmation. Clockwise positive track heading:
  * 0 = +x east, +PI/2 = +y south. */
 export const ROUTE_START_X_CM = 0.0;
 export const ROUTE_START_Y_CM = 110.0;
@@ -274,8 +274,8 @@ export const ROUTE_WAYPOINT_CONFIRM_CM = 2.5;
 export const ROUTE_WAYPOINT_FALLBACK_CM = 18.0;
 /* The ring entry is timed on the axle pose, not the 24 cm look-ahead bar. */
 export const ROUTE_WAYPOINT_RING_CONFIRM_CM = 6.0;
-/* A gray junction only authorises this row's action when its bar is this close
- * to the row's known corner; farther nodes are passing junctions. */
+/* Cross-track trust/loss threshold, matching the firmware value. Ordinary
+ * grey-confirmed action authorization no longer uses a waypoint proximity gate. */
 export const ROUTE_WAYPOINT_GATE_CM = 12.0;
 /* 2026-11-08：位姿“已过角点”的最大滞后。超过该值说明位姿与表格不再一致（例如
  * 上电后旋转过车体、或表内该行段长为 0 导致 waypoint 退化），此时必须由灰度节点

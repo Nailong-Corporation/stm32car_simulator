@@ -77,11 +77,6 @@ import {
   ROUTE_START_HEADING_RAD,
   ROUTE_REPEAT_COUNT,
   ROUTE_WAYPOINT_MARGIN_CM,
-  ROUTE_WAYPOINT_CONFIRM_CM,
-  ROUTE_WAYPOINT_FALLBACK_CM,
-  ROUTE_WAYPOINT_RING_CONFIRM_CM,
-  ROUTE_WAYPOINT_GATE_CM,
-  ROUTE_WAYPOINT_MAX_PASSED_LAG_CM,
   ROUTE_WAYPOINT_EXIT_CM,
   ROUTE_WAYPOINT_EXIT_ANGLE_RAD,
   HEXAGON_ENTRY_APPROACH_MAX_CM,
@@ -647,11 +642,11 @@ export class RoutePlannerModel {
 
   public targetReady(d: number, next: boolean): boolean {
     const s = this.steps[this.index];
-    const countReady = s.junction_count > 0 &&
+    // Positive segment distance is mandatory; count cannot release it early.
+    // Readiness only arms a subsequently confirmed grey node, never a pose turn.
+    if (s.segment_length_cm > 0) return d - this.origin_cm >= s.segment_length_cm;
+    return s.junction_count > 0 &&
       this.junctions_seen + (next ? 1 : 0) >= s.junction_count;
-    const distanceReady = s.segment_length_cm > 0 &&
-      d - this.origin_cm >= s.segment_length_cm;
-    return countReady || distanceReady;
   }
 
   private refreshDistance(d: number, now: number): void {
@@ -1424,77 +1419,6 @@ export class RoutePlannerModel {
     }
 
     if (this.state === RouteState.ROUTE_FOLLOW || this.state === RouteState.ROUTE_CANDIDATE) {
-      // Parallel pose trigger (2026-11-06): the table corner is known in track
-      // coordinates, so encoders+IMU can confirm it even when a printed symbol
-      // hides the wire or the leg is shorter than the 24 cm look-ahead bar.
-      /* 表内 segment_length_cm==0 的行没有可用的角点（waypoint 退化到起点/上一角），
-       * 这时位姿不能代替灰度交棒，否则启动第一帧就会把角点判成“已过”并立即执行
-       * 第一行动作（2026-11-08 现场：在线上启动就左转）。该类行只按灰度节点计数执行。 */
-      if (
-        this.pose_mode &&
-        this.state === RouteState.ROUTE_FOLLOW &&
-        this.steps[this.index].segment_length_cm > 0 &&
-        Number.isFinite(axle_x_cm) &&
-        Number.isFinite(axle_y_cm) &&
-        this.waypoint_x_cm.length === this.count
-      ) {
-        const st = this.steps[this.index];
-        const wh = h - Math.PI / 2;
-        const sx = axle_x_cm + GRAY_FORWARD_OFFSET_CM * Math.cos(wh);
-        const sy = axle_y_cm + GRAY_FORWARD_OFFSET_CM * Math.sin(wh);
-        const wx = this.waypoint_x_cm[this.index];
-        const wy = this.waypoint_y_cm[this.index];
-        const axleGap = Math.hypot(axle_x_cm - wx, axle_y_cm - wy);
-        const barGap = Math.hypot(sx - wx, sy - wy);
-        // A missed window must not stall the row: if the axle has already
-        // passed the corner while still within a corridor width of it, this is
-        // that corner (only reachable when the previous exit ran long).
-        const proj = (wx - axle_x_cm) * Math.cos(wh) + (wy - axle_y_cm) * Math.sin(wh);
-        const lateral = Math.abs(-(wx - axle_x_cm) * Math.sin(wh) + (wy - axle_y_cm) * Math.cos(wh));
-        // The trigger is timed for the bar, so a bar already past the corner
-        // (short leg started late) must still hand the row over instead of
-        // driving by until the next corner.
-        const barProj = proj - GRAY_FORWARD_OFFSET_CM;
-        /* “已过角点”只允许合理滞后：位姿一旦错位/退化，几十厘米以外的角点
-         * 也会满足 bar_proj<=确认半径，从而在 d≈0 直接触发动作。 */
-        const passed = barProj <= ROUTE_WAYPOINT_CONFIRM_CM &&
-          barProj >= -ROUTE_WAYPOINT_MAX_PASSED_LAG_CM &&
-          lateral <= ROUTE_WAYPOINT_GATE_CM;
-        const reached = barGap <= ROUTE_WAYPOINT_CONFIRM_CM || passed;
-        const fallback = st.segment_length_cm > 0 &&
-          d - this.origin_cm >= st.segment_length_cm + ROUTE_WAYPOINT_FALLBACK_CM;
-        this.pose_trigger_late_cm = barProj < 0 ? -barProj : 0;
-        /* 2026-11-09 现场：位姿交棒原先只要“前杆压到角点”就执行动作，比本行表内段距
-         * 早约 24 cm，而且完全不需要灰度节点 —— 表现为“未达距离就转弯 / 没路口也转”。
-         * 24 cm 提前量只对滚动圆弧（入弯切点 E=K-R·u 在角点前 13 cm）和 90° 枢轴
-         * （交棒后有 TURN_PIVOT_APPROACH_CM 接近段）成立；其余动作（非 90° 自定义角、
-         * STOP、通过型节点）交棒即动作，必须走满本行段距（表=几何-5）。 */
-        /* STOP / LEFT / RIGHT / HEXAGON 保持原交棒时机；只有非 90° 自定义角既没有接近段、
-         * 也没有离口位置 PID 补偿，必须等本行段距。 */
-        const immediateAction = !this.usesCornerArc() &&
-          st.action === Action.CUSTOM_TURN &&
-          Math.abs(Math.abs(this.turnTargetRad()) - JUNCTION_TURN_TARGET_RAD) >= 1e-4;
-        /* 2026-11-10 现场：表内段距=几何-5，车轴走到段距时仍在物理角点前 5 cm；
-         * 那里起转会横向错 5 cm（灰度只看到边沿）。交棒改到 waypoint=段距+5。 */
-        const distanceReady = st.segment_length_cm > 0 &&
-          d - this.origin_cm >= st.segment_length_cm + ROUTE_WAYPOINT_MARGIN_CM;
-        const poseReady = immediateAction ? distanceReady : (reached || fallback);
-        if (st.action !== Action.STRAIGHT && poseReady && (reached || fallback)) {
-          this.candidate_count = 0;
-          this.search_pending = false;
-          this.passing_junction = false;
-          if (this.junctions_seen < 0xffff) ++this.junctions_seen;
-          if (this.currentAction() !== Action.STRAIGHT && !this.entrySpeedReady()) {
-            this.state = RouteState.ROUTE_BRAKING;
-            this.phase_ms = now;
-            this.entry_cm = d;
-            this.entry_heading = h;
-            return;
-          }
-          this.acceptTarget(d, h, now);
-          return;
-        }
-      }
       const narrow = routeIsNarrowLine(o);
       const center = narrow && Math.abs(o.position) <= JUNCTION_CENTER_LIMIT;
       if (this.post_turn_slow && narrow && center && adjacent) {
@@ -1632,37 +1556,7 @@ export class RoutePlannerModel {
 
       this.last_confirmed_kind = this.candidate_kind;
       this.junctions_seen++;
-      // Pose gate: a real junction far from this table row's known corner is a
-      // passing node (printed elements and swept nodes included), not the
-      // target. Keeps the 8-channel proof but stops an over-counted node from
-      // starting the turn tens of cm early.
-      let poseMatches = true;
-      /* 0 段长的行没有角点可核对，退化为纯灰度节点行（距离 0 = 忽略距离）。 */
-      if (this.pose_mode && this.steps[this.index].segment_length_cm > 0 &&
-        Number.isFinite(axle_x_cm) && Number.isFinite(axle_y_cm) &&
-        this.waypoint_x_cm.length === this.count) {
-        const wh = h - Math.PI / 2;
-        const sx = axle_x_cm + GRAY_FORWARD_OFFSET_CM * Math.cos(wh);
-        const sy = axle_y_cm + GRAY_FORWARD_OFFSET_CM * Math.sin(wh);
-        // The ring vertex is a lollipop: the bar sees the split bands before
-        // the axle is anywhere near V0, so a HEXAGON row only accepts a grey
-        // node within the ring confirmation radius.
-        const gate = this.steps[this.index].action === Action.HEXAGON
-          ? ROUTE_WAYPOINT_RING_CONFIRM_CM
-          : ROUTE_WAYPOINT_GATE_CM;
-        const __gap = Math.hypot(sx - this.waypoint_x_cm[this.index], sy - this.waypoint_y_cm[this.index]);
-        poseMatches = __gap <= gate;
-      }
-      /* 2026-11-09：计数只是“最多可提前经过几个路口”的容错上限，不是动作授权；
-       * 动作仍须先走满本行段距（表=几何-5）。旧实现把它当 OR，于是只要计数够了，
-       * 车就在物理路口直接起转，改表内距离完全不生效。 */
-      /* 纯灰度模式（无里程位姿）保留旧的计数容错语义；有位姿时距离才是权威门禁。 */
-      const distanceGate = !this.pose_mode ||
-        this.steps[this.index].action === Action.HEXAGON ||
-        this.steps[this.index].action === Action.STRAIGHT ||
-        this.steps[this.index].segment_length_cm <= 0 ||
-        d - this.origin_cm >= this.steps[this.index].segment_length_cm;
-      this.passing_junction = !distanceGate || !this.targetReady(d, false) || !poseMatches;
+      this.passing_junction = !this.targetReady(d, false);
       this.search_pending = false;
 
       if (this.passing_junction) {

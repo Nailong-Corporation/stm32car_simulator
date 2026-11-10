@@ -188,8 +188,10 @@ export function parseRouteTableC(sourceCode: string): ParseResult {
 export const DEFAULT_ROUTE_TABLE_C = `#include "route.h"
 
 /* 字段：最多路口数、转弯速度、动作、巡航速度、右正左负角度、圆弧开关、总段距离、短段几何长度。
- * 普通行：计数包含当前节点；计数或距离任一达到后，仍须确认灰度节点才执行动作。
- * short_link_cm>0：明确标注的短连接，使用前一路口确认后的有界编码器/航向投影；长度不减5。
+ * 普通行：正段距必须先满足 d-origin>=段距，再由确认的灰度节点授权；计数不得提前放行。
+ * 段距为 0 时按计数授权；距离已到但无灰度路口继续等待，位姿不触发或否决动作。
+ * short_link_cm>0：历史短连接旁路使用前一路口确认后的有界编码器/航向投影；长度不减5。
+ * 该旁路仍可能不经下一灰度节点直接起转，未满足上述新授权规则，待单独修正。
  * 电阻及其他印刷图形参与节点计数，使用连续证据及离口去重。
  * 所有行距离 = 图纸几何长度 - 5 cm；原始长度见 test/new_track_routes.json。
  * 传感器前伸 24 cm，短段节点可能在上一动作内通过，计数需逐段回放校准。
@@ -199,8 +201,8 @@ export const DEFAULT_ROUTE_TABLE_C = `#include "route.h"
  * 本文件由 test/sync_new_track_routes.py 生成。
  */
 #ifndef ROUTE_SCHEME_SELECT
-/* 仿真器默认仍选方案 1（正式全元件路线）；表内容已与固件 route_table.c 逐行同步。 */
-#define ROUTE_SCHEME_SELECT 1
+/* 默认方案与固件当前工作树一致：方案 0，两行实车调试表。 */
+#define ROUTE_SCHEME_SELECT 0
 #endif
 
 const RouteStep route[] = {
@@ -210,7 +212,7 @@ const RouteStep route[] = {
      * 右转后小车在线内侧、与出弯线平行错约 4 cm（灰度过线但一直判丢线）。
      * 段距 230→234 让本行角点/位姿起转点整体后移 4 cm（滚动转弯的切点 E=K-R·u 也随之
      * 后移），即“转弯前再走 4 cm”；出弯切点 X=K+R·o 才落回出弯线上。 */
-    { 2, 20.0f, CUSTOM_TURN, 50,   90.0f, false ,  80.0f, 0.0f},
+    { 2, 20.0f, CUSTOM_TURN, 50,   90.0f, false ,  50.0f, 0.0f},
     { 3, 20.0f, STOP,        50,   90.0f, false ,  40.0f, 0.0f},
     //{ 5, 50.0f, CUSTOM_TURN, 80,   90.0f, true ,  234.0f, 0.0f},
     //{ 3, 50.0f, STOP, 80,   90.0f,false ,   70.0f, 0.0f}, /* 调试 2；几何 60 - 5 = 55 cm */

@@ -1,104 +1,87 @@
 import assert from 'node:assert/strict';
 import { RoutePlannerModel } from '../src/sim/route';
-import { LineFollowModel } from '../src/sim/line_follow';
-import { VehicleSimulator } from '../src/sim/physics';
 import { grayClassify } from '../src/sim/gray_sensor';
-import { parseRouteTableC, DEFAULT_ROUTE_TABLE_C } from '../src/sim/route_parser';
 import { GRAY_FORWARD_OFFSET_CM } from '../src/sim/config';
-import { Action, RouteState, LineState, type RouteStep } from '../src/sim/types';
+import { Action, RouteState, type RouteStep } from '../src/sim/types';
 
-/**
- * 2026-11-08 controller-layer authorization regression.
- *
- * A grey-confirmed node that lands on this row's known waypoint must authorize
- * the action even when the precomputed count and segment length have not armed.
- * This is the physical fix for the top-right corner of the outer loop: the
- * 24 cm look-ahead plus the previous turn's exit advance make both table gates
- * unreachable before the board edge, while the corner node itself is real.
- */
-
-function fixture() {
+// Pose may guide steering, but FOLLOW/CANDIDATE authorization requires a grey
+// node after the positive segment distance, or the count for a zero-length row.
+function fixture(action: Action, pose: boolean, arc = false, count = 4, length = 105) {
   const row: RouteStep = {
-    junction_count: 99, turn_speed: 20, action: Action.LEFT, cruise_speed: 40,
-    angle_deg: 0, corner_arc_enabled: false, segment_length_cm: 1000,
+    junction_count: count, turn_speed: 12, action, cruise_speed: 30,
+    angle_deg: action === Action.HEXAGON ? 360 : action === Action.CUSTOM_TURN ? 62 : 0,
+    corner_arc_enabled: arc, segment_length_cm: length,
   };
   const r = new RoutePlannerModel();
-  const stop: RouteStep = { ...row, action: Action.STOP, segment_length_cm: 0 };
-  r.init([row, stop]);
-  r.pose_enabled = true;
-  r.repeat_count = 1;
-  r.start(0, 0);
-  // Known corner of row 0, and a deliberately impossible table length/count:
-  // only the geometric node may authorize the turn.
-  r.waypoint_x_cm[0] = 0;
-  r.waypoint_y_cm[0] = -30;
+  r.init(action === Action.STOP ? [row] : [row, { ...row, action: Action.STOP,
+    angle_deg: 0, corner_arc_enabled: false, segment_length_cm: 100 }]);
+  r.pose_enabled = pose; r.repeat_count = 1; r.start(0, 0); r.setSpeed(0, 0);
+  assert.equal(r.valid, true);
   let d = 0, now = 0;
-  const feed = (mask: number, n = 1, lateral = 0, along = 0) => {
+  const feed = (mask: number, n = 1, near = true, advance = .1) => {
     for (let i = 0; i < n; ++i) {
-      d += 0.1; now += 5;
-      // h = 0: the bar sits 24 cm in -y from the axle.
-      const barX = r.waypoint_x_cm[0] + lateral;
-      const barY = r.waypoint_y_cm[0] + along;
+      d += advance; now += 5;
       r.update(grayClassify(mask, true, 0), d, 0, now,
-        barX, barY + GRAY_FORWARD_OFFSET_CM);
+        r.waypoint_x_cm[0] + (near ? 0 : 100),
+        r.waypoint_y_cm[0] + GRAY_FORWARD_OFFSET_CM);
     }
   };
-  return { r, feed };
+  return { r, feed, distance: (v: number) => { d = v; } };
 }
 
-for (const action of [Action.LEFT, Action.RIGHT]) {
-  const { r, feed } = fixture();
-  r.steps[0].action = action;
-  r.setSpeed(0, 0);
-  feed(0x18, 4);
-  feed(0xff, 3);
-  assert.equal(r.passing_junction, false,
-    'a grey node on the known corner must be the target, not a passing junction');
-  assert.ok(r.state === RouteState.ROUTE_EXECUTING || r.state === RouteState.ROUTE_BRAKING,
-    `action ${Action[action]} must be authorized by the geometric node, state=${RouteState[r.state]}`);
-  assert.equal(r.junctions_seen, 1);
-}
-console.log('PASS: grey node on the known corner authorizes LEFT/RIGHT despite unreachable count/length');
-
-{
-  for (const [lateral, along, label] of [[20, 0, 'lateral > 12 cm'], [0, 10, 'along > 2.5 cm']] as const) {
-    const { r, feed } = fixture();
-    feed(0x18, 4);
-    feed(0xff, 3, lateral, along);
-    assert.equal(r.passing_junction, true,
-      `${label} must stay a passing junction`);
-    assert.equal(r.state, RouteState.ROUTE_CLEARING);
+const actions = [Action.LEFT, Action.RIGHT, Action.CUSTOM_TURN, Action.HEXAGON,
+  Action.STRAIGHT, Action.STOP];
+for (const pose of [false, true]) for (const action of actions) {
+  for (const mask of [0, 0x18]) {
+    const { r, feed, distance } = fixture(action, pose);
+    r.junctions_seen = 99; distance(150); feed(mask, 5);
+    assert.equal(r.state, RouteState.ROUTE_FOLLOW, 'waypoint/fallback/count cannot replace a grey node');
+    assert.equal(r.junctions_seen, 99, 'pose cannot manufacture a count');
+  }
+  {
+    const { r, feed } = fixture(action, pose);
+    r.junctions_seen = 99; feed(0x18, 4); feed(0xff, 3);
+    assert.equal(r.state, RouteState.ROUTE_CLEARING, 'even a node on the waypoint must wait for distance');
+    assert.equal(r.passing_junction, true);
     assert.equal(r.index, 0);
   }
+  for (const near of [true, false]) {
+    const { r, feed, distance } = fixture(action, pose);
+    distance(105); feed(0x18, 4, near); feed(0xff, 3, near);
+    assert.equal(r.passing_junction, false, 'drifted waypoint must not veto the grey target');
+    assert.equal(r.state, action === Action.STOP ? RouteState.ROUTE_FINISHED : RouteState.ROUTE_EXECUTING);
+    assert.equal(r.junctions_seen, 1, 'distance authorizes despite insufficient count');
+  }
 }
-console.log('PASS: nodes off the known corner still pass through (no pose-only blind turn)');
+console.log('PASS: all actions in pose and grey modes require distance then grey proof, without waypoint trigger or veto');
+
+for (const count of [0, 2]) {
+  const { r, feed, distance } = fixture(Action.RIGHT, true, true, count);
+  distance(150); feed(0, 4);
+  assert.equal(r.state, RouteState.ROUTE_FOLLOW, 'rolling arcs also require grey, including count zero');
+  feed(0x18, 4); feed(0xff, 3);
+  assert.equal(r.state, RouteState.ROUTE_EXECUTING);
+  assert.equal(r.passing_junction, false);
+}
+console.log('PASS: rolling arc entry requires a confirmed grey node even for count zero');
 
 {
-  const scheme = parseRouteTableC(DEFAULT_ROUTE_TABLE_C).schemes.find((s) => s.id === 3)!;
-  const f = new LineFollowModel(scheme.steps);
-  f.route.repeat_count = 1;
-  const sim = new VehicleSimulator(f);
-  sim.requestStart();
-  let maxX = -Infinity;
-  let maxIndex = 0;
-  for (let i = 0; i < 240000; ++i) {
-    sim.step();
-    maxX = Math.max(maxX, sim.pose.x);
-    maxIndex = Math.max(maxIndex, f.route.index);
-    if (f.route.state === RouteState.ROUTE_FINISHED || f.state === LineState.LINE_STOPPED) break;
-  }
-  assert.ok(maxIndex >= 2,
-    `outer loop must turn at the top-right corner (index=${maxIndex}, ` +
-    `state=${RouteState[f.route.state]}, pose=${sim.pose.x.toFixed(1)},${sim.pose.y.toFixed(1)})`);
-  assert.ok(maxX < 377,
-    `outer loop must not drive off the 375 cm board at the top-right (maxX=${maxX.toFixed(1)})`);
-  // The controller-layer authorization fixes the top-right off-track.  The
-  // restored x=245 -> y=220 junction adds one bottom-edge node, so the bundled
-  // scheme-3 route table (junction_count=6 for the bottom row) now arms one node
-  // early and leaves the loop at the bottom-left.  That is a table-count
-  // recalibration (a parameter change), not a controller regression.
-  console.log(`PROGRESS: scheme 3 turned at the top-right (maxX=${maxX.toFixed(1)}); ` +
-    `state=${RouteState[f.route.state]} index=${f.route.index} ` +
-    `pose=${sim.pose.x.toFixed(1)},${sim.pose.y.toFixed(1)}`);
+  const { r, feed, distance } = fixture(Action.RIGHT, true);
+  feed(0x18, 4); feed(0xff, 1);
+  assert.equal(r.state, RouteState.ROUTE_CANDIDATE);
+  distance(105); feed(0, 1);
+  assert.equal(r.state, RouteState.ROUTE_FOLLOW, 'distance cannot promote an interrupted candidate');
+  assert.equal(r.junctions_seen, 0);
+  feed(0x18, 4); feed(0xff, 3, false);
+  assert.equal(r.state, RouteState.ROUTE_EXECUTING);
 }
-console.log('PASS: built-in scheme 3 turns at the top-right instead of driving off the board');
+for (const pose of [false, true]) {
+  const { r, feed } = fixture(Action.RIGHT, pose, false, 2, 0);
+  feed(0x18, 4); feed(0xff, 3);
+  assert.equal(r.state, RouteState.ROUTE_CLEARING);
+  assert.equal(r.passing_junction, true);
+  feed(0x18, 40); feed(0xff, 3);
+  assert.equal(r.state, RouteState.ROUTE_EXECUTING);
+  assert.equal(r.junctions_seen, 2);
+}
+console.log('PASS: interrupted candidates cannot blind-turn; zero-length rows retain grey count authorization');

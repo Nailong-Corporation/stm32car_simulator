@@ -17,15 +17,15 @@ import {
 } from '../src/sim/config';
 import { Action, LineState, RouteState } from '../src/sim/types';
 
-/* Firmware sync contract (2026-11-08, firmware b167058 "转弯参数和编码器参数修正").
+/* Firmware sync contract (2026-11-10, current firmware working tree).
  *
  * These tests pin the parts of the port that a full-lap run does not exercise:
  *   - the encoder / pivot / waypoint constants equal the firmware values;
  *   - START realigns the IMU heading zero and the odometry pose (rotated POWER-ON
  *     bodies must not hand over the first row at d = 0);
  *   - a row with segment_length_cm == 0 cannot be handed over by the pose;
- *   - a corner more than ROUTE_WAYPOINT_MAX_PASSED_LAG_CM behind the bar is not
- *     "already passed";
+ *   - pose proximity never authorizes ordinary FOLLOW actions (the full
+ *     distance/grey contract is in route_pose_node.test.ts);
  *   - commented-out route_table.c step lines are not parsed as active steps.
  */
 
@@ -103,7 +103,7 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   console.log('PASS: segment_length_cm == 0 rows are not pose-triggered');
 }
 
-// 4) "Already passed" is bounded: a corner far behind the bar cannot fire.
+// 4) A waypoint far behind the bar cannot authorize an ordinary action.
 {
   const steps = [
     { junction_count: 4, turn_speed: 20, action: Action.CUSTOM_TURN, cruise_speed: 40,
@@ -120,8 +120,8 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   r.update(grayClassify(0x18, true, 0), 0, 0, 0, 0, -50);
   assert.equal(r.index, 0);
   assert.notEqual(r.state, RouteState.ROUTE_EXECUTING,
-    'a corner beyond ROUTE_WAYPOINT_MAX_PASSED_LAG_CM must not count as passed');
-  console.log('PASS: waypoint "already passed" is bounded by ROUTE_WAYPOINT_MAX_PASSED_LAG_CM');
+    'a waypoint cannot authorize an ordinary action without grey confirmation');
+  console.log('PASS: a waypoint behind the bar cannot authorize an ordinary action');
 }
 
 // 5) Commented-out step lines in route_table.c are not active table rows.
@@ -129,16 +129,14 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
   const scheme0 = parsed.schemes.find((s) => s.id === 0);
   assert.ok(scheme0);
-  assert.equal(scheme0.steps.length, 2,
-    'scheme 0 has three commented-out rows plus two active debug rows');
-  // 2026-11-09 cf5d30d 调试路线：80 cm 右转 + 40 cm STOP（arc=false，turn 20/cruise 50）。
-  assert.equal(scheme0.steps[0].junction_count, 2);
-  assert.equal(scheme0.steps[0].turn_speed, 20);
-  assert.equal(scheme0.steps[0].cruise_speed, 50);
-  assert.equal(scheme0.steps[0].corner_arc_enabled, false);
-  assert.equal(scheme0.steps[0].segment_length_cm, 80);
-  assert.equal(scheme0.steps[1].action, Action.STOP);
-  assert.equal(scheme0.steps[1].segment_length_cm, 40);
+  assert.equal(parsed.activeSchemeId, 0, 'bundled default must match firmware scheme 0');
+  assert.equal(scheme0.steps.length, 2, 'only the two active debug rows are parsed');
+  const fields = ['junction_count', 'turn_speed', 'action', 'cruise_speed',
+    'angle_deg', 'corner_arc_enabled', 'segment_length_cm', 'short_link_cm'] as const;
+  assert.deepEqual(scheme0.steps.map(step => fields.map(field => step[field])), [
+    [2, 20, Action.CUSTOM_TURN, 50, 90, false, 50, 0],
+    [3, 20, Action.STOP, 50, 90, false, 40, 0],
+  ], 'debug rows must match the current firmware working tree in every field');
   // ROUTE_REPEAT_COUNT=1 must reach a freshly initialised planner.
   const planner = new RoutePlannerModel();
   planner.init(scheme0.steps);
@@ -160,4 +158,4 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   console.log('PASS: commented-out route steps are ignored by the parser');
 }
 
-console.log('PASS: firmware sync contract (params, START realign, pose gates, parser comments)');
+console.log('PASS: firmware sync contract (params, START realign, grey authorization, current debug table and default)');

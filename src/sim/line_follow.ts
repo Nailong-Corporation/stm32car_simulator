@@ -778,10 +778,15 @@ export class LineFollowModel {
         }
         this.abnormal = false;
       } else if (!this.abnormal &&
-        Math.abs(this.route.pose_cross_cm) > ROUTE_WAYPOINT_GATE_CM) {
+        (obs.line_mask === 0 ||
+          Math.abs(this.route.pose_cross_cm) > ROUTE_WAYPOINT_GATE_CM)) {
         // The pose itself says the car is off the segment: from here the grey
         // loss is real, so arm the bounded loss window instead of trusting the
         // path follower.
+        // A completely blank bar must arm the window on its own: the pose can
+        // still believe it is on the segment (or its cross-track can be
+        // invalid), and without this the car holds heading at cruise with no
+        // line under the sensor indefinitely.
         this.abnormal = true;
         this.abnormal_origin_cm = this.odometry.distance_cm;
       }
