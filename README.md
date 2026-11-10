@@ -1,10 +1,28 @@
 # STM32 智能循迹小车 Web 仿真器 (STM32 Car Simulator)
 
-基于 **STM32 智能循迹小车固件算法与参数** 构建的 Web 仿真器。控制器使用独立 TypeScript 移植，车辆和灰度输入来自简化模型；固件与仿真器须分别验证。2026-11-07 已将固件当前工作树的参数与算法逐项同步到仿真器；2026-11-08 给固件 `route.c` 增加“几何节点授权”（算法改动，未改任何参数）并同步；2026-11-08 又把固件 `b167058` 的转弯/编码器参数（轮径 4.8、1064 计数、里程系数 1.0、`TURN_PIVOT_APPROACH_CM=10`）与 START 位姿复位算法同步到仿真器。`npm run parity` 用相同输入逐帧对比 C 与 TS 的控制输出。
+基于 **STM32 智能循迹小车固件算法与参数** 构建的 Web 仿真器。控制器使用独立 TypeScript 移植，车辆和灰度输入来自简化模型；固件与仿真器须分别验证。2026-11-07 已将固件当前工作树的参数与算法逐项同步到仿真器；2026-11-08 给固件 `route.c` 增加“几何节点授权”（算法改动，未改任何参数）并同步；2026-11-08 又把固件 `b167058` 的转弯/编码器参数（轮径 4.8、1064 计数、里程系数 1.0、`TURN_PIVOT_APPROACH_CM=10`）与 START 位姿复位算法同步到仿真器；2026-11-10 又把固件 `cf5d30d` 的位姿交棒距离门禁、非 90° 自定义角出口、环岛直边速度计划与提速参数同步。`npm run parity` 用相同输入逐帧对比 C 与 TS 的控制输出。
 
 ---
 
-## ✅ 2026-11-08 固件参数/算法同步（固件 `b167058`，最新）
+## ✅ 2026-11-10 固件 `cf5d30d` 参数/算法同步（最新）
+
+按用户要求把固件 `main` 提交 `cf5d30d`（「修复了一些已知问题」，对应固件 AGENTS 里 2026-11-09 23:3x / 2026-11-10 00:0x 的现场修正）同步到仿真器，**未修改固件工程**：
+
+- **参数**（`include/motion_config.h`）：`TARGET_RISE_CM_S2` 160→**400**、`BRAKING_TARGET_JERK_CM_S3` 800→**2000**、`COMPONENT_RECOVERY_SPEED_CM_S` 16→**60**；新增 `JUNCTION_SETTLE_MAX_ERR_RAD=0.06` / `JUNCTION_SETTLE_MIN_DIFF_CM_S=6`；环岛 `HEXAGON_SPEED_CM_S` 24→**28**，新增 `HEXAGON_LEG_SPEED_CM_S=45` / `HEXAGON_PIVOT_LEAD_CM=4` / `HEXAGON_TURN_KP=40` / `HEXAGON_TURN_DAMPING=2.0`；弯前窗口 `ROUTE_WAYPOINT_SLOW_CM` 删除，改为 `BRAKING_ENVELOPE_MARGIN_CM=4`；`ROUTE_REPEAT_COUNT` 0→**1**（单圈后停车）。
+- **算法**（`src/route.c` / `src/line_follow.c` / `include/route.h`）：
+  - 位姿交棒距离门禁：非 90° `CUSTOM_TURN` 必须走满 `segment_length_cm + ROUTE_WAYPOINT_MARGIN_CM`（=物理角点）才交动作层；滚动圆弧与 90° 枢轴保留前杆提前量。
+  - 灰度节点 `passing_junction` 加同一距离门禁（位姿模式、非 HEXAGON/STRAIGHT）：计数只是容错上限，不再单独授权提前起转。
+  - 非 90° 自定义角的位姿出口改为“真正转到设定角”（0.02 rad 余量，不要求灰度出口线）；直角仍用 0.12 rad。
+  - 枢轴尾段保留最小轮速差（`JUNCTION_SETTLE_MIN_DIFF_CM_S`），避免最后 1–2° “边直行边拧”。
+  - 环岛速度计划写入 `HexagonNavigation.speed_cm_s`：顶点 28 cm/s，直边 45 cm/s 并用 `a_safe` 向下一顶点做减速包络。
+- **路线表**：内置方案 0 与固件当前调试表一致（2 步：80 cm 右转 + 40 cm STOP）。
+- **修正的既有偏差**：仿真器出弯判定曾允许 `angle_full` 绕过 `JUNCTION_CENTER_LIMIT`（`600b6e9` C 侧补丁不允许）；已改回固件条件，`npm run parity:legacy` 由红转绿。
+
+**验证（2026-11-10）**：`npm test` 全 PASS（方案 1 = 72.5 s、27/27 元件；方案 2/3 整圈）；`npm run parity` 7 个方案逐帧一致且全部 FINISHED；`npm run parity:legacy`（`-DPOSE_NAV_ENABLED=0`）方案 0–7 逐帧一致（含新方案 0 调试表）；`npm run build` 通过并重建 `dist/`。以上均为仿真/回放结论，未实车复测。
+
+---
+
+## ✅ 2026-11-08 固件参数/算法同步（固件 `b167058`）
 
 按用户要求把固件 `main` 当前工作树（提交 `b167058`「转弯参数和编码器参数修正」）的算法与参数逐项同步到仿真器，**未修改固件任何参数**：
 
@@ -45,9 +63,9 @@
    - 完整移植 `car_stm32` 核心 C 算法：
      - `gray_sensor.c`：8 路灰度传感器多数滤波投票、连续区域分割与权重位置解算（权重 `[-7, -5, -3, -1, 1, 3, 5, 7]`）。
      - `route.c`：路径规划状态机（`ROUTE_FOLLOW`、`ROUTE_CANDIDATE`、`ROUTE_EXECUTING`、`ROUTE_CLEARING`、`ROUTE_BRAKING`、`ROUTE_RECOVERING`、`ROUTE_FINISHED`）与六边形环岛子状态机（`HEXAGON_OFF`、`ENTERING`、`FOLLOWING`、`EXIT_CANDIDATE`、`EXITING`、`DONE`）。
-     - `braking_planner.c`：已知路段距离减速包络规划（安全减速度 $120\text{ cm/s}^2$、加加速度限幅 $800\text{ cm/s}^3$）。
+     - `braking_planner.c`：已知路段距离减速包络规划（安全减速度 $115\text{ cm/s}^2$、加加速度限幅 $2000\text{ cm/s}^3$）。
      - `odometry.c`：差速轮系里程计、TI12 四倍频与航向融合（Sinc 转向航向积分、编码器/IMU 双模）。
-     - `speed_control.c`：双轮独立 PID 速度闭环与前馈 PWM 混流（量程 $500\text{ cm/s}$、满标尺 255）。
+     - `speed_control.c`：双轮独立 PID 速度闭环与前馈 PWM 混流（量程 $190\text{ cm/s}$、满标尺 255）。
      - `pid.c`：含微分低通滤波与积分抗饱和的抗风移 PID。
    - **与固件的单源参数同步**：编码器极性 `LEFT=-1 / RIGHT=+1`、里程比例 `1.0`（2026-11-08 由 0.95 更新）、航向比例 `0.641`、速度环 `SPEED_KP=1.2`、轮径 `4.8 cm`、每圈计数 `1064`（2026-11-08 实测）全部取自 `motion_config.h`；圆弧控制常数因整圈回归恢复为 `70 cm/s / 6 cm / 3 cm`（见上方 2026-11-08 状态，属于控制器参数而非硬件/编码器数据）。`npm run parity` 会编译固件当前源码并用同一份观测/编码器输入回放，逐帧比较路线状态机、路口计数、目标轮速与里程；7 个内置方案全部通过（阈值帧 0）。
    - 所有物理参数严格对齐 `motion_config.h`、`control_config.h`、`board_config.h`：
@@ -79,7 +97,7 @@
      - 方案 1：正式全元件路线（走虚线 + 走环岛，覆盖全部 27 个元件，共 30 步）
      - 方案 2：不走虚线，走环岛路线（30 步）
      - 方案 3：走虚线，不走环岛路线（25 步）
-     - 方案 0：基础调试路线（3 步，另有 1 行按固件注释）
+     - 方案 0：基础调试路线（2 步：80 cm 右转 + 40 cm STOP，与固件当前调试表一致）
      - 用户上传的任意自定义 `const RouteStep route[] = { ... };` 表项与注释。
    - 提供弹窗式 **“📋 路径详情”** 抽屉，展示当前所有步的参数、路口上限、限速、角度与注释说明，仿真运行时高亮当前活动步！
 

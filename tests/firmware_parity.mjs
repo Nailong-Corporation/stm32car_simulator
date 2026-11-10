@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 const firmware = process.env.FW_DIR ?? new URL('../../PlatformIO/Projects/car_stm32/', import.meta.url).pathname;
 /* PARITY_POSE_NAV=0 builds the firmware's legacy grey-only controller
  * (POSE_NAV_ENABLED=0) and disables pose navigation in the simulator. It also
- * includes scheme 0, the four-step debug table. */
+ * includes scheme 0, the short two-row debug table. */
 const poseNav = process.env.PARITY_POSE_NAV !== '0';
 const temp = mkdtempSync(join(tmpdir(), 'car-parity-'));
 const server = await createServer({server:{middlewareMode:true},logLevel:'error',optimizeDeps:{noDiscovery:true,include:[]}});
@@ -109,8 +109,8 @@ try {
       assert.ok(Math.abs(actual[i][8]-expected[i][8])<0.02,`scheme ${scheme.id} heading drift at ${i}`);
     }
     /* Every formal route must reach its final STOP, not merely agree on the
-     * frames before a shared failure.  (Scheme 0 is the four-step debug table
-     * and is only run in the legacy -DPOSE_NAV_ENABLED=0 build.) */
+     * frames before a shared failure.  (Scheme 0 is the short two-row debug
+     * table and is only run in the legacy -DPOSE_NAV_ENABLED=0 build.) */
     if (poseNav) {
       assert.equal(f.route.state, RouteState.ROUTE_FINISHED,
         `scheme ${scheme.id} must finish, final index ${f.route.index}/${scheme.steps.length - 1}, ` +

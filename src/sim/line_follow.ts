@@ -53,6 +53,8 @@ import {
   JUNCTION_TURN_TARGET_RAD,
   JUNCTION_SETTLE_SPEED_CM_S,
   JUNCTION_SETTLE_HEADING_KP,
+  JUNCTION_SETTLE_MAX_ERR_RAD,
+  JUNCTION_SETTLE_MIN_DIFF_CM_S,
   JUNCTION_CAPTURE_HEADING_KP,
   JUNCTION_CAPTURE_CENTER_BIAS_CM_S,
   JUNCTION_CAPTURE_MIN_TURN_CM_S,
@@ -61,6 +63,8 @@ import {
   JUNCTION_EXIT_SPEED_CM_S,
   COMPONENT_RECOVERY_SPEED_CM_S,
   HEXAGON_SPEED_CM_S,
+  HEXAGON_TURN_KP,
+  HEXAGON_TURN_DAMPING,
   NAVIGATION_RECOVERY_SPEED_CM_S,
   CORNER_RADIUS_CM,
   CORNER_HEADING_KP,
@@ -76,7 +80,7 @@ import {
   STEERING_FEEDBACK_MIN_CM_S,
   STEERING_FEEDBACK_MIN_HALF_CM_S,
   ROUTE_START_Y_CM,
-  ROUTE_WAYPOINT_SLOW_CM,
+  BRAKING_ENVELOPE_MARGIN_CM,
   JUNCTION_POSE_GRAY_SPREAD,
   JUNCTION_CENTER_LIMIT,
   JUNCTION_CROSS_KP,
@@ -704,19 +708,27 @@ export class LineFollowModel {
       );
     }
     // Pose mode keeps the exit speed until the outgoing line is re-centred; the
-    // printed symbol beside a corner must not be chased at cruise speed.
-    if (this.route.post_turn_slow && !rolled_corner) {
+    // printed symbol beside a corner must not be chased at cruise speed. The
+    // re-centring *evidence* gate stays for every row, but the speed cap only
+    // applies to a real turn: a pass-through node has no turn, and capping it to
+    // min(turn_speed,20) at 2026-11-09 speeds braked scheme 3's bottom edge from
+    // 130 cm/s to 18 and lost the line.
+    if (this.route.post_turn_slow && !rolled_corner && !this.route.passing_junction) {
       base_speed = Math.min(base_speed, Math.min(step.turn_speed, JUNCTION_EXIT_SPEED_CM_S));
     }
-    // Pose-mode corner approach: pre-slow so the brake phase does not eat the
-    // pivot approach distance (the old CANDIDATE deceleration did this). The
-    // window grows with speed: v^2 / (2*a_safe) plus the 30 cm base.
-    if (this.route.pose_mode) {
-      const brake = (this.odometry.left_speed_cm_s * this.odometry.left_speed_cm_s) /
-        (2 * BRAKING_SAFE_DECEL_CM_S2);
-      if (this.route.pose_gap_bar_cm <= Math.max(ROUTE_WAYPOINT_SLOW_CM, brake + 8.0)) {
-        base_speed = Math.min(base_speed, this.route.entrySpeedLimit());
-      }
+    // Continuous pre-corner braking envelope (mirrors firmware line_follow.c):
+    // require only v <= sqrt(vt^2 + 2*a_safe*remaining) instead of stepping the
+    // target to the entry speed and holding it for tens of centimetres.
+    // `pose_gap_bar_cm` is the bar-to-waypoint gap; the route switches when the
+    // bar reaches the waypoint, so it is exactly the distance still to go. The
+    // last BRAKING_ENVELOPE_MARGIN_CM still hard-caps to vt so entry_speed_ready
+    // keeps passing despite the measured-speed lag.
+    if (this.route.pose_mode && Number.isFinite(this.route.pose_gap_bar_cm)) {
+      const vt = this.route.entrySpeedLimit();
+      const envelope_travel = Math.max(0, this.route.pose_gap_bar_cm - BRAKING_ENVELOPE_MARGIN_CM);
+      const envelope = Math.sqrt(vt * vt + 2 * BRAKING_SAFE_DECEL_CM_S2 * envelope_travel);
+      base_speed = Math.min(base_speed, envelope);
+      if (envelope_travel <= 0) base_speed = Math.min(base_speed, vt);
     }
 
     if (this.route.state === RouteState.ROUTE_CANDIDATE && this.route.targetReady(this.odometry.distance_cm, true)) {
@@ -854,7 +866,11 @@ export class LineFollowModel {
       this.abnormal = false;
       this.exit_accelerating = false;
       if (previous_route !== RouteState.ROUTE_EXECUTING) this.pid.reset();
-      const outer = Math.min(step.turn_speed, Math.min(HEXAGON_SPEED_CM_S, JUNCTION_SETTLE_SPEED_CM_S));
+      // Ring speed comes from the route plan (pivot speed at the vertices, leg
+      // speed on the edges with a braking envelope toward the next vertex).
+      const outer = x.speed_cm_s > 0
+        ? x.speed_cm_s
+        : Math.min(step.turn_speed, Math.min(HEXAGON_SPEED_CM_S, JUNCTION_SETTLE_SPEED_CM_S));
       let correction = 0;
       if (x.turning) {
         // Pose-mode ring: pivot to the next 30/60 degree vertex heading.  The
@@ -862,8 +878,7 @@ export class LineFollowModel {
         // rounded-corner polygon assumes; damping kills the residual rate.
         this.pid.reset();
         const err = x.target_heading - this.odometry.heading_rad;
-        correction =
-          JUNCTION_SETTLE_HEADING_KP * err - JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
+        correction = HEXAGON_TURN_KP * err - HEXAGON_TURN_DAMPING * this.turn_yaw_rate_rad_s;
         correction = Math.max(-0.5 * outer, Math.min(0.5 * outer, correction));
         this.outerTargets(outer, correction, dt);
       } else if (x.use_line) {
@@ -944,10 +959,13 @@ export class LineFollowModel {
         // saturated rate early stops the arc from ballooning (a line-following
         // 90 degree turn travels >20 cm forward and misses the short leg).
         let corr: number;
-        if (Math.abs(err) > 0.15) {
+        if (Math.abs(err) > JUNCTION_SETTLE_MAX_ERR_RAD) {
           corr = err > 0 ? base : -base;
         } else {
           corr = JUNCTION_SETTLE_HEADING_KP * err - 1.2 * this.turn_yaw_rate_rad_s;
+          if (Math.abs(err) > 0.01 && Math.abs(corr) < JUNCTION_SETTLE_MIN_DIFF_CM_S) {
+            corr = err > 0 ? JUNCTION_SETTLE_MIN_DIFF_CM_S : -JUNCTION_SETTLE_MIN_DIFF_CM_S;
+          }
           corr = Math.max(-base, Math.min(base, corr));
         }
         this.turnTargets(outer, corr, dt);

@@ -58,6 +58,8 @@ import {
   JUNCTION_ADJACENT_EXIT_CM,
   HEXAGON_MAX_ANGLE_DEG,
   HEXAGON_SPEED_CM_S,
+  HEXAGON_LEG_SPEED_CM_S,
+  HEXAGON_PIVOT_LEAD_CM,
   HEXAGON_ENTRY_MIN_RAD,
   HEXAGON_ENTRY_TIMEOUT_MS,
   HEXAGON_ENTRY_MAX_CM,
@@ -73,6 +75,7 @@ import {
   ROUTE_START_X_CM,
   ROUTE_START_Y_CM,
   ROUTE_START_HEADING_RAD,
+  ROUTE_REPEAT_COUNT,
   ROUTE_WAYPOINT_MARGIN_CM,
   ROUTE_WAYPOINT_CONFIRM_CM,
   ROUTE_WAYPOINT_FALLBACK_CM,
@@ -81,7 +84,6 @@ import {
   ROUTE_WAYPOINT_MAX_PASSED_LAG_CM,
   ROUTE_WAYPOINT_EXIT_CM,
   ROUTE_WAYPOINT_EXIT_ANGLE_RAD,
-  ROUTE_WAYPOINT_SLOW_CM,
   HEXAGON_ENTRY_APPROACH_MAX_CM,
   HEXAGON_LEG_CROSS_MAX_CM,
   ROUTE_CLEAR_POSE_CM,
@@ -251,6 +253,7 @@ export class RoutePlannerModel {
     turning: false,
     turn_index: 0,
     vertex_x_cm: 0,
+    speed_cm_s: 0,
     vertex_y_cm: 0,
     leg_start_cm: 0,
     leg_from_x_cm: 0,
@@ -311,7 +314,7 @@ export class RoutePlannerModel {
   public exit_candidate_cm = 0;
   public exit_candidate_pending = false;
   public repeat_action: Action = Action.LEFT;
-  public repeat_count = 0;
+  public repeat_count = ROUTE_REPEAT_COUNT;
   public completed_laps = 0;
   public candidate_count = 0;
   public exit_count = 0;
@@ -418,7 +421,7 @@ export class RoutePlannerModel {
   public init(steps: RouteStep[], callback?: (step_index: number) => void): void {
     this.steps = steps.map((s) => ({ ...s }));
     this.count = steps.length;
-    this.repeat_count = 0;
+    this.repeat_count = ROUTE_REPEAT_COUNT;
     this.repeat_action = Action.LEFT;
     this.stop_callback = callback;
     this.valid = steps !== null && steps.length > 0;
@@ -716,6 +719,7 @@ export class RoutePlannerModel {
       turning: false,
       turn_index: 0,
       vertex_x_cm: 0,
+      speed_cm_s: 0,
       vertex_y_cm: 0,
       leg_start_cm: 0,
       leg_from_x_cm: 0,
@@ -764,6 +768,7 @@ export class RoutePlannerModel {
         turning: false,
         turn_index: 0,
         vertex_x_cm: 0,
+        speed_cm_s: 0,
         vertex_y_cm: 0,
         leg_start_cm: 0,
         leg_from_x_cm: 0,
@@ -1006,6 +1011,21 @@ export class RoutePlannerModel {
     if (o.line_mask !== 0 && adjacent) {
       x.line_ms = now;
       x.line_cm = d;
+    }
+
+    // Ring speed plan (2026-11-09): pivots stay at the settle speed; straight
+    // legs run at HEXAGON_LEG_SPEED_CM_S and brake toward the next vertex with
+    // a_safe so each pivot still starts on its tangent point.
+    {
+      const ringStep = this.steps[this.index];
+      const pivot = Math.min(HEXAGON_SPEED_CM_S, JUNCTION_SETTLE_SPEED_CM_S, ringStep.turn_speed);
+      let ringSpeed = pivot;
+      if (x.state === HexagonState.HEXAGON_FOLLOWING && !x.turning) {
+        const leg = Math.min(HEXAGON_LEG_SPEED_CM_S, this.cruiseSpeed());
+        const gap = Math.hypot(x.vertex_x_cm - axle_x_cm, x.vertex_y_cm - axle_y_cm) - HEXAGON_PIVOT_LEAD_CM;
+        ringSpeed = Math.min(leg, Math.sqrt(pivot * pivot + 2 * BRAKING_SAFE_DECEL_CM_S2 * Math.max(0, gap)));
+      }
+      x.speed_cm_s = ringSpeed;
     }
 
     if (x.state === HexagonState.HEXAGON_ENTERING) {
@@ -1444,7 +1464,22 @@ export class RoutePlannerModel {
         const fallback = st.segment_length_cm > 0 &&
           d - this.origin_cm >= st.segment_length_cm + ROUTE_WAYPOINT_FALLBACK_CM;
         this.pose_trigger_late_cm = barProj < 0 ? -barProj : 0;
-        if (st.action !== Action.STRAIGHT && (reached || fallback)) {
+        /* 2026-11-09 现场：位姿交棒原先只要“前杆压到角点”就执行动作，比本行表内段距
+         * 早约 24 cm，而且完全不需要灰度节点 —— 表现为“未达距离就转弯 / 没路口也转”。
+         * 24 cm 提前量只对滚动圆弧（入弯切点 E=K-R·u 在角点前 13 cm）和 90° 枢轴
+         * （交棒后有 TURN_PIVOT_APPROACH_CM 接近段）成立；其余动作（非 90° 自定义角、
+         * STOP、通过型节点）交棒即动作，必须走满本行段距（表=几何-5）。 */
+        /* STOP / LEFT / RIGHT / HEXAGON 保持原交棒时机；只有非 90° 自定义角既没有接近段、
+         * 也没有离口位置 PID 补偿，必须等本行段距。 */
+        const immediateAction = !this.usesCornerArc() &&
+          st.action === Action.CUSTOM_TURN &&
+          Math.abs(Math.abs(this.turnTargetRad()) - JUNCTION_TURN_TARGET_RAD) >= 1e-4;
+        /* 2026-11-10 现场：表内段距=几何-5，车轴走到段距时仍在物理角点前 5 cm；
+         * 那里起转会横向错 5 cm（灰度只看到边沿）。交棒改到 waypoint=段距+5。 */
+        const distanceReady = st.segment_length_cm > 0 &&
+          d - this.origin_cm >= st.segment_length_cm + ROUTE_WAYPOINT_MARGIN_CM;
+        const poseReady = immediateAction ? distanceReady : (reached || fallback);
+        if (st.action !== Action.STRAIGHT && poseReady && (reached || fallback)) {
           this.candidate_count = 0;
           this.search_pending = false;
           this.passing_junction = false;
@@ -1618,7 +1653,16 @@ export class RoutePlannerModel {
         const __gap = Math.hypot(sx - this.waypoint_x_cm[this.index], sy - this.waypoint_y_cm[this.index]);
         poseMatches = __gap <= gate;
       }
-      this.passing_junction = !this.targetReady(d, false) || !poseMatches;
+      /* 2026-11-09：计数只是“最多可提前经过几个路口”的容错上限，不是动作授权；
+       * 动作仍须先走满本行段距（表=几何-5）。旧实现把它当 OR，于是只要计数够了，
+       * 车就在物理路口直接起转，改表内距离完全不生效。 */
+      /* 纯灰度模式（无里程位姿）保留旧的计数容错语义；有位姿时距离才是权威门禁。 */
+      const distanceGate = !this.pose_mode ||
+        this.steps[this.index].action === Action.HEXAGON ||
+        this.steps[this.index].action === Action.STRAIGHT ||
+        this.steps[this.index].segment_length_cm <= 0 ||
+        d - this.origin_cm >= this.steps[this.index].segment_length_cm;
+      this.passing_junction = !distanceGate || !this.targetReady(d, false) || !poseMatches;
       this.search_pending = false;
 
       if (this.passing_junction) {
@@ -1725,7 +1769,16 @@ export class RoutePlannerModel {
         }
       } else {
         const gap = Math.hypot(axle_x_cm - this.waypoint_x_cm[this.index], axle_y_cm - this.waypoint_y_cm[this.index]);
-        if (gap <= ROUTE_WAYPOINT_EXIT_CM && turn >= target - ROUTE_WAYPOINT_EXIT_ANGLE_RAD) {
+        /* 2026-11-09 现场：这个“轴距角点 14 cm + 差 0.12 rad 就交棒”的提前退出只对
+         * 普通直角成立；非 90° 自定义角没有离口位置 PID 补偿，枢轴在角点前 5 cm 起转
+         * 后车轴一直在 14 cm 窗口内，旧条件会在 target-0.12 rad（设 62° 只转 55°）
+         * 就交出，表现为“转弯达不到设定角度”。 */
+        const poseOrdinaryExit = this.steps[this.index].action !== Action.CUSTOM_TURN ||
+          Math.abs(Math.abs(this.turnTargetRad()) - JUNCTION_TURN_TARGET_RAD) < 1e-4;
+        /* 直角沿用 0.12 rad 余量；非 90° 自定义角必须真正转到设定角才交棒（否则少 ~7°），
+         * 但也不能等灰度出口线（枢轴期间 mask=0 会一直拧到 EXIT_LOST）。 */
+        const poseExitTolerance = poseOrdinaryExit ? ROUTE_WAYPOINT_EXIT_ANGLE_RAD : 0.02;
+        if (gap <= ROUTE_WAYPOINT_EXIT_CM && turn >= target - poseExitTolerance) {
           this.line_exit_confirmed = true;
           this.line_exit_heading_rad = h;
           this.enterClear(d, now);
@@ -1824,13 +1877,14 @@ export class RoutePlannerModel {
         ordinary_exit && turn >= target - alignment &&
         this.turn_capturing &&
         o.white_count <= JUNCTION_STRAIGHT_EXIT_MAX_WIDTH;
-      // A completed pivot may leave the axle 1-2 cm off the exit line (coast,
-      // printed symbol edge).  Once the full angle is reached, a narrow
-      // single-region line is the exit even if the centroid is one channel
-      // beyond the strict centre window; blind wide/edge reads still fail.
+      // Firmware route.c (600b6e9 C-side patch): the exit needs a narrow line
+      // *and* a centroid inside JUNCTION_CENTER_LIMIT; reaching the full angle
+      // does not relax the centre window.  The simulator used to accept any
+      // narrow line once turn >= target, which handed a legacy (grey-only) turn
+      // over one frame early, so parity:legacy diverged from the C controller.
       const exit =
         narrow &&
-        (Math.abs(o.position) <= JUNCTION_CENTER_LIMIT || angle_full) &&
+        Math.abs(o.position) <= JUNCTION_CENTER_LIMIT &&
         (line_ready || angle_full || turn >= target - JUNCTION_EXIT_ANGLE_MARGIN_RATIO * target);
 
       if (!exit || !adjacent) {

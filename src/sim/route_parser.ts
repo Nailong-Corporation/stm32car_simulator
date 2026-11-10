@@ -76,7 +76,7 @@ export function parseRouteTableC(sourceCode: string): ParseResult {
   }
 
   const schemes: ParsedScheme[] = [
-    { id: 0, name: '方案 0 (基础调试用赛道 - 3步)', steps: [] },
+    { id: 0, name: '方案 0 (基础调试用赛道)', steps: [] },
     { id: 1, name: '方案 1 (正式赛道：走虚线，全元件，调试中)', steps: [] },
     { id: 2, name: '方案 2 (正式赛道：不走虚线，调试中)', steps: [] },
     { id: 3, name: '方案 3 (外框测试圈)', steps: [] },
@@ -193,7 +193,7 @@ export const DEFAULT_ROUTE_TABLE_C = `#include "route.h"
  * 电阻及其他印刷图形参与节点计数，使用连续证据及离口去重。
  * 所有行距离 = 图纸几何长度 - 5 cm；原始长度见 test/new_track_routes.json。
  * 传感器前伸 24 cm，短段节点可能在上一动作内通过，计数需逐段回放校准。
- * 方案 0：保留调试路线（4 步，1 行注释）；1：走虚线全元件；2：不走虚线；3：外框测试圈。
+ * 方案 0：保留四步调试路线；1：走虚线全元件；2：不走虚线；3：外框测试圈。
  * 正式方案仍在仿真调试中，不能据表名宣称已经完赛或实车验证。
  * 地图：375x220，Q6(245,140)，右中线 y110，环岛中心(310,165)，P(0,110)。
  * 本文件由 test/sync_new_track_routes.py 生成。
@@ -206,10 +206,16 @@ export const DEFAULT_ROUTE_TABLE_C = `#include "route.h"
 const RouteStep route[] = {
 #if (ROUTE_SCHEME_SELECT == 0)
     //{ 1, 50.0f, CUSTOM_TURN,  50,   -90.0f,false ,  100.0f, 0.0f}, /* 调试 0；几何 60 - 5 = 55 cm */
-    { 5, 50.0f, CUSTOM_TURN, 80,    90.0f,true ,  230.0f, 0.0f}, /* 调试 1；2026-11-08 实车调试行（开 arc） */
-    { 3, 50.0f, CUSTOM_TURN, 80,    90.0f,false ,   70.0f, 0.0f}, /* 调试 2；几何 60 - 5 = 55 cm */
-    { 7, 50.0f, RIGHT      , 80,     0.0f,false,  220.0f, 0.0f}, /* 调试 3；几何 200 - 5 = 195 cm */
-    { 1, 50.0f, STOP       , 50,     0.0f,false,  100.0f, 0.0f}, /* 调试 4；几何 60 - 5 = 55 cm */
+    /* 调试 1；几何 239 - 5 = 234 cm。2026-11-09 21:2x 实车（方案 0）：转弯比表早 4 cm，
+     * 右转后小车在线内侧、与出弯线平行错约 4 cm（灰度过线但一直判丢线）。
+     * 段距 230→234 让本行角点/位姿起转点整体后移 4 cm（滚动转弯的切点 E=K-R·u 也随之
+     * 后移），即“转弯前再走 4 cm”；出弯切点 X=K+R·o 才落回出弯线上。 */
+    { 2, 20.0f, CUSTOM_TURN, 50,   90.0f, false ,  80.0f, 0.0f},
+    { 3, 20.0f, STOP,        50,   90.0f, false ,  40.0f, 0.0f},
+    //{ 5, 50.0f, CUSTOM_TURN, 80,   90.0f, true ,  234.0f, 0.0f},
+    //{ 3, 50.0f, STOP, 80,   90.0f,false ,   70.0f, 0.0f}, /* 调试 2；几何 60 - 5 = 55 cm */
+    //{ 7, 50.0f, RIGHT       , 80,    0.0f,false,  220.0f, 0.0f}, /* 调试 3；几何 200 - 5 = 195 cm */
+    //{ 1, 50.0f, STOP        , 50,    0.0f, false ,  100.0f, 0.0f}, /* 调试 0；几何 60 - 5 = 55 cm */
 
 #elif (ROUTE_SCHEME_SELECT == 1)
     /* 正式赛道：走虚线、全元件（调试中） */

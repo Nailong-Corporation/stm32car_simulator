@@ -104,6 +104,8 @@ export interface HexagonNavigation {
   turning: boolean;
   turn_index: number;
   vertex_x_cm: number;
+  /** Ring speed plan (pivot at vertices, leg speed + braking envelope on edges). */
+  speed_cm_s: number;
   vertex_y_cm: number;
   leg_start_cm: number;
   /* Inside-ring leg line (from the vertex just passed to the next one) and the

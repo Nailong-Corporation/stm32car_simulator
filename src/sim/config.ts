@@ -124,7 +124,7 @@ export const PID_INTEGRAL_LIMIT = 20.0;
 export const PID_DERIVATIVE_TAU_S = 0.020;
 
 export const STARTUP_RAMP_TIME_S = 1.0;
-export const TARGET_RISE_CM_S2 = 160.0;
+export const TARGET_RISE_CM_S2 = 400.0;
 export const TURN_EXIT_ACCEL_CM_S2 = 400.0;
 export const LINE_FOLLOW_SPEED_CM_S = 50.0;
 export const HOLD_SPEED_CM_S = 40.0;
@@ -184,10 +184,14 @@ export const JUNCTION_PASS_ALIGNED_RAD = 0.10;
 export const JUNCTION_PASS_SETTLED_YAW_RAD_S = 0.15;
 export const JUNCTION_SETTLE_SPEED_CM_S = 28.0;
 export const JUNCTION_SETTLE_HEADING_KP = 24.0;
+/* 2026-11-10 现场：枢轴尾段比例项趋零时，混速器把两轮都放到外轮速度，车“边直行边拧”，
+ * 最后 1–2° 要跑十几厘米，转弯点被推过线。尾段必须保留能继续转的轮速差。 */
+export const JUNCTION_SETTLE_MAX_ERR_RAD = 0.06;
+export const JUNCTION_SETTLE_MIN_DIFF_CM_S = 6.0;
 export const JUNCTION_YAW_DAMPING = 2.5;
 export const JUNCTION_YAW_FILTER_TAU_S = 0.030;
 export const JUNCTION_EXIT_SPEED_CM_S = 20.0;
-export const COMPONENT_RECOVERY_SPEED_CM_S = 16.0;
+export const COMPONENT_RECOVERY_SPEED_CM_S = 60.0;
 export const COMPONENT_RECOVERY_MAX_CM = 12.0;
 export const COMPONENT_RECOVERY_TIMEOUT_MS = 1200;
 
@@ -195,7 +199,7 @@ export const BRAKING_ACCEL_FILTER_TAU_S = 0.080;
 export const BRAKING_CALIBRATION_CONFIRMED = 1;
 export const BRAKING_SAFE_DECEL_CM_S2 = 115.0; /* 0.8×实测 min(144.45)。 */
 export const BRAKING_DISTANCE_MARGIN_CM = 2.0;
-export const BRAKING_TARGET_JERK_CM_S3 = 800.0;
+export const BRAKING_TARGET_JERK_CM_S3 = 2000.0;
 
 /* Reverse (negative-PWM) approach braking.
  * Mirrors include/motion_config.h: the switch is a compile-time constant in the
@@ -259,6 +263,12 @@ export const JUNCTION_ADJACENT_EXIT_CM = 0.30;
 export const ROUTE_START_X_CM = 0.0;
 export const ROUTE_START_Y_CM = 110.0;
 export const ROUTE_START_HEADING_RAD = -Math.PI / 2;
+/* motion_config.h ROUTE_REPEAT_COUNT: 0 = endless laps, 1 = one lap then stop at
+ * the final P, N = N laps. The firmware ships 1 (competition single lap); the
+ * route model initialises repeat_count from this so the web preview also ends
+ * the run where the real car does. Tests that need another value override the
+ * public repeat_count field. */
+export const ROUTE_REPEAT_COUNT = 1;
 export const ROUTE_WAYPOINT_MARGIN_CM = 5.0;
 export const ROUTE_WAYPOINT_CONFIRM_CM = 2.5;
 export const ROUTE_WAYPOINT_FALLBACK_CM = 18.0;
@@ -276,8 +286,12 @@ export const ROUTE_WAYPOINT_MAX_PASSED_LAG_CM = 30.0;
 export const ROUTE_WAYPOINT_EXIT_CM = 14.0;
 /* Residual turn angle accepted when the pose, not the grey line, ends a pivot. */
 export const ROUTE_WAYPOINT_EXIT_ANGLE_RAD = 0.12;
-/* Start braking for the corner this far before the bar reaches its waypoint. */
-export const ROUTE_WAYPOINT_SLOW_CM = 30.0;
+/* Continuous pre-corner braking envelope margin (motion_config.h
+ * BRAKING_ENVELOPE_MARGIN_CM): the envelope reaches the entry speed exactly at
+ * d=0 and the measured wheel speed lags, so stop 4 cm early to keep the entry
+ * gate passing. Replaces ROUTE_WAYPOINT_SLOW_CM=30, whose step-to-vt window
+ * made the car crawl the last few tens of centimetres before every corner. */
+export const BRAKING_ENVELOPE_MARGIN_CM = 4.0;
 /* Allowed disagreement between the grey position (weight units, ~0.55 cm each)
  * and the pose-predicted lateral offset before an off-centre narrow reading is
  * distrusted. Still live (motion_config.h JUNCTION_POSE_GRAY_SPREAD): since
@@ -302,7 +316,14 @@ export const ROUTE_CLEAR_POSE_CM = 2.0;
 
 /* Hexagon Roundabout Bounds */
 export const HEXAGON_MAX_ANGLE_DEG = 720.0;
-export const HEXAGON_SPEED_CM_S = 24.0;
+/* 2026-11-09 环岛提速（mirror motion_config.h）：顶点枢轴 24→28；6 条 35 cm 直边
+ * 单独用 HEXAGON_LEG_SPEED_CM_S，并用 a_safe 向下一顶点做减速包络，枢轴仍从切点
+ * 起步；顶点 settle 用 HEXAGON_TURN_KP/DAMPING（24/2.5 在高速时 settle 太慢）。 */
+export const HEXAGON_SPEED_CM_S = 28.0;
+export const HEXAGON_LEG_SPEED_CM_S = 45.0;
+export const HEXAGON_PIVOT_LEAD_CM = 4.0;
+export const HEXAGON_TURN_KP = 40.0;
+export const HEXAGON_TURN_DAMPING = 2.0;
 export const HEXAGON_ENTRY_MIN_RAD = 0.35;
 export const HEXAGON_ENTRY_TIMEOUT_MS = 3000;
 export const HEXAGON_ENTRY_MAX_CM = 30.0;

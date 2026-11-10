@@ -6,6 +6,7 @@ import { parseRouteTableC, DEFAULT_ROUTE_TABLE_C } from '../src/sim/route_parser
 import {
   TURN_PIVOT_APPROACH_CM,
   ROUTE_WAYPOINT_MAX_PASSED_LAG_CM,
+  ROUTE_REPEAT_COUNT,
   LEFT_WHEEL_DIAMETER_CM,
   RIGHT_WHEEL_DIAMETER_CM,
   LEFT_COUNTS_PER_WHEEL_REV,
@@ -31,6 +32,7 @@ import { Action, LineState, RouteState } from '../src/sim/types';
 // 1) Parameters copied one-for-one from include/motion_config.h.
 assert.equal(TURN_PIVOT_APPROACH_CM, 10.0);
 assert.equal(ROUTE_WAYPOINT_MAX_PASSED_LAG_CM, 30.0);
+assert.equal(ROUTE_REPEAT_COUNT, 1); /* motion_config.h ships one competition lap */
 assert.equal(LEFT_WHEEL_DIAMETER_CM, 4.8);
 assert.equal(RIGHT_WHEEL_DIAMETER_CM, 4.8);
 assert.equal(LEFT_COUNTS_PER_WHEEL_REV, 1064.0);
@@ -127,11 +129,20 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
   const scheme0 = parsed.schemes.find((s) => s.id === 0);
   assert.ok(scheme0);
-  assert.equal(scheme0.steps.length, 4,
-    'scheme 0 has one commented-out row plus four active rows');
-  // 2026-11-08 调试路线第 0 行改为 junction_count=5 / arc=true（230 cm），随表同步。
-  assert.equal(scheme0.steps[0].junction_count, 5);
-  assert.equal(scheme0.steps[0].segment_length_cm, 230);
+  assert.equal(scheme0.steps.length, 2,
+    'scheme 0 has three commented-out rows plus two active debug rows');
+  // 2026-11-09 cf5d30d 调试路线：80 cm 右转 + 40 cm STOP（arc=false，turn 20/cruise 50）。
+  assert.equal(scheme0.steps[0].junction_count, 2);
+  assert.equal(scheme0.steps[0].turn_speed, 20);
+  assert.equal(scheme0.steps[0].cruise_speed, 50);
+  assert.equal(scheme0.steps[0].corner_arc_enabled, false);
+  assert.equal(scheme0.steps[0].segment_length_cm, 80);
+  assert.equal(scheme0.steps[1].action, Action.STOP);
+  assert.equal(scheme0.steps[1].segment_length_cm, 40);
+  // ROUTE_REPEAT_COUNT=1 must reach a freshly initialised planner.
+  const planner = new RoutePlannerModel();
+  planner.init(scheme0.steps);
+  assert.equal(planner.repeat_count, 1);
 
   const custom = [
     'const RouteStep route[] = {',
