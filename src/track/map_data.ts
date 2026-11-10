@@ -68,8 +68,8 @@ export const TRACK_LINE_WIDTH_CM = 2.8;
 
 /** Component artwork proportions, measured from the official circuit render. */
 /* The artwork proportion (component length / 375 cm) gives ~14.5 cm resistors.
- * The transistor mouth is deliberately enlarged to 18 cm (depth 6 cm) so the
- * two arms clear the 8-channel bar when the car passes between them (0x00).
+ * The transistor mouth/depth is calibrated to the printed symbol's ~1:1 aspect
+ * (7 x 6 cm, stroke 2.8 cm; see the transistor block below), not to firmware.
  * The resistor symbol is drawn at that full
  * artwork scale (k = 1.8125 on the previous 55 % calibration: 8.0 * 1.8125 =
  * 14.5 cm): its two long edges then straddle the 8-channel sensor bar so that
@@ -85,22 +85,23 @@ export const RESISTOR_LENGTH_CM = 14.5;
 export const RESISTOR_WIDTH_CM = 6.8875;
 export const RESISTOR_STROKE_CM = 2.35625;
 /* Transistor artwork (simulator picture scale, never a firmware parameter).
- *  2026-11-10 用户要求“三极管做大一点”，并按实车现象建模：
- *   - 从两边（V 的两条斜臂之间）通过时，光电管全黑（掩码 0x00）；
- *   - 从正面（基极横条）通过时，8 路全部检测到白线（掩码 0xFF）。
+ *  2026-11-10 first pass 用户要求“三极管做大一点”，曾放大到 18 x 6 cm（3:1），
+ *  并按“两侧穿行为 0x00、正面 0xFF”建模；随后现场对照发现图形做得太长：实际
+ *  印刷三极管的整体长宽比约 1:1。现改为 mouth 7 cm、depth 6 cm，线宽仍与赛道
+ *  一致（2.8 cm），外轮廓 9.8 x 8.8 cm（约 1.1:1）。
+ *   - 基极横条绘制半跨 3.5 + 1.4 = 4.9 cm，仍覆盖 8 路探头的 ±3.85 cm，
+ *     沿支路正面穿过时原始掩码保持 0xFF（横杠保持/角点锁存依赖这个满排）。
+ *   - V 臂现在落在 ±3.85 cm 杆内，不再整排无遮挡；从两侧通过时杆能看到 V 臂/
+ *     穿行线的组合，而不是 18 cm 图形留下的 0x00 黑洞。因此 Q6 这类“支路进入、
+ *     穿行线出”的节点可以在前视杆上形成固件期待的满排/中心+侧支证据。
  *  The printed symbol uses the SAME stroke as the track wire
  *  (TRANSISTOR_STROKE_CM = TRACK_LINE_WIDTH_CM = 2.8 cm), and the board patch
  *  below the symbol (insideFootprint / track_renderer board rectangle) stops
  *  exactly at the round stroke caps of the V arms and the base bar, so the two
- *  V ends join the through wire without a black sliver.
- *  Depth 6 cm > outer channel 3.85 + half stroke 1.4 = 5.25 cm, so when the bar
- *  sits between the two V arms the arms are outside all eight channels and the
- *  board patch leaves them dark (0x00 for ~1.4 cm of travel).  The base bar is as long as the V mouth
- *  (BAR_HALF = MOUTH / 2 = 9 cm), so its painted span (+/-10.4 cm) covers every
- *  channel (+/-3.85 cm) when the car crosses along the branch (0xFF). */
-export const TRANSISTOR_MOUTH_CM = 18.0; // distance between the two V arms on the wire
+ *  V ends join the through wire without a black sliver. */
+export const TRANSISTOR_MOUTH_CM = 7.0; // distance between the two V arms on the wire
 export const TRANSISTOR_DEPTH_CM = 6.0; // depth of the V notch towards the branch
-export const TRANSISTOR_BAR_HALF_CM = TRANSISTOR_MOUTH_CM / 2; // 9.0
+export const TRANSISTOR_BAR_HALF_CM = TRANSISTOR_MOUTH_CM / 2; // 3.5
 export const TRANSISTOR_STROKE_CM = TRACK_LINE_WIDTH_CM; // 2.8: same width as the track wire
 export const BATTERY_PLATE_SPACING_CM = 1.8;
 export const BATTERY_LONG_HALF_CM = 4.6;

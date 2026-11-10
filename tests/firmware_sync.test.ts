@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { LineFollowModel } from '../src/sim/line_follow';
-import { RoutePlannerModel } from '../src/sim/route';
+import { RoutePlannerModel, routeGrayShowsBranch } from '../src/sim/route';
 import { grayClassify } from '../src/sim/gray_sensor';
 import { parseRouteTableC, DEFAULT_ROUTE_TABLE_C } from '../src/sim/route_parser';
 import {
@@ -176,6 +176,14 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   assert.equal(scheme4.steps[10].junction_count, 2);
   assert.equal(scheme4.steps[10].segment_length_cm, 100,
     'x=345 south leg measures to the bottom edge, not the ring centre');
+  assert.equal(scheme4.steps[10].turn_approach_cm, 19,
+    'x=345 south leg crosses the ring vertex with the 14+5 cm transistor hold');
+  assert.equal(scheme4.steps[14].turn_approach_cm, 19,
+    'Q18 row keeps the 14+5 cm transistor hold');
+  assert.equal(scheme4.steps[17].junction_count, 7,
+    'firmware 59a7268 top-edge Q22 row counts seven nodes');
+  assert.equal(scheme4.steps[17].cruise_speed, 100,
+    'firmware 59a7268 top-edge Q22 row cruises at 100');
   assert.equal(scheme4.steps[7].segment_length_cm, 265);
   assert.equal(scheme4.steps[28].action, Action.STOP);
   // ROUTE_REPEAT_COUNT=1 must reach a freshly initialised planner.
@@ -197,6 +205,22 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   assert.equal(scheme.steps.length, 1, 'line and block comments must be ignored');
   assert.equal(scheme.steps[0].junction_count, 1);
   console.log('PASS: commented-out route steps are ignored by the parser');
+}
+
+// 5b) 2026-11-10 firmware 59a7268: merged branch detection is shared by the
+//     route counter and the line-follow steering gate.  A single region with
+//     centre+side evidence (field 0x70) must not be handed to the position PID;
+//     a plain centre line or an outermost single line must stay usable.
+{
+  assert.equal(routeGrayShowsBranch(grayClassify(0x70, true, 3)), true,
+    '0x70 (centre+side merged branch) must be held on the segment heading');
+  assert.equal(routeGrayShowsBranch(grayClassify(0x18, true, 0)), false,
+    'a plain centre line is not a branch');
+  assert.equal(routeGrayShowsBranch(grayClassify(0x03, true, -6)), false,
+    'an outermost single line is an exit edge, not a branch');
+  assert.equal(routeGrayShowsBranch(grayClassify(0x00, true, 0)), false,
+    'a lost line is not a branch');
+  console.log('PASS: route_gray_shows_branch mirrors firmware (0x70 branch, 0x18/0x03/0x00 usable/none)');
 }
 
 // 6) 2026-11-10 field regression (index 9, Q13 left turn -> ring entrance):

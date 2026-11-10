@@ -88,7 +88,7 @@ import {
   HEXAGON_TURN_TOL_RAD,
 } from './config';
 import { OdometryModel, defaultOdometryCalibration } from './odometry';
-import { RoutePlannerModel, routeIsNarrowLine, routeIsClearLine } from './route';
+import { RoutePlannerModel, routeIsNarrowLine, routeIsClearLine, routeGrayShowsBranch } from './route';
 import { SpeedControlModel } from './speed_control';
 import { Pid } from './pid';
 import { BrakingSlewModel, brakingPlan, brakingDecide, brakingSlew } from './braking_planner';
@@ -785,7 +785,13 @@ export class LineFollowModel {
       // multi-region pattern, printed symbol). The gyro only damps yaw jitter; it
       // never generates the straight steering command.
       const trusted = this.grayPlausible(obs);
-      const usable = trusted && narrow;
+      /* 2026-11-10 固件 59a7268（方案 4 第 11 行）：x345 南下穿过环岛右侧顶点
+       * 时，24 cm 前伸杆同时压住主线与环岛斜边，滤波后是“单区域但带中心+侧支”。
+       * 旧实现把它当窄线交给位置 PID，单区域质心偏向支路一侧，车被带进环岛。
+       * 分支并入时保持本行线段方向，等支路离开杆后再交回位置 PID；它是结构而
+       * 不是丢线，因此不启动丢线窗口。 */
+      const branch = routeGrayShowsBranch(obs);
+      const usable = trusted && narrow && !branch;
       if (usable) {
         if (stable) {
           this.have_reliable = true;

@@ -59,3 +59,24 @@ changes were edited by the simulator work. The simulator mirrors the current
 working tree; see the top-level `README.md` section
 "2026-11-10 固件工作树（`f944a47` 之后）实车环岛入口同步" for the verification
 and the remaining physical-model limitation.
+
+## 2026-11-10 `59a7268` follow-up (simulator only)
+
+The 2026-11-10 working tree was committed as `59a7268` ("修复了一些已知问题").
+The simulator now mirrors that commit as well:
+
+- `src/line_follow.c`: `route_gray_shows_branch()` gate on the grey position
+  PID (`usable = trusted && narrow && !branch`).
+- `src/route_table.c`: scheme 4 rows 11/15 use
+  `TURN_TRANSISTOR_STRAIGHT_CM + 5` and row 18 uses `junction_count=7`,
+  `cruise_speed=100`.
+- Simulator picture fix (NOT a firmware change): the printed transistor is
+  narrowed from 18 x 6 cm to **7 x 6 cm** (outer footprint 9.8 x 8.8 cm,
+  ~1.1:1). The V arms now sit inside the 8-channel bar, so the Q6 corner reads
+  0x80 between the arms instead of the old 0x00 hole; the base bar still reads
+  0xFF from the front.
+
+Verification on the simulator side: `npm test` exits 0 (schemes 1/4 now pass Q6
+and reach the ring entrance, `maxIndex=10`), `npm run parity` is frame-identical
+for schemes 1-7 against firmware `59a7268`, and `npm run build` succeeds. The
+firmware repository was not modified.

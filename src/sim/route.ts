@@ -197,6 +197,14 @@ function separatedSides(o: GrayObservation): number {
   return ((outer & 0x03) ? 1 : 0) | ((outer & 0xc0) ? 2 : 0);
 }
 
+export function routeGrayShowsBranch(o: GrayObservation): boolean {
+  /* 2026-11-10 固件 59a7268：巡线层的“这一帧是不是合并进来的支路”与路由计数共用
+   * 同一形状分型。单区域但带“中心两路 + 侧支”，或两区域/空心图形，都表示杆下
+   * 不只是本行那一条线；此时航向保持本行线段方向，不把单区域质心交给位置 PID。 */
+  const { kind, sides } = junctionShape(o);
+  return kind !== JunctionEvidence.JUNCTION_EVIDENCE_NONE && sides !== 0;
+}
+
 function junctionShape(o: GrayObservation): { kind: JunctionEvidence; sides: number } {
   // Printed components are counted nodes, with the same temporal/motion proof
   // and clearance lock as a branch. Crossing control remains independent.
