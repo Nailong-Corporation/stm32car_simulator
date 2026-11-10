@@ -21,6 +21,7 @@ export interface RouteStep {
   corner_arc_enabled: boolean;
   segment_length_cm: number; /* START / previous action completion -> target; 0 means unknown */
   short_link_cm?: number; /* Explicit full corner spacing; 0/omitted disables dead reckoning. */
+  turn_approach_cm?: number;  /* Absolute straight travel after grey confirmation; 0 uses the legacy approach. */
   comment?: string;        /* Associated comment in route_table.c */
   rawLine?: string;
 }
@@ -35,6 +36,14 @@ export enum RouteState {
   ROUTE_DISABLED = 6,
   ROUTE_BRAKING = 7,
   ROUTE_RECOVERING = 8,
+}
+
+/* 三极管/横杠保持状态（route.h RouteBarHoldState）。 */
+export enum RouteBarHoldState {
+  ROUTE_BAR_HOLD_NONE = 0,
+  ROUTE_BAR_HOLD_PENDING = 1,
+  ROUTE_BAR_HOLD_PASS = 2,
+  ROUTE_BAR_HOLD_TARGET = 3,
 }
 
 export enum RouteFailure {

@@ -60,6 +60,7 @@ import {
   JUNCTION_CAPTURE_MIN_TURN_CM_S,
   JUNCTION_YAW_DAMPING,
   JUNCTION_YAW_FILTER_TAU_S,
+  JUNCTION_EXIT_SEARCH_SPEED_CM_S,
   JUNCTION_EXIT_SPEED_CM_S,
   COMPONENT_RECOVERY_SPEED_CM_S,
   HEXAGON_SPEED_CM_S,
@@ -81,8 +82,6 @@ import {
   STEERING_FEEDBACK_MIN_HALF_CM_S,
   ROUTE_START_Y_CM,
   BRAKING_ENVELOPE_MARGIN_CM,
-  JUNCTION_POSE_GRAY_SPREAD,
-  JUNCTION_CENTER_LIMIT,
   JUNCTION_CROSS_KP,
   POSE_PURSUIT_LOOKAHEAD_CM,
   ROUTE_WAYPOINT_GATE_CM,
@@ -353,24 +352,24 @@ export class LineFollowModel {
   }
 
   /** Which grey reading may steer, now that the straight branch trusts grey.
-   * Mirrors line_follow.c gray_plausible() exactly:
-   *  - a centred narrow line is unambiguous, always trusted (after a pivot the
-   *    pose can be several cm off);
-   *  - a pose cross-track beyond ROUTE_WAYPOINT_GATE_CM means the pose itself is
-   *    the suspect side, so the visible narrow line is trusted (field 2026-11-08:
-   *    pose_cross≈-16.5 cm, mask=0x04 = real line, old code vetoed it and the car
-   *    drove blind along its heading);
-   *  - the pose says "still on the segment" and the narrow reading disagrees: that
-   *    is most likely the 24 cm look-ahead bar already sitting on another real
-   *    wire (hexagon NW edge) or a printed stroke, so the pose hold keeps
-   *    authority. Wide/multi-region patterns are never trusted here. */
+   * Mirrors line_follow.c gray_plausible() exactly (2026-11-10):
+   *  - without a valid pose segment there is nothing to compare against, so the
+   *    reading is trusted unconditionally (unchanged);
+   *  - with a valid pose segment every single-region narrow line is trusted,
+   *    including 2-3 channels hugging the bar edge. The lateral offset goes to
+   *    the grey position PID, never to the pose hold.
+   *  - the pose only vetoes wide lines, multi-region readings, hollow component
+   *    artwork and a blank bar (all of which fail routeIsNarrowLine anyway).
+   *  - the old "expected = -pose_cross/0.55 within JUNCTION_POSE_GRAY_SPREAD"
+   *    test is gone: it vetoed a real line merely because the 24 cm bar already
+   *    sat on a bend the route table has no action for. Host probe on the old
+   *    port: position +5 -> differential 0.00 -> LINE_STOP_LOST 35.1 cm later
+   *    (on a track with 45 deg / arc corners that means driving straight off it).
+   *  - JUNCTION_POSE_GRAY_SPREAD is retired in the firmware and kept in config.ts
+   *    only so the C/TS parameter names still line up. */
   private grayPlausible(obs: GrayObservation): boolean {
     if (!this.route.pose_mode || !this.route.pose_cross_valid) return true;
-    if (!routeIsNarrowLine(obs)) return false;
-    if (Math.abs(obs.position) <= JUNCTION_CENTER_LIMIT) return true;
-    if (Math.abs(this.route.pose_cross_cm) > ROUTE_WAYPOINT_GATE_CM) return true;
-    const expected = -this.route.pose_cross_cm / 0.55;
-    return Math.abs(obs.position - expected) <= JUNCTION_POSE_GRAY_SPREAD;
+    return routeIsNarrowLine(obs);
   }
 
   /** Ordinary maneuvers use route phase bounds; HEXAGON keeps its own loss rules. */
@@ -745,7 +744,30 @@ export class LineFollowModel {
       return;
     }
 
-    if (
+    if (this.route.barHoldActive(this.odometry.distance_cm)) {
+      /* A transistor stroke must not regain the position PID merely because a
+       * non-target node cleared after 2 cm or its candidate was cancelled.
+       * Hold the latched entry heading for the row's straight distance. */
+      this.state = LineState.LINE_JUNCTION;
+      this.pid.reset();
+      if (!this.abnormal) {
+        this.abnormal = true;
+        this.abnormal_origin_cm = this.odometry.distance_cm;
+      }
+      const cap = Math.min(base_speed, Math.min(step.turn_speed, JUNCTION_SETTLE_SPEED_CM_S));
+      const correction = HEADING_KP_CM_S_PER_RAD *
+        (this.route.bar_hold_heading_rad - this.odometry.heading_rad) -
+        JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
+      this.straightTargets(cap, correction, dt);
+      const peak = Math.max(this.left_target_cm_s, this.right_target_cm_s);
+      if (peak > cap) {
+        const scale = cap / peak;
+        this.left_target_cm_s *= scale;
+        this.right_target_cm_s *= scale;
+        this.base = 0.5 * (this.left_target_cm_s + this.right_target_cm_s);
+        this.correction = 0.5 * (this.left_target_cm_s - this.right_target_cm_s);
+      }
+    } else if (
       this.route.pose_mode &&
       this.route.pose_cross_valid &&
       this.route.state === RouteState.ROUTE_FOLLOW &&
@@ -851,6 +873,25 @@ export class LineFollowModel {
             JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s,
           dt
         );
+      }
+    } else if (this.route.turn_exit_search) {
+      this.state = LineState.LINE_JUNCTION;
+      this.abnormal = false;
+      this.exit_accelerating = false;
+      this.pid.reset();
+      const cap = Math.min(step.turn_speed, JUNCTION_EXIT_SEARCH_SPEED_CM_S);
+      const correction = HEADING_KP_CM_S_PER_RAD *
+        (this.route.entry_heading + this.route.turnTargetRad() - this.odometry.heading_rad) -
+        JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
+      /* Grey edges cannot steer this search; cap both wheels after mixing. */
+      this.straightTargets(cap, correction, dt);
+      const peak = Math.max(this.left_target_cm_s, this.right_target_cm_s);
+      if (peak > cap) {
+        const scale = cap / peak;
+        this.left_target_cm_s *= scale;
+        this.right_target_cm_s *= scale;
+        this.base = 0.5 * (this.left_target_cm_s + this.right_target_cm_s);
+        this.correction = 0.5 * (this.left_target_cm_s - this.right_target_cm_s);
       }
     } else if (this.route.component_recovery_active) {
       this.state = LineState.LINE_JUNCTION;

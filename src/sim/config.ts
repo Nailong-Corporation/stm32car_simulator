@@ -19,6 +19,10 @@ export const LEFT_WHEEL_DIAMETER_CM = 4.8;
 export const RIGHT_WHEEL_DIAMETER_CM = 4.8;
 export const WHEEL_TRACK_CM = 14.0;
 export const GRAY_FORWARD_OFFSET_CM = 24.0;
+/* 8 路杆通道间距与半跨（与 physics.ts 的 (i - 3.5) * 1.1 一致）。横杠/角点先被
+ * 最外通道看到，所以“探头到线”可比“杆中心到线”早最多半跨。 */
+export const GRAY_SENSOR_PITCH_CM = 1.1;
+export const GRAY_SENSOR_HALF_SPAN_CM = 3.5 * GRAY_SENSOR_PITCH_CM; // 3.85
 
 export const CORNER_RADIUS_CM = 24.0;
 export const CORNER_HEADING_KP = 8.0;
@@ -78,7 +82,9 @@ export const RIGHT_COUNTS_PER_WHEEL_REV = 1064.0;
 export const ENCODER_LEFT_SIGN = -1;
 export const ENCODER_RIGHT_SIGN = 1;
 export const ODOMETRY_DISTANCE_SCALE = 1.0;
-export const ODOMETRY_HEADING_SCALE = 0.641;
+/* 2026-11-10 实车差分实测：IMU 正常时车体正好 90°，IMU 失败改用编码器估角时
+ * 实车约 105°；0.641 × 105/90 ≈ 0.748。只用于 IMU 不可用的降级估角。 */
+export const ODOMETRY_HEADING_SCALE = 0.748;
 
 export const VEHICLE_MAX_SPEED_CM_S = 190.0; /* 2026-11-08 实测满 PWM≈190 cm/s（pwm/v≈1.33）。 */
 export const ODOMETRY_MAX_SPEED_CM_S = 650.0;
@@ -169,6 +175,9 @@ export const JUNCTION_PASS_SPEED_CM_S = 60.0;
 export const JUNCTION_TURN_MAX_RAD = 2.1;
 export const JUNCTION_WRONG_WAY_RAD = 0.35;
 export const JUNCTION_CENTER_LIMIT = 2.0;
+/* 显式短连接到角找线：位置权重 ±3 约为探头观测中心偏移 ±1.65 cm。
+ * 仍须单区至多3路、连续3帧、出口航向合格；普通出口保留 ±2。 */
+export const JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT = 3.0;
 export const JUNCTION_CAPTURE_MIN_RAD = 0.70;
 export const JUNCTION_CLEAR_MAX_CM = 20.0;
 // Normal tracking limits common target lead instead of cutting just the inner wheel.
@@ -190,6 +199,10 @@ export const JUNCTION_SETTLE_MAX_ERR_RAD = 0.06;
 export const JUNCTION_SETTLE_MIN_DIFF_CM_S = 6.0;
 export const JUNCTION_YAW_DAMPING = 2.5;
 export const JUNCTION_YAW_FILTER_TAU_S = 0.030;
+/* 满角后尚无出口线：独立低速搜索预算，不因居中噪声或轻微欠角续期。 */
+export const JUNCTION_EXIT_SEARCH_SPEED_CM_S = 16.0;
+export const JUNCTION_EXIT_SEARCH_MAX_CM = 12.0;
+export const JUNCTION_EXIT_SEARCH_TIMEOUT_MS = 1200;
 export const JUNCTION_EXIT_SPEED_CM_S = 20.0;
 export const COMPONENT_RECOVERY_SPEED_CM_S = 60.0;
 export const COMPONENT_RECOVERY_MAX_CM = 12.0;
@@ -235,9 +248,13 @@ export const JUNCTION_APPROACH_TIMEOUT_MS = 3000;
 // 24 cm ahead, bar half-span ~3.85 cm) and the car then brakes, so this value
 // trades an early pivot (exit line just outside the bar) against overrunning a
 // dead-end corner. Calibrated against the reference routes below.
-// 2026-11-08 实测：灰度确认路口后仍走约 17 cm 才起转，偏迟；按用户“检测到
-// 路口再走 10 cm 就起转”改为 17 -> 10（可直接微调的旋钮，改回 17 即旧行为）。
-export const TURN_PIVOT_APPROACH_CM = 10.0;
+// 旧表（turn_approach_cm==0）的默认接近距离；当前路线表用每行第 9 列。
+/* 2026-11-10: the bar sits GRAY_FORWARD_OFFSET_CM ahead of the axle and a stopped
+ * pivot rotates about the axle without advancing, so travelling exactly that much
+ * after the grey detection puts the axle on the corner (and the body's lateral
+ * error on the outgoing line at 0). 24 - track/2 = 17 left 6.5 cm of offset and
+ * the car ran blind/parallel to the outgoing line. */
+export const TURN_PIVOT_APPROACH_CM = GRAY_FORWARD_OFFSET_CM;
 // After a turn has confirmed its exit and then loses the line, bias the hold
 // heading toward the inside of the corner: the pivot can start a few cm early
 // (the bar sees the branch with its outer channel first), leaving the exit line
@@ -260,6 +277,9 @@ export const JUNCTION_ADJACENT_EXIT_CM = 0.30;
  * uses count); pose predicts steering/speed/turn geometry and cannot authorize
  * the node or veto its grey confirmation. Clockwise positive track heading:
  * 0 = +x east, +PI/2 = +y south. */
+/* 表内行数上限（motion_config.h ROUTE_MAX_STEPS）。超过上限 route_init 判非法，
+ * 不再静默关闭位姿导航。2026-11-10 由 32 提到 64（方案 1 已用 30 行）。 */
+export const ROUTE_MAX_STEPS = 64;
 export const ROUTE_START_X_CM = 0.0;
 export const ROUTE_START_Y_CM = 110.0;
 export const ROUTE_START_HEADING_RAD = -Math.PI / 2;
@@ -270,6 +290,14 @@ export const ROUTE_START_HEADING_RAD = -Math.PI / 2;
  * public repeat_count field. */
 export const ROUTE_REPEAT_COUNT = 1;
 export const ROUTE_WAYPOINT_MARGIN_CM = 5.0;
+/* 2026-11-10: the ordinary-row segment gate is measured at the sensor bar
+ * (GRAY_FORWARD_OFFSET_CM ahead of the axle), not at the axle. A corner is first
+ * seen ~24 cm before the axle reaches it, so an axle-measured gate consumed the
+ * target node as a "passing" junction and never authorized the turn.
+ * The corner bar is seen first by the outermost channel, so add the bar half
+ * span (3.85 cm) as margin (motion_config.h: 24 + 3.85 = 27.85 cm).
+ * Set to 0 to restore the pre-2026-11-10 axle-only contract. */
+export const ROUTE_GATE_LOOKAHEAD_CM = GRAY_FORWARD_OFFSET_CM + GRAY_SENSOR_HALF_SPAN_CM;
 export const ROUTE_WAYPOINT_CONFIRM_CM = 2.5;
 export const ROUTE_WAYPOINT_FALLBACK_CM = 18.0;
 /* The ring entry is timed on the axle pose, not the 24 cm look-ahead bar. */
@@ -292,12 +320,11 @@ export const ROUTE_WAYPOINT_EXIT_ANGLE_RAD = 0.12;
  * gate passing. Replaces ROUTE_WAYPOINT_SLOW_CM=30, whose step-to-vt window
  * made the car crawl the last few tens of centimetres before every corner. */
 export const BRAKING_ENVELOPE_MARGIN_CM = 4.0;
-/* Allowed disagreement between the grey position (weight units, ~0.55 cm each)
- * and the pose-predicted lateral offset before an off-centre narrow reading is
- * distrusted. Still live (motion_config.h JUNCTION_POSE_GRAY_SPREAD): since
- * 2026-11-08 a centred narrow line is always trusted and a pose cross-track past
- * ROUTE_WAYPOINT_GATE_CM gives the reading priority; only "pose says still on
- * the segment but the line disagrees" keeps using this spread to distrust it. */
+/* Retired (motion_config.h JUNCTION_POSE_GRAY_SPREAD): kept only so the C/TS
+ * parameter names still line up. Since 2026-11-10 grayPlausible() trusts every
+ * single-region narrow line whenever the pose segment is valid; the pose only
+ * vetoes wide lines, multi-region readings, hollow artwork and a blank bar, so
+ * this spread no longer takes part in any decision. */
 export const JUNCTION_POSE_GRAY_SPREAD = 4.0;
 /* cm/s of differential correction per cm of pose cross-track error. */
 export const JUNCTION_CROSS_KP = 2.0;
@@ -362,6 +389,9 @@ export const NAVIGATION_RECOVERY_MS = 1200;
 export const NAVIGATION_RECOVERY_CM = 12.0;
 export const NAVIGATION_RECOVERY_SPEED_CM_S = 16.0;
 
+/* 固件 control_config.h 2026-11-10 改为 1（原始 GPIO 白=0/黑=1，需要反相成
+ * “1=目标线”）。仿真器的 isWhiteAt() 已经直接输出“1=白线”，若再打开会二次反相，
+ * 因此这里保持 0；极性同步体现在传感器模型，而不是这个开关。 */
 export const GRAY_INVERT_ENABLED = 0;
 export const LOST_LINE_STOP_ENABLED = 0;
 export const FLOOR_SEAM_FILTER_ENABLED = 0;

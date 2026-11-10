@@ -12,7 +12,16 @@ import {
   LEFT_COUNTS_PER_WHEEL_REV,
   RIGHT_COUNTS_PER_WHEEL_REV,
   ODOMETRY_DISTANCE_SCALE,
+  ODOMETRY_HEADING_SCALE,
   GRAY_FORWARD_OFFSET_CM,
+  GRAY_SENSOR_HALF_SPAN_CM,
+  ROUTE_GATE_LOOKAHEAD_CM,
+  ROUTE_MAX_STEPS,
+  JUNCTION_SETTLE_MIN_DIFF_CM_S,
+  JUNCTION_EXIT_SEARCH_SPEED_CM_S,
+  JUNCTION_EXIT_SEARCH_MAX_CM,
+  JUNCTION_EXIT_SEARCH_TIMEOUT_MS,
+  JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT,
   LINE_CONFIRM_SAMPLES,
 } from '../src/sim/config';
 import { Action, LineState, RouteState } from '../src/sim/types';
@@ -30,7 +39,7 @@ import { Action, LineState, RouteState } from '../src/sim/types';
  */
 
 // 1) Parameters copied one-for-one from include/motion_config.h.
-assert.equal(TURN_PIVOT_APPROACH_CM, 10.0);
+assert.equal(TURN_PIVOT_APPROACH_CM, 24.0); /* bar look-ahead = pivot travel */
 assert.equal(ROUTE_WAYPOINT_MAX_PASSED_LAG_CM, 30.0);
 assert.equal(ROUTE_REPEAT_COUNT, 1); /* motion_config.h ships one competition lap */
 assert.equal(LEFT_WHEEL_DIAMETER_CM, 4.8);
@@ -38,7 +47,17 @@ assert.equal(RIGHT_WHEEL_DIAMETER_CM, 4.8);
 assert.equal(LEFT_COUNTS_PER_WHEEL_REV, 1064.0);
 assert.equal(RIGHT_COUNTS_PER_WHEEL_REV, 1064.0);
 assert.equal(ODOMETRY_DISTANCE_SCALE, 1.0);
-console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064 counts, scale 1.0, pivot 10, lag 30)');
+assert.equal(ODOMETRY_HEADING_SCALE, 0.748); /* 2026-11-10 differential field calibration */
+assert.ok(Math.abs(GRAY_SENSOR_HALF_SPAN_CM - 3.85) < 1e-9);
+assert.equal(ROUTE_GATE_LOOKAHEAD_CM, GRAY_FORWARD_OFFSET_CM + GRAY_SENSOR_HALF_SPAN_CM);
+assert.ok(Math.abs(ROUTE_GATE_LOOKAHEAD_CM - 27.85) < 1e-9);
+assert.equal(ROUTE_MAX_STEPS, 64);
+assert.equal(JUNCTION_SETTLE_MIN_DIFF_CM_S, 6.0);
+assert.equal(JUNCTION_EXIT_SEARCH_SPEED_CM_S, 16.0);
+assert.equal(JUNCTION_EXIT_SEARCH_MAX_CM, 12.0);
+assert.equal(JUNCTION_EXIT_SEARCH_TIMEOUT_MS, 1200);
+assert.equal(JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT, 3.0);
+console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064 counts, scale 1.0, heading 0.748, gate 27.85, max steps 64)');
 
 // 2) START is the pose origin: a body rotated after power-on must not leave a
 //    non-zero heading, and the first row must not be accepted at d ~ 0.
@@ -129,14 +148,20 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
   const scheme0 = parsed.schemes.find((s) => s.id === 0);
   assert.ok(scheme0);
-  assert.equal(parsed.activeSchemeId, 0, 'bundled default must match firmware scheme 0');
+  assert.equal(parsed.activeSchemeId, 1, 'bundled default must match firmware ROUTE_SCHEME_SELECT=1');
   assert.equal(scheme0.steps.length, 2, 'only the two active debug rows are parsed');
   const fields = ['junction_count', 'turn_speed', 'action', 'cruise_speed',
-    'angle_deg', 'corner_arc_enabled', 'segment_length_cm', 'short_link_cm'] as const;
+    'angle_deg', 'corner_arc_enabled', 'segment_length_cm', 'short_link_cm', 'turn_approach_cm'] as const;
   assert.deepEqual(scheme0.steps.map(step => fields.map(field => step[field])), [
-    [2, 20, Action.CUSTOM_TURN, 50, 90, false, 50, 0],
-    [3, 20, Action.STOP, 50, 90, false, 40, 0],
+    [2, 20, Action.CUSTOM_TURN, 50, 90, false, 50, 0, 9],
+    [3, 20, Action.STOP, 50, 90, false, 40, 0, 0],
   ], 'debug rows must match the current firmware working tree in every field');
+  const scheme1 = parsed.schemes.find((s) => s.id === 1);
+  assert.ok(scheme1);
+  assert.equal(scheme1.steps.length, 30, 'scheme 1 now uses the full 30-row transistor-aware table');
+  assert.equal(scheme1.steps[3].turn_approach_cm, 19, 'Q6 row: 14 cm transistor hold + 5 cm calibration');
+  assert.equal(scheme1.steps[7].segment_length_cm, 265, 'bottom-right gate calibrated on the car');
+  assert.equal(scheme1.steps[29].action, Action.STOP);
   // ROUTE_REPEAT_COUNT=1 must reach a freshly initialised planner.
   const planner = new RoutePlannerModel();
   planner.init(scheme0.steps);

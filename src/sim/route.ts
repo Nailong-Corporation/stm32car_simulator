@@ -5,6 +5,7 @@ import {
   JunctionEvidence,
   JunctionReject,
   HexagonState,
+  RouteBarHoldState,
   type HexagonNavigation,
   type RouteStep,
   type GrayObservation,
@@ -15,6 +16,7 @@ import {
   LINE_CONFIRM_SAMPLES,
   GRAY_FORWARD_OFFSET_CM,
   TURN_PIVOT_APPROACH_CM,
+  ROUTE_GATE_LOOKAHEAD_CM,
   SENSOR_MAX_REGION_WIDTH,
   JUNCTION_CONFIRM_SAMPLES,
   JUNCTION_CONFIRM_DISTANCE_CM,
@@ -37,6 +39,10 @@ import {
   JUNCTION_TURN_MAX_RAD,
   JUNCTION_WRONG_WAY_RAD,
   JUNCTION_CENTER_LIMIT,
+  JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT,
+  JUNCTION_EXIT_SEARCH_SPEED_CM_S,
+  JUNCTION_EXIT_SEARCH_MAX_CM,
+  JUNCTION_EXIT_SEARCH_TIMEOUT_MS,
   JUNCTION_CAPTURE_MIN_RAD,
   JUNCTION_YAW_FILTER_TAU_S,
   JUNCTION_CLEAR_MAX_CM,
@@ -77,6 +83,7 @@ import {
   ROUTE_START_HEADING_RAD,
   ROUTE_REPEAT_COUNT,
   ROUTE_WAYPOINT_MARGIN_CM,
+  ROUTE_MAX_STEPS,
   ROUTE_WAYPOINT_EXIT_CM,
   ROUTE_WAYPOINT_EXIT_ANGLE_RAD,
   HEXAGON_ENTRY_APPROACH_MAX_CM,
@@ -288,6 +295,14 @@ export class RoutePlannerModel {
    * the corner instead of tens of cm late. */
   public turn_approach_cm = 0;
   public pose_trigger_late_cm = 0;
+  /* 三极管正面横杠：首帧 0xFF 锁航向，按本行 turn_approach_cm 直走。 */
+  public bar_hold_state: RouteBarHoldState = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
+  public bar_hold_index = 0;
+  public bar_hold_origin_cm = 0;
+  public bar_hold_heading_rad = 0;
+  public bar_hold_ms = 0;
+  public bar_hold_clear_count = 0;
+  public bar_hold_complete = false;
   /* Pose mode: after a pivot the car keeps exit speed until the outgoing line
    * has been re-acquired, so a printed symbol next to the corner cannot be
    * chased at cruise speed. */
@@ -350,6 +365,7 @@ export class RoutePlannerModel {
   public capture_line_samples = 0;
   public capture_line_ms = 0;
   public capture_line_cm = 0;
+  public turn_exit_search = false;
   public line_exit_heading_rad = 0;
   public turn_ended_on_line = false;
   public next_junction_samples = 0;
@@ -419,10 +435,13 @@ export class RoutePlannerModel {
     this.repeat_count = ROUTE_REPEAT_COUNT;
     this.repeat_action = Action.LEFT;
     this.stop_callback = callback;
-    this.valid = steps !== null && steps.length > 0;
+    /* Explicit upper bound: over ROUTE_MAX_STEPS must fail, not silently
+     * disable pose navigation (motion_config.h route_init). */
+    this.valid = steps !== null && steps.length > 0 && steps.length <= ROUTE_MAX_STEPS;
 
     for (let i = 0; this.valid && i < this.count; ++i) {
       const s = steps[i];
+      const approach = s.turn_approach_cm ?? 0;
       this.valid =
         (s.junction_count > 0 || s.segment_length_cm > 0) &&
         s.action <= Action.HEXAGON &&
@@ -431,6 +450,8 @@ export class RoutePlannerModel {
         Number.isFinite(s.turn_speed) &&
         s.turn_speed > 0 &&
         s.turn_speed <= s.cruise_speed &&
+        Number.isFinite(approach) &&
+        approach >= 0 &&
         Number.isFinite(s.segment_length_cm) &&
         s.segment_length_cm >= 0 &&
         (s.segment_length_cm === 0 ||
@@ -461,6 +482,8 @@ export class RoutePlannerModel {
 
   public start(d: number, now: number): void {
     this.short_link_tracking = this.short_link_active = this.turn_approaching = false;
+    this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
+    this.bar_hold_clear_count = 0;
     this.post_turn_slow = false;
     this.post_turn_samples = 0;
     this.arc_just_exited = false;
@@ -472,7 +495,7 @@ export class RoutePlannerModel {
     let wx = this.start_x_cm;
     let wy = this.start_y_cm;
     let wh = this.start_heading_rad;
-    for (let i = 0; i < this.count && i < 32; ++i) {
+    for (let i = 0; i < this.count && i < ROUTE_MAX_STEPS; ++i) {
       const len = this.steps[i].segment_length_cm > 0
         ? this.steps[i].segment_length_cm + ROUTE_WAYPOINT_MARGIN_CM
         : 0;
@@ -644,7 +667,11 @@ export class RoutePlannerModel {
     const s = this.steps[this.index];
     // Positive segment distance is mandatory; count cannot release it early.
     // Readiness only arms a subsequently confirmed grey node, never a pose turn.
-    if (s.segment_length_cm > 0) return d - this.origin_cm >= s.segment_length_cm;
+    // 2026-11-10: the mileage is the sensor bar's (24 cm ahead of the axle), so a
+    // corner node seen by the bar authorizes instead of being dropped as passing.
+    if (s.segment_length_cm > 0) {
+      return d + ROUTE_GATE_LOOKAHEAD_CM - this.origin_cm >= s.segment_length_cm;
+    }
     return s.junction_count > 0 &&
       this.junctions_seen + (next ? 1 : 0) >= s.junction_count;
   }
@@ -677,6 +704,7 @@ export class RoutePlannerModel {
     this.turn_rewind_active = this.turn_rewind_pending = false;
     this.line_exit_confirmed = this.turn_ended_on_line = this.capture_line_seen = false;
     this.capture_line_samples = 0;
+    this.turn_exit_search = false;
     this.next_junction_samples = 0;
     this.turn_branch_samples = 0;
     this.turn_branch_sides = 0;
@@ -723,19 +751,139 @@ export class RoutePlannerModel {
     };
   }
 
+  private rowTurnApproachCm(): number {
+    const approach = this.steps[this.index].turn_approach_cm ?? 0;
+    return approach > 0 ? approach : TURN_PIVOT_APPROACH_CM;
+  }
+
+  /** Mirror of route_bar_hold_active(): the latched transverse bar keeps the
+   * confirmed entry heading for the row's configured straight distance. */
+  public barHoldActive(d: number): boolean {
+    if (this.index >= this.count ||
+      this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_NONE ||
+      this.bar_hold_index !== this.index ||
+      this.bar_hold_complete) return false;
+    const phase =
+      this.state === RouteState.ROUTE_FOLLOW ||
+      this.state === RouteState.ROUTE_CANDIDATE ||
+      this.state === RouteState.ROUTE_BRAKING ||
+      (this.state === RouteState.ROUTE_CLEARING && this.passing_junction) ||
+      (this.state === RouteState.ROUTE_EXECUTING && this.turn_approaching);
+    return phase && d >= this.bar_hold_origin_cm &&
+      d - this.bar_hold_origin_cm < (this.steps[this.index].turn_approach_cm ?? 0);
+  }
+
+  /** Candidate cancellation / side change only unbinds the bar; it never
+   * cancels the steering hold (C: unbind_bar_hold). */
+  private unbindBarHold(): void {
+    if (this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_PENDING) {
+      this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_PASS;
+    }
+  }
+
+  /** A bar is this row's corner only when the pivot start (first bar frame +
+   * the row's straight distance) puts the 24 cm look-ahead bar on the segment
+   * end. Mid-row printed-resistor end walls stay "passing" nodes. */
+  private barMarksCorner(): boolean {
+    if (this.bar_hold_state !== RouteBarHoldState.ROUTE_BAR_HOLD_PENDING ||
+      this.bar_hold_index !== this.index) return false;
+    const s = this.steps[this.index];
+    const approach = s.turn_approach_cm ?? 0;
+    if (s.segment_length_cm <= 0 || approach <= 0) return false;
+    const pivot = this.bar_hold_origin_cm + approach;
+    if (pivot + GRAY_FORWARD_OFFSET_CM <
+      this.origin_cm + s.segment_length_cm + ROUTE_WAYPOINT_MARGIN_CM) return false;
+    return this.targetReady(pivot, false);
+  }
+
+  private updateBarHold(o: GrayObservation, d: number, h: number, now: number): void {
+    const s = this.steps[this.index];
+    const phase =
+      this.state === RouteState.ROUTE_FOLLOW ||
+      this.state === RouteState.ROUTE_CANDIDATE ||
+      (this.state === RouteState.ROUTE_CLEARING && this.passing_junction) ||
+      (this.state === RouteState.ROUTE_EXECUTING && this.turn_approaching) ||
+      this.state === RouteState.ROUTE_BRAKING;
+    const eligible = (s.turn_approach_cm ?? 0) > 0 &&
+      !s.corner_arc_enabled &&
+      (s.short_link_cm ?? 0) === 0 &&
+      (s.action === Action.LEFT || s.action === Action.RIGHT || s.action === Action.CUSTOM_TURN);
+    if (!eligible || !phase || this.bar_hold_index !== this.index) {
+      this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
+      this.bar_hold_clear_count = 0;
+    }
+    if (this.bar_hold_state !== RouteBarHoldState.ROUTE_BAR_HOLD_NONE) {
+      if (!this.bar_hold_complete) {
+        if (now - this.bar_hold_ms >= JUNCTION_APPROACH_TIMEOUT_MS) {
+          this.fail(RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE);
+          return;
+        }
+        if (d - this.bar_hold_origin_cm >= (s.turn_approach_cm ?? 0)) {
+          this.bar_hold_complete = true;
+        }
+      }
+      if (this.bar_hold_complete) {
+        const center =
+          this.state === RouteState.ROUTE_FOLLOW &&
+          routeIsNarrowLine(o) &&
+          o.white_count <= JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
+          Math.abs(o.position) <= JUNCTION_CENTER_LIMIT &&
+          now - this.last_sample_ms <= CONTROL_MAX_INTERVAL_MS;
+        if (!center) this.bar_hold_clear_count = 0;
+        else if (this.bar_hold_clear_count < LINE_CONFIRM_SAMPLES) this.bar_hold_clear_count++;
+        if (this.bar_hold_clear_count >= LINE_CONFIRM_SAMPLES &&
+          this.bar_hold_state !== RouteBarHoldState.ROUTE_BAR_HOLD_PENDING) {
+          this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
+        }
+      }
+      return;
+    }
+    /* Steering freezes on the first filtered 0xFF bar; node confirmation stays
+     * independent. An early bar can never be reused after the distance gate. */
+    if (!eligible || !phase ||
+      this.state === RouteState.ROUTE_BRAKING ||
+      this.state === RouteState.ROUTE_EXECUTING ||
+      o.line_mask !== 0xff) return;
+    this.bar_hold_index = this.index;
+    this.bar_hold_origin_cm = d;
+    this.bar_hold_heading_rad = h;
+    this.bar_hold_ms = now;
+    this.bar_hold_clear_count = 0;
+    this.bar_hold_complete = false;
+    this.bar_hold_state = this.state === RouteState.ROUTE_CLEARING
+      ? RouteBarHoldState.ROUTE_BAR_HOLD_PASS
+      : RouteBarHoldState.ROUTE_BAR_HOLD_PENDING;
+  }
+
   private beginAction(d: number, h: number, now: number): void {
+    const explicitApproach = (this.steps[this.index].turn_approach_cm ?? 0) > 0;
+    let approachOrigin = explicitApproach && this.state === RouteState.ROUTE_BRAKING
+      ? this.entry_cm : d;
+    let approachHeading = explicitApproach && this.state === RouteState.ROUTE_BRAKING
+      ? this.entry_heading : h;
+    if (explicitApproach &&
+      this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_TARGET &&
+      this.bar_hold_index === this.index &&
+      !this.short_link_active) {
+      approachOrigin = this.bar_hold_origin_cm;
+      approachHeading = this.bar_hold_heading_rad;
+    }
     this.state = RouteState.ROUTE_EXECUTING;
     this.phase_ms = now;
     this.entry_cm = d;
-    if (!this.short_link_active) this.entry_heading = h;
+    if (!this.short_link_active) this.entry_heading = approachHeading;
     this.action_start_heading = this.entry_heading;
-    this.turn_approach_origin_cm = d;
-    this.turn_approach_cm = Math.max(0.0,
-      TURN_PIVOT_APPROACH_CM - (this.pose_mode ? this.pose_trigger_late_cm : 0.0));
+    this.turn_approach_origin_cm = approachOrigin;
+    this.turn_approach_cm = Math.max(0.0, this.rowTurnApproachCm() -
+      (!explicitApproach && this.pose_mode ? this.pose_trigger_late_cm : 0.0));
+    const current = this.currentAction();
     this.turn_approaching = !this.passing_junction &&
       !this.usesCornerArc() &&
-      Math.abs(Math.abs(this.turnTargetRad()) - JUNCTION_TURN_TARGET_RAD) < 1e-4 &&
-      this.steps[this.index].action !== Action.HEXAGON;
+      this.steps[this.index].action !== Action.HEXAGON &&
+      current !== Action.STRAIGHT &&
+      current !== Action.STOP &&
+      (explicitApproach ||
+        Math.abs(Math.abs(this.turnTargetRad()) - JUNCTION_TURN_TARGET_RAD) < 1e-4);
     this.resetEvidence(now);
     this.last_arc_ms = now;
     this.arc_just_exited = false;
@@ -821,7 +969,7 @@ export class RoutePlannerModel {
         this.beginAction(d, this.short_link_heading, now);
         this.short_link_active = true;
         const remaining = shortLinkLength(this.steps[this.index]) - this.short_link_pivot_lead_cm - this.short_link_forward_cm;
-        this.turn_approach_origin_cm = d - (TURN_PIVOT_APPROACH_CM - remaining);
+        this.turn_approach_origin_cm = d - (this.rowTurnApproachCm() - remaining);
         return;
       }
     }
@@ -840,6 +988,64 @@ export class RoutePlannerModel {
       this.capture_line_ms = now;
       this.capture_line_cm = d;
     }
+  }
+
+  /** The estimated corner may drift when a real node authorizes a later turn.
+   * Full angle ends the pivot, but never grants a short link without a real exit. */
+  private beginTurnExitSearch(d: number, now: number): void {
+    this.turn_exit_search = true;
+    this.capture_line_ms = now;
+    this.capture_line_cm = d;
+    this.capture_line_samples = this.exit_count = 0;
+    this.exit_candidate_pending = false;
+    this.turn_capturing = this.capture_line_seen = this.line_exit_confirmed = false;
+    this.turn_ended_on_line = false;
+    this.turn_rewind_active = this.turn_rewind_pending = false;
+    this.component_recovery_active = false;
+  }
+
+  private updateTurnExitSearch(
+    o: GrayObservation,
+    d: number,
+    h: number,
+    now: number,
+    adjacent: boolean
+  ): void {
+    /* Deadlines precede even the third valid exit frame. Noise never renews them. */
+    if (now - this.capture_line_ms >= JUNCTION_EXIT_SEARCH_TIMEOUT_MS ||
+      Math.abs(d - this.capture_line_cm) >= JUNCTION_EXIT_SEARCH_MAX_CM) {
+      this.fail(RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE);
+      return;
+    }
+    if (this.short_link_tracking && this.index + 1 < this.count) {
+      const lead = Math.max(WHEEL_TRACK_CM * 0.5, Math.abs(this.short_link_lateral_cm));
+      if (lead > SHORT_LINK_MAX_LATERAL_CM ||
+        shortLinkLength(this.steps[this.index + 1]) - lead - this.short_link_forward_cm < 1.0) {
+        this.fail(RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE);
+        return;
+      }
+    }
+    /* On a short link a real narrow exit at position +3 may be all the room
+     * there is; qualify by the outgoing heading and let enterClear charge the
+     * search travel to the link. */
+    const shortExit = this.short_link_tracking && this.index + 1 < this.count &&
+      shortLinkLength(this.steps[this.index + 1]) > 0;
+    const positionLimit = shortExit
+      ? JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT
+      : JUNCTION_CENTER_LIMIT;
+    const exit = adjacent && routeIsNarrowLine(o) &&
+      o.white_count <= JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
+      Math.abs(o.position) <= positionLimit &&
+      (!shortExit || Math.abs(h - this.short_link_heading) <= SHORT_LINK_MAX_HEADING_RAD);
+    if (!exit) this.exit_count = 0;
+    else if (this.exit_count < LINE_CONFIRM_SAMPLES) this.exit_count++;
+    this.capture_line_samples = this.exit_count;
+    if (this.exit_count < LINE_CONFIRM_SAMPLES) return;
+    this.turn_exit_search = false;
+    this.capture_line_seen = true;
+    this.line_exit_confirmed = true;
+    this.line_exit_heading_rad = h;
+    this.enterClear(d, now);
   }
 
   private completeClear(d: number, now: number): boolean {
@@ -1263,6 +1469,8 @@ export class RoutePlannerModel {
         return false;
     }
     this.short_link_tracking = this.short_link_active = this.turn_approaching = false;
+    this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
+    this.bar_hold_clear_count = 0;
     this.navigation_warning = this.failure;
     this.navigation_recoveries++;
     this.failure = RouteFailure.ROUTE_FAILURE_NONE;
@@ -1348,6 +1556,8 @@ export class RoutePlannerModel {
       this.pose_gap_bar_cm = Infinity;
     }
     const s = this.steps[this.index];
+    this.updateBarHold(o, d, h, now);
+    if ((this.state as RouteState) === RouteState.ROUTE_FAILED) return;
     if (this.short_link_tracking) {
       const ds = d - this.short_link_last_cm, dh = h - this.short_link_last_heading;
       const half = 0.5 * dh;
@@ -1365,7 +1575,7 @@ export class RoutePlannerModel {
           this.fail(RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE); return;
         }
         const remaining = shortLinkLength(s) - this.short_link_pivot_lead_cm - this.short_link_forward_cm;
-        this.turn_approach_origin_cm = d - (TURN_PIVOT_APPROACH_CM - remaining);
+        this.turn_approach_origin_cm = d - (this.rowTurnApproachCm() - remaining);
       }
     }
     if (this.state === RouteState.ROUTE_RECOVERING) {
@@ -1486,6 +1696,7 @@ export class RoutePlannerModel {
           : JunctionReject.JUNCTION_REJECT_SHAPE;
 
         if (smooth) this.smooth_edge_rejections++;
+        this.unbindBarHold();
         this.candidate_count = 0;
         this.candidate_separated = false;
         this.candidate_kind = JunctionEvidence.JUNCTION_EVIDENCE_NONE;
@@ -1497,6 +1708,7 @@ export class RoutePlannerModel {
       this.candidate_reject = JunctionReject.JUNCTION_REJECT_NONE;
 
       if (this.state === RouteState.ROUTE_CANDIDATE && !(this.candidate_sides & sides)) {
+        this.unbindBarHold();
         this.candidate_restarts++;
         this.candidate_reject = JunctionReject.JUNCTION_REJECT_SIDE_CHANGE;
         this.candidate_count = 0;
@@ -1556,7 +1768,15 @@ export class RoutePlannerModel {
 
       this.last_confirmed_kind = this.candidate_kind;
       this.junctions_seen++;
-      this.passing_junction = !this.targetReady(d, false);
+      this.passing_junction = !this.targetReady(d, false) && !this.barMarksCorner();
+      if (this.passing_junction) {
+        this.unbindBarHold();
+      } else if (this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_PENDING &&
+        this.bar_hold_index === this.index) {
+        this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_TARGET;
+      } else if (this.bar_hold_state !== RouteBarHoldState.ROUTE_BAR_HOLD_TARGET) {
+        this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
+      }
       this.search_pending = false;
 
       if (this.passing_junction) {
@@ -1612,13 +1832,14 @@ export class RoutePlannerModel {
       if (now - this.phase_ms >= JUNCTION_APPROACH_TIMEOUT_MS) {
         this.fail(RouteFailure.ROUTE_FAILURE_ACTION_TIMEOUT); return;
       }
-      // The front bar sees a junction L ahead of the axle. A pivot of radius
-      // track/2 must start L-track/2 later, not at the detection point.
+      // Explicit row distances count from grey confirmation, including braking.
+      // Zero-valued rows retain the legacy front-bar/axle approach.
       if (d - this.turn_approach_origin_cm < this.turn_approach_cm) return;
       if (this.short_link_active && !this.entrySpeedReady()) {
         this.state = RouteState.ROUTE_BRAKING; this.phase_ms = now; this.entry_cm = d; return;
       }
       this.turn_approaching = false;
+      this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
       // Approach wheel inertia is part of this action's accumulated yaw.
       this.phase_ms = now;
       this.entry_cm = d;
@@ -1636,9 +1857,15 @@ export class RoutePlannerModel {
     // 24 cm look-ahead bar a few cm after the pivot, so the grey-only contract
     // would time out.  When the axle has reached the pivot angle at the known
     // corner, hand over to the next row immediately.
-    const pose_available = this.pose_mode &&
+    /* Firmware working tree (2026-11-10): the pose hand-off is a one-shot
+     * EXECUTING transition. Re-entering from CLEARING refreshed its deadline
+     * and moved the next segment origin every frame while the axle stayed
+     * inside the corner exit radius. */
+    const pose_available = this.state === RouteState.ROUTE_EXECUTING &&
+      this.pose_mode &&
       action !== Action.STRAIGHT &&
       !this.passing_junction &&
+      !this.turn_exit_search &&
       Number.isFinite(axle_x_cm) &&
       Number.isFinite(axle_y_cm) &&
       this.waypoint_x_cm.length === this.count;
@@ -1695,8 +1922,17 @@ export class RoutePlannerModel {
     }
 
     if (this.state === RouteState.ROUTE_EXECUTING) {
+      if (this.turn_exit_search) {
+        this.updateTurnExitSearch(o, d, h, now, adjacent);
+        return;
+      }
       if (now - this.phase_ms >= this.actionTimeoutMs()) {
         this.fail(RouteFailure.ROUTE_FAILURE_ACTION_TIMEOUT);
+        return;
+      }
+      if (this.pose_mode && !this.passing_junction &&
+        ordinaryRightAngle(s) && turn >= target) {
+        this.beginTurnExitSearch(d, now);
         return;
       }
 

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { RoutePlannerModel } from '../src/sim/route';
 import { grayClassify } from '../src/sim/gray_sensor';
 import { Action, RouteState } from '../src/sim/types';
+import { ROUTE_GATE_LOOKAHEAD_CM } from '../src/sim/config';
 
 const steps = [
   { junction_count: 4, turn_speed: 12, action: Action.LEFT, cruise_speed: 30,
@@ -21,8 +22,9 @@ function samples(mask: number, n: number) {
   }
 }
 reset();
-assert.equal(p.targetReady(104.99, true), false);
-assert.equal(p.targetReady(105, true), true);
+// 2026-11-10: the gate is measured at the sensor bar (24 cm ahead of the axle).
+assert.equal(p.targetReady(105 - ROUTE_GATE_LOOKAHEAD_CM - 0.01, true), false);
+assert.equal(p.targetReady(105 - ROUTE_GATE_LOOKAHEAD_CM, true), true);
 d = 105; samples(0x18,8); samples(0,1);
 assert.equal(p.state, RouteState.ROUTE_FOLLOW);
 assert.equal(p.junctions_seen, 0);
@@ -55,8 +57,8 @@ samples(0x18,40); samples(0xff,3);
 assert.equal(p.state,RouteState.ROUTE_EXECUTING);
 assert.equal(p.junctions_seen,4);
 reset(); p.origin_cm=20; p.junctions_seen=99;
-assert.equal(p.targetReady(124.99,true),false);
-assert.equal(p.targetReady(125,false),true);
+assert.equal(p.targetReady(20 + 105 - ROUTE_GATE_LOOKAHEAD_CM - 0.01,true),false);
+assert.equal(p.targetReady(20 + 105 - ROUTE_GATE_LOOKAHEAD_CM,false),true);
 reset(); samples(0x18,4); samples(0x3c,1); samples(0x24,5);
 assert.equal(p.junctions_seen,1);
 assert.equal(p.state,RouteState.ROUTE_CLEARING);

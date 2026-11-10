@@ -43,8 +43,15 @@ for(const sign of [1,-1]) {
   const h0=sign>0?Math.PI:0;
   const diry=sign>0?1:-1;
   const ax=V0X; let ay=V0Y-diry*(GRAY_FORWARD_OFFSET_CM+2.0);
-  for(let i=0;i<6 && r.state!==RouteState.ROUTE_EXECUTING;i++)feed(0x18,h0,ax,ay,0);
-  assert.equal(r.state,RouteState.ROUTE_EXECUTING,'pose trigger confirms the ring row');
+  for(let i=0;i<6;i++)feed(0x18,h0,ax,ay,0);
+  /* 2026-11-10: ordinary/HEXAGON actions are authorized only by a confirmed
+   * grey node after the row's segment gate; the pose trigger was removed.
+   * This test targets the ring polygon FSM, so start the row directly at the
+   * gate (bar at V0) instead of fabricating a grey node pattern. */
+  d=22.2;now=30;
+  (r as unknown as {acceptTarget(d:number,h:number,now:number):void})
+    .acceptTarget(d,h0,now);
+  assert.equal(r.state,RouteState.ROUTE_EXECUTING,'grey node confirms the ring row');
   assert.equal(r.hexagon.state,HexagonState.HEXAGON_ENTERING);
   let guard=0;
   while(r.hexagon.state===HexagonState.HEXAGON_ENTERING && ++guard<200)
@@ -89,6 +96,9 @@ console.log('PASS: pose hexagon polygon entry, 7 pivots, exit and clearance hand
       d+=ds;now+=5;r.update(grayClassify(m,true,0),d,h,now,x,y);
     };
     for(let i=0;i<6;i++)feed(0x18,Math.PI,V0X,V0Y-26,0);
+    d=22.2;now=30;
+    (r as unknown as {acceptTarget(d:number,h:number,now:number):void})
+      .acceptTarget(d,Math.PI,now);
     for(let i=0;i<120 && r.hexagon.state===HexagonState.HEXAGON_ENTERING;i++)
       feed(0x18,Math.PI,V0X,V0Y-24+0.4*i,0.4);
     return {r,feed,now:()=>now,d:()=>d};

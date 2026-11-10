@@ -12,7 +12,11 @@
  *   3. the base bar ("one horizontal stroke on a straight run") must cover ALL
  *      eight phototransistor channels (pitch 1.1 cm, offsets (i - 3.5) * 1.1 =
  *      +/-0.55 .. +/-3.85 cm), i.e. raw sensor mask 0xFF when the sensor bar
- *      centre crosses the bar along the branch direction.
+ *      centre crosses the bar along the branch direction ("from the front").
+ *   4. the enlarged symbol must leave ALL eight channels dark (raw mask 0x00)
+ *      while the bar is between the two V arms ("from the two sides"): the
+ *      arms are then outside the +/-3.85 cm channel span and the board patch
+ *      has hidden the through wire.
  *
  * The plane is the same one sampled by the grayscale sensor
  * (map_data.isWhiteAt), so these assertions are exactly what the car "sees".
@@ -124,8 +128,10 @@ for (const comp of TRANSISTORS) {
   // base bar -> branch wire: bar centred at v = depth, stroke reaches v = d + s/2
   const vJoin = d + s / 2;
   assert.ok(Math.abs(vJoin - (d + TRANSISTOR_STROKE_CM / 2)) < 1e-9, `${comp.id}: expected the base-bar cap at ${vJoin} cm`);
+  // Start just outside the round cap: the wire underneath is hidden by the
+  // board patch, and the cap must meet it without a black sliver.
   for (let k = 0; k * STEP_CM <= 3.5 + 1e-9; ++k) {
-    const v = d + k * STEP_CM;
+    const v = vJoin + 1e-6 + k * STEP_CM;
     assert.ok(whiteLocal(comp, 0, v),
       `${comp.id}: black gap between the base bar and the branch wire at v=${v.toFixed(2)} cm`);
     samples++;
@@ -172,6 +178,32 @@ for (const comp of TRANSISTORS) {
       `${comp.id}: channel ${pt.index} u=${u.toFixed(3)} exceeds the outermost channel ${CHANNEL_LIMIT_CM} cm`);
   }
   console.log(`PASS: ${comp.id} base bar covers all 8 channels (raw mask ${hex(mask)})`);
+}
+
+/* ------------------------------- two-side passage leaves the bar black -- */
+
+// Requirement (e): passing between the two V arms (through-wire direction)
+// must read all black.  The sensor bar centre is placed on the symbol centre;
+// at that point the V vertex/base bar is TRANSISTOR_DEPTH_CM (9 cm) away, well
+// outside the outermost channel + stroke (5.25 cm), and the board patch hides
+// the through wire.
+for (const comp of TRANSISTORS) {
+  const heading = comp.rotation; // forward = through-wire direction (+u)
+  const sim = new VehicleSimulator(new LineFollowModel());
+  sim.reset({
+    x: comp.x - GRAY_FORWARD_OFFSET_CM * Math.cos(heading),
+    y: comp.y - GRAY_FORWARD_OFFSET_CM * Math.sin(heading),
+    heading,
+  });
+  const mask = sim.updateSensors();
+  assert.equal(mask, 0x00,
+    `${comp.id}: passage between the V arms must be all black, got ${hex(mask)}`);
+  for (const pt of sim.sensor_points) {
+    const { v } = worldToLocal(comp, pt.x, pt.y);
+    assert.ok(Math.abs(v) <= CHANNEL_LIMIT_CM + 1e-9,
+      `${comp.id}: channel ${pt.index} v=${v.toFixed(3)} must be inside the bar span`);
+  }
+  console.log(`PASS: ${comp.id} two-side passage is all black (raw mask ${hex(mask)})`);
 }
 
 /* ------------------------------------------------- V arm / bar thickness -- */
