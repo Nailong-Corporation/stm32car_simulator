@@ -64,6 +64,10 @@ export class VehicleSimulator {
     y: START_POINT.y,
     heading: START_HEADING_RAD,
   };
+  /* World heading of the START anchor: the firmware latches the IMU zero on
+   * START, so the controller's mileage heading is relative to this, not to the
+   * production P-north constant (a scenario may start facing south). */
+  public start_heading_rad = START_HEADING_RAD;
 
   public actual_left_speed = 0;   // cm/s
   public actual_right_speed = 0;  // cm/s
@@ -94,6 +98,7 @@ export class VehicleSimulator {
       y: pose?.y ?? START_POINT.y,
       heading: pose?.heading ?? START_HEADING_RAD,
     };
+    this.start_heading_rad = this.pose.heading;
     this.actual_left_speed = 0;
     this.actual_right_speed = 0;
     this.left_tick_accum = 0;
@@ -171,7 +176,7 @@ export class VehicleSimulator {
     );
 
     // 3. Compute relative heading for STM32 algorithm (0 at start, clockwise positive)
-    const relative_heading_rad = this.pose.heading - START_HEADING_RAD;
+    const relative_heading_rad = this.pose.heading - this.start_heading_rad;
 
     // The idle browser has no control ticks. Warm up real observations before START;
     // keep the controller's stable-line guard and never retry a rejected request forever.

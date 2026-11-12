@@ -7,6 +7,7 @@ import {
   HexagonState,
   GrayKind,
   type RouteStep,
+  type RouteStartPose,
   type GrayObservation,
   type EncoderCounts,
   type MotorCommand,
@@ -196,7 +197,8 @@ export class LineFollowModel {
     this.init(steps);
   }
 
-  public init(steps: RouteStep[], callback?: (step_index: number) => void): void {
+  public init(steps: RouteStep[], callback?: (step_index: number) => void,
+    startPose?: RouteStartPose): void {
     this.state = LineState.LINE_IDLE;
     this.stop_reason = LineStopReason.LINE_STOP_NONE;
     this.heading_source = HeadingSource.HEADING_IMU;
@@ -205,7 +207,7 @@ export class LineFollowModel {
     this.speed.reset();
     this.braking_slew.reset();
     this.pid.reset();
-    this.route.init(steps, callback);
+    this.route.init(steps, callback, startPose);
 
     this.braking_active = false;
     this.braking_reverse_active = false;

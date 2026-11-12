@@ -8,6 +8,7 @@ import {
   RouteBarHoldState,
   type HexagonNavigation,
   type RouteStep,
+  type RouteStartPose,
   type GrayObservation,
   GrayKind,
 } from './types';
@@ -40,6 +41,9 @@ import {
   JUNCTION_WRONG_WAY_RAD,
   JUNCTION_CENTER_LIMIT,
   JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT,
+  JUNCTION_SHORT_LINK_EXIT_EDGE_STABLE_MS,
+  JUNCTION_SHORT_LINK_EXIT_EDGE_STABLE_CM,
+  JUNCTION_EXIT_SEARCH_EDGE_HEADING_RAD,
   JUNCTION_EXIT_SEARCH_SPEED_CM_S,
   JUNCTION_EXIT_SEARCH_MAX_CM,
   JUNCTION_EXIT_SEARCH_TIMEOUT_MS,
@@ -333,6 +337,10 @@ export class RoutePlannerModel {
   public exit_candidate_ms = 0;
   public exit_candidate_cm = 0;
   public exit_candidate_pending = false;
+  /* 短连接/普通偏边出口的“同侧连续采样”：side 1 = 负位置、2 = 正位置。
+   * 换侧即清零，避免把扫线时的一帧当出口（route.h short_exit_edge_*）。 */
+  public short_exit_edge_side = 0;
+  public short_exit_edge_samples = 0;
   public repeat_action: Action = Action.LEFT;
   public repeat_count = ROUTE_REPEAT_COUNT;
   public completed_laps = 0;
@@ -439,12 +447,19 @@ export class RoutePlannerModel {
 
   public stop_callback?: (step_index: number) => void;
 
-  public init(steps: RouteStep[], callback?: (step_index: number) => void): void {
+  public init(steps: RouteStep[], callback?: (step_index: number) => void,
+    startPose?: RouteStartPose): void {
     this.steps = steps.map((s) => ({ ...s }));
     this.count = steps.length;
     this.repeat_count = ROUTE_REPEAT_COUNT;
     this.repeat_action = Action.LEFT;
     this.stop_callback = callback;
+    /* Table-selected scenario anchor (route_scenario_start_pose): the compiled
+     * table may re-anchor the track frame (scheme 8 ring test starts at
+     * (345,110) heading south); otherwise the production P(0,110) north. */
+    this.start_x_cm = startPose ? startPose.x_cm : ROUTE_START_X_CM;
+    this.start_y_cm = startPose ? startPose.y_cm : ROUTE_START_Y_CM;
+    this.start_heading_rad = startPose ? startPose.heading_rad : ROUTE_START_HEADING_RAD;
     /* Explicit upper bound: over ROUTE_MAX_STEPS must fail, not silently
      * disable pose navigation (motion_config.h route_init). */
     this.valid = steps !== null && steps.length > 0 && steps.length <= ROUTE_MAX_STEPS;
@@ -766,6 +781,17 @@ export class RoutePlannerModel {
     return approach > 0 ? approach : TURN_PIVOT_APPROACH_CM;
   }
 
+  /** C: close_corner_approach_cm(). The row's pivot is placed on the geometric
+   * corner instead of a fixed straight distance, so a resistor right in front
+   * of the corner cannot start the pivot ~10 cm early. Table value, segment
+   * gate, counting, angle and speed are untouched. */
+  private closeCornerApproachCm(d: number): number {
+    const s = this.steps[this.index];
+    if (!(s.segment_length_cm > 0)) return 0;
+    const corner = this.origin_cm + s.segment_length_cm + ROUTE_WAYPOINT_MARGIN_CM;
+    return Math.max(0, corner - d);
+  }
+
   /** Mirror of route_bar_hold_active(): the latched transverse bar keeps the
    * confirmed entry heading for the row's configured straight distance. */
   public barHoldActive(d: number): boolean {
@@ -786,7 +812,8 @@ export class RoutePlannerModel {
   /** Candidate cancellation / side change only unbinds the bar; it never
    * cancels the steering hold (C: unbind_bar_hold). */
   private unbindBarHold(): void {
-    if (this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_PENDING) {
+    if (this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_PENDING ||
+      this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_SIDE) {
       this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_PASS;
     }
   }
@@ -846,14 +873,31 @@ export class RoutePlannerModel {
           this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
         }
       }
-      return;
+      /* A full transverse bar may follow the partial edge of the SAME live
+       * candidate. Give it its own anchor; a cancelled or confirmed passage
+       * has already become PASS and cannot lend an old symbol to a corner. */
+      if (this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_SIDE &&
+        !this.bar_hold_complete &&
+        this.state === RouteState.ROUTE_CANDIDATE &&
+        o.line_mask === 0xff &&
+        now - this.last_sample_ms <= CONTROL_MAX_INTERVAL_MS) {
+        this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
+      } else {
+        return;
+      }
     }
-    /* Steering freezes on the first filtered 0xFF bar; node confirmation stays
+    /* Steering freezes on the first filtered bar; node confirmation stays
      * independent. An early bar can never be reused after the distance gate. */
     if (!eligible || !phase ||
       this.state === RouteState.ROUTE_BRAKING ||
-      this.state === RouteState.ROUTE_EXECUTING ||
-      o.line_mask !== 0xff) return;
+      this.state === RouteState.ROUTE_EXECUTING) return;
+    const fullBar = o.line_mask === 0xff;
+    /* A side-on transistor first covers only part of the bar (field: 0x1f,
+     * then 0x0f). Hold before its V arm becomes an ordinary narrow line.
+     * This partial observation can only grant passage, never a corner anchor. */
+    const passBranch = !this.targetReady(d, true) &&
+      o.white_count >= 4 && routeGrayShowsBranch(o);
+    if (!fullBar && !passBranch) return;
     this.bar_hold_index = this.index;
     this.bar_hold_origin_cm = d;
     this.bar_hold_heading_rad = h;
@@ -862,7 +906,9 @@ export class RoutePlannerModel {
     this.bar_hold_complete = false;
     this.bar_hold_state = this.state === RouteState.ROUTE_CLEARING
       ? RouteBarHoldState.ROUTE_BAR_HOLD_PASS
-      : RouteBarHoldState.ROUTE_BAR_HOLD_PENDING;
+      : fullBar
+        ? RouteBarHoldState.ROUTE_BAR_HOLD_PENDING
+        : RouteBarHoldState.ROUTE_BAR_HOLD_SIDE;
   }
 
   private beginAction(d: number, h: number, now: number): void {
@@ -886,6 +932,11 @@ export class RoutePlannerModel {
     this.turn_approach_origin_cm = approachOrigin;
     this.turn_approach_cm = Math.max(0.0, this.rowTurnApproachCm() -
       (!explicitApproach && this.pose_mode ? this.pose_trigger_late_cm : 0.0));
+    if (explicitApproach && !this.short_link_active && this.steps[this.index].close_corner) {
+      approachOrigin = d;
+      this.turn_approach_origin_cm = approachOrigin;
+      this.turn_approach_cm = this.closeCornerApproachCm(d);
+    }
     const current = this.currentAction();
     this.turn_approaching = !this.passing_junction &&
       !this.usesCornerArc() &&
@@ -965,6 +1016,13 @@ export class RoutePlannerModel {
   private enterClear(d: number, now: number): void {
     if (this.short_link_tracking && !this.passing_junction && this.line_exit_confirmed &&
       this.index + 1 < this.count && shortLinkLength(this.steps[this.index + 1]) > 0) {
+      /* Pose completion also sets line_exit_confirmed without grey evidence.
+       * An explicit link must first pass the existing bounded real-exit search;
+       * both grey exit paths supply LINE_CONFIRM_SAMPLES before entering here. */
+      if (this.exit_count < LINE_CONFIRM_SAMPLES) {
+        this.beginTurnExitSearch(d, now);
+        return;
+      }
       if (Math.abs(this.line_exit_heading_rad - this.short_link_heading) > SHORT_LINK_MAX_HEADING_RAD) {
         this.short_link_tracking = false;
       } else {
@@ -1008,6 +1066,7 @@ export class RoutePlannerModel {
     this.capture_line_cm = d;
     this.capture_line_samples = this.exit_count = 0;
     this.exit_candidate_pending = false;
+    this.short_exit_edge_side = this.short_exit_edge_samples = 0;
     this.turn_capturing = this.capture_line_seen = this.line_exit_confirmed = false;
     this.turn_ended_on_line = false;
     this.turn_rewind_active = this.turn_rewind_pending = false;
@@ -1051,22 +1110,64 @@ export class RoutePlannerModel {
     else if (this.exit_count < LINE_CONFIRM_SAMPLES) this.exit_count++;
     this.capture_line_samples = this.exit_count;
     let confirmed = this.exit_count >= LINE_CONFIRM_SAMPLES;
-    /* 2026-11-10 实车（索引 9 → 环岛）：搜索只保持出口航向、冻结灰度位置 PID，
-     * 枢轴留下的横向残差会让真正的出口线一直停在 8 路杆最外侧（0x03,
-     * position=-6），在 12 cm 预算内不可能自己回中；旧的“连续 3 帧居中”规则
-     * 必然超限 EXIT_RECAPTURE，车停在环岛斜边与 x=345 线的交点之前。
-     * 持续可见的窄单区域线本身就是出口证据，交给离口位置 PID 回中即可；
-     * 宽线/多区域/空心图形和单帧笔画仍不满足下面的稳定窗口。 */
-    if (narrowExit && !shortExit && !confirmed) {
-      if (!this.exit_candidate_pending) {
-        this.exit_candidate_pending = true;
-        this.exit_candidate_ms = now;
-        this.exit_candidate_cm = d;
-      } else if (now - this.exit_candidate_ms >= JUNCTION_EXIT_SEARCH_EDGE_STABLE_MS &&
-        d - this.exit_candidate_cm >= JUNCTION_EXIT_SEARCH_EDGE_STABLE_CM) {
-        confirmed = true;
+    if (shortExit) {
+      /* Q13 leaves only a brief, same-side edge window before the 12 cm
+       * deadline. Keep the fast +/-3 exit; farther edges need both time and
+       * travel, with every sample qualified by the outgoing heading above. */
+      if (narrowExit && Number.isFinite(o.position) && Math.abs(o.position) > positionLimit) {
+        const side = o.position < 0 ? 1 : 2;
+        if (!this.exit_candidate_pending || this.short_exit_edge_side !== side) {
+          this.exit_candidate_pending = true;
+          this.exit_candidate_ms = now;
+          this.exit_candidate_cm = d;
+          this.short_exit_edge_side = side;
+          this.short_exit_edge_samples = 0;
+        }
+        if (this.short_exit_edge_samples < LINE_CONFIRM_SAMPLES) this.short_exit_edge_samples++;
+        if (this.short_exit_edge_samples >= LINE_CONFIRM_SAMPLES &&
+          now - this.exit_candidate_ms >= JUNCTION_SHORT_LINK_EXIT_EDGE_STABLE_MS &&
+          d - this.exit_candidate_cm >= JUNCTION_SHORT_LINK_EXIT_EDGE_STABLE_CM) {
+          confirmed = true;
+          /* enter_clear also requires a real multi-frame exit proof. */
+          this.capture_line_samples = this.exit_count = LINE_CONFIRM_SAMPLES;
+        }
+      } else {
+        this.exit_candidate_pending = false;
+        this.short_exit_edge_side = this.short_exit_edge_samples = 0;
       }
-    } else if (!narrowExit) this.exit_candidate_pending = false;
+    }
+    if (!shortExit) {
+      /* The ordinary exit can first appear near the end of the 12 cm search
+       * (field: +5 -> +4 for 165 ms / 2.59 cm). Require a stable same-side
+       * line aligned with the outgoing axis, then let clearance PID recenter.
+       * 2026-11-10 实车（索引 9 → 环岛）：搜索只保持出口航向、冻结灰度位置 PID，
+       * 枢轴留下的横向残差会让真正的出口线一直停在 8 路杆最外侧（0x03,
+       * position=-6）。持续可见且与出口轴对齐的窄单区域线就是出口证据，交给
+       * 离口位置 PID 回中；宽线/多区域/空心图形和单帧笔画仍不满足稳定窗口。 */
+      const edge = narrowExit && Number.isFinite(o.position) && !centered &&
+        Math.abs(h - (this.entry_heading + this.turnTargetRad())) <=
+        JUNCTION_EXIT_SEARCH_EDGE_HEADING_RAD;
+      if (edge && !confirmed) {
+        const side = o.position < 0 ? 1 : 2;
+        if (!this.exit_candidate_pending || this.short_exit_edge_side !== side) {
+          this.exit_candidate_pending = true;
+          this.exit_candidate_ms = now;
+          this.exit_candidate_cm = d;
+          this.short_exit_edge_side = side;
+          this.short_exit_edge_samples = 0;
+        }
+        if (this.short_exit_edge_samples < LINE_CONFIRM_SAMPLES) this.short_exit_edge_samples++;
+        if (this.short_exit_edge_samples >= LINE_CONFIRM_SAMPLES &&
+          now - this.exit_candidate_ms >= JUNCTION_EXIT_SEARCH_EDGE_STABLE_MS &&
+          d - this.exit_candidate_cm >= JUNCTION_EXIT_SEARCH_EDGE_STABLE_CM) {
+          confirmed = true;
+          this.capture_line_samples = this.exit_count = LINE_CONFIRM_SAMPLES;
+        }
+      } else {
+        this.exit_candidate_pending = false;
+        this.short_exit_edge_side = this.short_exit_edge_samples = 0;
+      }
+    }
     if (!confirmed) return;
     this.exit_candidate_pending = false;
     this.turn_exit_search = false;
@@ -1546,16 +1647,20 @@ export class RoutePlannerModel {
     this.pose_mode = Number.isFinite(axle_x_cm) && Number.isFinite(axle_y_cm) &&
       this.pose_enabled && this.count > 0 && this.waypoint_x_cm.length === this.count;
     if (this.pose_mode && this.waypoint_x_cm.length === this.count) {
-      const wh0 = h - Math.PI / 2;
-      const sx0 = axle_x_cm + GRAY_FORWARD_OFFSET_CM * Math.cos(wh0);
-      const sy0 = axle_y_cm + GRAY_FORWARD_OFFSET_CM * Math.sin(wh0);
+      /* h is the mileage heading relative to START (START aligns 0), so the
+       * world heading is start_heading + h.  The old code hard-coded h - PI/2
+       * (the production P-north anchor); a scenario that starts southward put
+       * the 24 cm bar behind the car and flipped every segment heading by 180°. */
+      const wh = h + this.start_heading_rad;
+      const sx0 = axle_x_cm + GRAY_FORWARD_OFFSET_CM * Math.cos(wh);
+      const sy0 = axle_y_cm + GRAY_FORWARD_OFFSET_CM * Math.sin(wh);
       this.pose_gap_bar_cm = Math.hypot(
         sx0 - this.waypoint_x_cm[this.index],
         sy0 - this.waypoint_y_cm[this.index]
       );
       this.pose_bearing_rad =
         Math.atan2(this.waypoint_y_cm[this.index] - axle_y_cm,
-          this.waypoint_x_cm[this.index] - axle_x_cm) + Math.PI / 2;
+          this.waypoint_x_cm[this.index] - axle_x_cm) - this.start_heading_rad;
       const px = this.index > 0 ? this.waypoint_x_cm[this.index - 1] : this.start_x_cm;
       const py = this.index > 0 ? this.waypoint_y_cm[this.index - 1] : this.start_y_cm;
       const dx = this.waypoint_x_cm[this.index] - px;
@@ -1567,10 +1672,10 @@ export class RoutePlannerModel {
           (-(axle_x_cm - px) * dy + (axle_y_cm - py) * dx) / len;
         // The bar sits 24 cm ahead; a heading error shifts its lateral offset.
         const segH = Math.atan2(dy, dx);
-        const worldH = h - Math.PI / 2;
         this.pose_cross_bar_cm =
-          this.pose_cross_cm + GRAY_FORWARD_OFFSET_CM * Math.sin(worldH - segH);
-        this.pose_seg_heading_rad = segH + Math.PI / 2;
+          this.pose_cross_cm + GRAY_FORWARD_OFFSET_CM * Math.sin(wh - segH);
+        // World direction -> mileage-relative heading (0 = start heading).
+        this.pose_seg_heading_rad = segH - this.start_heading_rad;
         this.pose_cross_valid = true;
       } else {
         // Degenerate (zero-length) row: there is no segment line, so hold the
@@ -2079,6 +2184,81 @@ export class RoutePlannerModel {
       d - this.clear_cm > JUNCTION_CLEAR_MAX_CM
     ) {
       this.fail(RouteFailure.ROUTE_FAILURE_ACTION_TIMEOUT);
+      return;
+    }
+
+    /* A passed symbol can be followed by the target corner at the 2 cm
+     * boundary. Carry only a real, continuous center corridor across the pose
+     * clearance reset, then let the ordinary candidate consume this frame. */
+    if (this.pose_mode && this.passing_junction) {
+      const shape = junctionShape(o);
+      const branch = shape.kind !== JunctionEvidence.JUNCTION_EVIDENCE_NONE;
+      const center = routeIsNarrowLine(o) && !branch &&
+        o.white_count <= JUNCTION_STRAIGHT_EXIT_MAX_WIDTH &&
+        Math.abs(o.position) <= JUNCTION_CENTER_LIMIT;
+      if (adjacent && center) {
+        if (!this.exit_candidate_pending) {
+          this.exit_candidate_pending = true;
+          this.exit_candidate_ms = now;
+          this.exit_candidate_cm = d;
+          this.exit_count = 0;
+        }
+        if (this.exit_count < LINE_CONFIRM_SAMPLES) this.exit_count++;
+        if (this.exit_count >= LINE_CONFIRM_SAMPLES &&
+          now - this.exit_candidate_ms >= JUNCTION_ADJACENT_EXIT_MS &&
+          d - this.exit_candidate_cm >= JUNCTION_ADJACENT_EXIT_CM) {
+          this.have_approach_center = true;
+          this.approach_center_ms = now;
+          this.approach_center_cm = d;
+        }
+      } else {
+        this.exit_count = 0;
+        this.exit_candidate_pending = false;
+        if (!adjacent || !branch) this.have_approach_center = false;
+      }
+      const history = adjacent && this.have_approach_center &&
+        now - this.approach_center_ms < JUNCTION_CENTER_MEMORY_MS &&
+        d >= this.approach_center_cm &&
+        d - this.approach_center_cm <= JUNCTION_CENTER_MEMORY_CM;
+      if (!history) this.unbindBarHold();
+      /* A new bar after the proven corridor owns its own first sample, even
+       * if it starts just before clearance completes. Never promote the
+       * resistor's PASS hold, or restart this new bar on subsequent frames. */
+      if (history && branch && o.line_mask === 0xff && (s.turn_approach_cm ?? 0) > 0 &&
+        !s.corner_arc_enabled && (s.short_link_cm ?? 0) === 0 &&
+        (s.action === Action.LEFT || s.action === Action.RIGHT ||
+          s.action === Action.CUSTOM_TURN) &&
+        this.bar_hold_state !== RouteBarHoldState.ROUTE_BAR_HOLD_PENDING) {
+        this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_PENDING;
+        this.bar_hold_index = this.index;
+        this.bar_hold_origin_cm = d;
+        this.bar_hold_heading_rad = h;
+        this.bar_hold_ms = now;
+        this.bar_hold_clear_count = 0;
+        this.bar_hold_complete = false;
+      }
+      /* 特例（用户明确允许）：R17 紧接 (275,0) 的 95 cm 行。电阻的 2 cm 离口屏蔽
+       * 正好盖住紧随的真实角点横杠：等屏蔽结束时角点笔画已经消失，只能记到
+       * 下一个路口才转（现场索引 14 的“过了”）。该行在已证实的中心走廊之后
+       * 只要求 0.3 cm 就交回正常候选流程；角点仍须自己完成连续帧/位移确认，
+       * 段距门禁、计数和解口去重其它行均不变。 */
+      const closeRow = this.steps[this.index].close_corner === true;
+      const clearDistance = closeRow ? JUNCTION_ADJACENT_EXIT_CM : ROUTE_CLEAR_POSE_CM;
+      if (d - this.clear_cm < clearDistance || (branch && !history)) return;
+      const centerMs = this.approach_center_ms;
+      const centerCm = this.approach_center_cm;
+      if (history && this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_PASS &&
+        (branch || this.targetReady(d, false))) {
+        this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
+      }
+      if (!this.completeClear(d, now) || !history) return;
+      this.have_approach_center = true;
+      this.approach_center_count = LINE_CONFIRM_SAMPLES;
+      this.approach_center_ms = centerMs;
+      this.approach_center_cm = centerCm;
+      /* Same frame, now in FOLLOW: the ordinary candidate consumes it
+       * (C re-enters route_update_pose after the clearance reset). */
+      this.update(o, d, h, now, axle_x_cm, axle_y_cm);
       return;
     }
 
