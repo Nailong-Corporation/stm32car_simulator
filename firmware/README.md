@@ -96,3 +96,16 @@ Verification: `npx tsc --noEmit` passes, `npm test` exits 0 with current known
 route stops reported as `KNOWN`, and `node tests/firmware_parity.mjs` matches
 schemes 1-8 frame-for-frame (maximum target error 0.0043 cm/s, no threshold
 frames).
+
+## 2026-11-12 current `main` at `d37f266` (simulator sync in progress)
+
+The bundled C route table now matches the firmware main snapshot, including
+schemes 0-9, start poses and route parameter changes. The simulator also mirrors
+the new dashed-row behavior, minimum end-bar width, long transistor approach,
+R25 exit-search extension, and 1 cm early short-link pivot.
+
+The firmware's outgoing-axis distance carry between marked geometric corners
+and the complete Q16/Q18/Q22 pivot tracking logic are not yet fully ported. New
+C/TypeScript frame parity has not been established. `npm run build`, `npx
+tsc --noEmit`, and `npm test` passed; the full-lap suite reports current vehicle
+model stops as `KNOWN`.
