@@ -135,7 +135,7 @@ console.log('PASS: short-link projected turn-in geometry stays unchanged for 0/4
 {
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
   assert.equal(parsed.activeSchemeId, 4); /* firmware ROUTE_SCHEME_SELECT=4 */
-  assert.equal(parsed.schemes.length, 8);
+  assert.equal(parsed.schemes.length, 9); /* 0..8: firmware 2e751de adds the scheme-8 ring test */
   for (const scheme of parsed.schemes) {
     for (const s of scheme.steps) {
       assert.equal(s.corner_arc_enabled, false);

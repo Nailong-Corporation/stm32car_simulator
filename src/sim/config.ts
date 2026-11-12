@@ -178,6 +178,10 @@ export const JUNCTION_CENTER_LIMIT = 2.0;
 /* 显式短连接到角找线：位置权重 ±3 约为探头观测中心偏移 ±1.65 cm。
  * 仍须单区至多3路、连续3帧、出口航向合格；普通出口保留 ±2。 */
 export const JUNCTION_SHORT_LINK_EXIT_POSITION_LIMIT = 3.0;
+/* 2026-11-11 Q13（mirror motion_config.h）：三路偏边出口只在搜索截止前约 55 ms
+ * 可见，短连接另需同侧连续采样、实际前进，不能把单帧扫线当出口。 */
+export const JUNCTION_SHORT_LINK_EXIT_EDGE_STABLE_MS = 50;
+export const JUNCTION_SHORT_LINK_EXIT_EDGE_STABLE_CM = 0.5;
 export const JUNCTION_CAPTURE_MIN_RAD = 0.70;
 export const JUNCTION_CLEAR_MAX_CM = 20.0;
 // Normal tracking limits common target lead instead of cutting just the inner wheel.
@@ -203,13 +207,17 @@ export const JUNCTION_YAW_FILTER_TAU_S = 0.030;
 export const JUNCTION_EXIT_SEARCH_SPEED_CM_S = 16.0;
 export const JUNCTION_EXIT_SEARCH_MAX_CM = 12.0;
 export const JUNCTION_EXIT_SEARCH_TIMEOUT_MS = 1200;
-/* 2026-11-10 实车（索引 9，Q13 左转 90° 后去环岛）：搜索期间灰度 PID 冻结、
+/* 2026-11-11 固件收窄：Q13 的三路偏边出口在搜索截止前只剩约 55 ms / 2.59 cm
+ * 可见，250 ms / 6 cm 的窗口永远来不及，必然 EXIT_RECAPTURE。现在普通出口
+ * 只要求 100 ms / 0.5 cm，但每帧都必须满足“同侧 + 与出口轴对齐”这一条。
+ * 2026-11-10 实车（索引 9，Q13 左转 90° 后去环岛）：搜索期间灰度 PID 冻结、
  * 只按出口航向直行，枢轴留下的横向残差让出口线停在 8 路杆最外侧（0x03，
- * position=-6），旧的“连续 3 帧居中 ±2”在 12 cm 预算内永远不成立。
- * 持续可见的窄单区域线本身就是出口证据，交给离口位置 PID 回中；但必须连续
- * 可见 250 ms / 6 cm，单帧笔画与扫线残影仍不算出口。 */
-export const JUNCTION_EXIT_SEARCH_EDGE_STABLE_MS = 250;
-export const JUNCTION_EXIT_SEARCH_EDGE_STABLE_CM = 6.0;
+ * position=-6）。持续可见的窄单区域线本身就是出口证据，交给离口位置 PID
+ * 回中；但必须连续可见，单帧笔画与扫线残影仍不算出口。 */
+export const JUNCTION_EXIT_SEARCH_EDGE_STABLE_MS = 100;
+export const JUNCTION_EXIT_SEARCH_EDGE_STABLE_CM = 0.5;
+/* 偏边出口还要求逐帧出口轴航向差不超过该值。 */
+export const JUNCTION_EXIT_SEARCH_EDGE_HEADING_RAD = 0.30;
 export const JUNCTION_EXIT_SPEED_CM_S = 20.0;
 export const COMPONENT_RECOVERY_SPEED_CM_S = 60.0;
 export const COMPONENT_RECOVERY_MAX_CM = 12.0;

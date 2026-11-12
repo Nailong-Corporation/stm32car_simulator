@@ -1,9 +1,12 @@
-import { Action, type RouteStep } from './types';
+import { Action, type RouteStartPose, type RouteStep } from './types';
 
 export interface ParsedScheme {
   id: number;
   name: string;
   steps: RouteStep[];
+  /* Table-selected start anchor (route_scenario_start_pose). Omitted = the
+   * production P(0,110) north anchor from motion_config.h. */
+  start_pose?: RouteStartPose;
 }
 
 export interface ParseResult {
@@ -148,6 +151,11 @@ export function parseRouteTableC(sourceCode: string): ParseResult {
     { id: 1, name: '方案 1 (正式全元件：走虚线+环岛)', steps: [] },
     { id: 2, name: '方案 2 (不走虚线，走环岛)', steps: [] },
     { id: 3, name: '方案 3 (外框测试圈)', steps: [] },
+    { id: 4, name: '方案 4 (走虚线、不进环岛：固件默认)', steps: [] },
+    { id: 5, name: '方案 5 (快速版：走虚线+环岛)', steps: [] },
+    { id: 6, name: '方案 6 (快速版：不走虚线+环岛)', steps: [] },
+    { id: 7, name: '方案 7 (快速版：外框测试圈)', steps: [] },
+    { id: 8, name: '方案 8 (环岛单独测试)', steps: [] },
   ];
 
   let currentSchemeId: number | null = null;
@@ -257,6 +265,51 @@ export function parseRouteTableC(sourceCode: string): ParseResult {
     activeSchemeId = 0;
   }
 
+  /* route_scenario_start_pose(): a #if gate of scheme ids selects a table
+   * anchor other than the production P(0,110)-north one. The scheme-8 ring test
+   * starts on the x=345 approach heading south; other tables keep the default. */
+  const startPoseMatch = sourceCode.match(
+    /#if\s*\(([^)\n]*ROUTE_SCHEME_SELECT[^)\n]*)\)[\s\S]*?static const RouteStartPose\s+route_scenario_pose\s*=\s*\{([^}]*)\}/);
+  if (startPoseMatch) {
+    const ids = [...startPoseMatch[1].matchAll(/ROUTE_SCHEME_SELECT\s*==\s*(\d+)/g)]
+      .map((m) => Number(m[1]));
+    const values = startPoseMatch[2].split(',')
+      .map((v) => Number(v.trim().replace(/[fF]$/, '')))
+      .filter((v) => Number.isFinite(v));
+    if (ids.length > 0 && values.length >= 3) {
+      for (const scheme of validSchemes) {
+        if (ids.includes(scheme.id)) {
+          scheme.start_pose = { x_cm: values[0], y_cm: values[1], heading_rad: values[2] };
+        }
+      }
+    }
+  }
+
+  /* route_scenario_close_corner(): the table marks one row by content, not by
+   * index — 95 cm segment, -90° CUSTOM_TURN, the ordinary right-angle pivot
+   * distance, immediately after a 215/220 cm leg — and only for the schemes its
+   * own #if gate lists. Marking here keeps the planner free of table knowledge. */
+  const closeGate = sourceCode.match(
+    /route_scenario_close_corner\s*\([^)]*\)\s*\{[\s\S]*?#if\s*\(([^)]*ROUTE_SCHEME_SELECT[^)]*)\)/);
+  const closeIds = closeGate
+    ? [...closeGate[1].matchAll(/ROUTE_SCHEME_SELECT\s*==\s*(\d+)/g)].map((m) => Number(m[1]))
+    : validSchemes.map((s) => s.id);
+  const rightAngleApproach = defines.get('TURN_RIGHT_ANGLE_STRAIGHT_CM') ?? 9;
+  for (const scheme of validSchemes) {
+    if (!closeIds.includes(scheme.id)) continue;
+    for (let i = 1; i < scheme.steps.length; ++i) {
+      const row = scheme.steps[i];
+      const prev = scheme.steps[i - 1].segment_length_cm;
+      if (row.action === Action.CUSTOM_TURN && (row.short_link_cm ?? 0) === 0 &&
+        row.segment_length_cm === 95 && row.angle_deg === -90 &&
+        (prev === 215 || prev === 220) &&
+        Math.abs((row.turn_approach_cm ?? 0) - rightAngleApproach) < 0.002) {
+        row.close_corner = true;
+        break;
+      }
+    }
+  }
+
   const selected = validSchemes.find((s) => s.id === activeSchemeId) || validSchemes[0];
 
   return {
@@ -291,6 +344,23 @@ export const DEFAULT_ROUTE_TABLE_C = `#include "route.h"
 #ifndef ROUTE_SCHEME_SELECT
 #define ROUTE_SCHEME_SELECT 4
 #endif
+
+/* 起跑位姿锚点（世界坐标：x 向东、y 向南）。
+ * 方案 8 是单独的环岛测试，应从环岛北侧 x=345 的主线（y=110 路口）朝南出发：
+ * HEXAGON 的环岛几何固定为右顶点 (345,165)、中心 (310,165)。如果仍用生产起点
+ * P(0,110) 朝北，车与右顶点相距约 380 cm，而入环阶段只允许直行
+ * HEXAGON_ENTRY_APPROACH_MAX_CM(35 cm)，必然 ENTRY_SPEED 后丢线停车。
+ * 2026-11-11 只读现场（方案 8）：第 0 行 HEXAGON 在 d≈24 已确认环岛入口，
+ * 但 d=84.7 的底部 T 口被当成入环口再次动作，d≈119.7 ENTRY_SPEED，恢复 12 cm
+ * 后 EXIT_LOST 停车；hexagon.state 始终没到 FOLLOWING —— 即“不进入环岛”。
+ * 其它方案（生产 1–7、调试 0）仍锚在 P。 */
+#if (ROUTE_SCHEME_SELECT == 8 || ROUTE_SCHEME_SELECT == 1)
+static const RouteStartPose route_scenario_pose={345.0f,110.0f,1.570796327f}; /* +pi/2 = 朝南 */
+#else
+static const RouteStartPose route_scenario_pose={ROUTE_START_X_CM,ROUTE_START_Y_CM,
+    ROUTE_START_HEADING_RAD};
+#endif
+const RouteStartPose *route_scenario_start_pose(void) { return &route_scenario_pose; }
 
 const RouteStep route[] = {
 #if (ROUTE_SCHEME_SELECT == 0)
@@ -386,10 +456,10 @@ const RouteStep route[] = {
     /* 走虚线、不进六边形环岛（普通） */
     { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 0: P 北上至 (0,0)；几何 110 - 5 = 105 cm */
     { 2, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   30.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 1: 顶边东至 (55,0)；R2 在上一转弯传感器扫过区内，不再计数；几何 55 - 5 = 50 cm */
-    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  135.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 2: x55 南下至 (55,140)，过 R3；几何 140 - 5 = 135 cm */
-    { 3, 28.0f, CUSTOM_TURN,  80,    90.0f,false,  185.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM + 5.0f}, /* 3: y140 东至 Q6(245,140)，右转南下；Q4 位于上一转弯传感器扫过区，计 R5/目标；几何 190 - 5 = 185 cm */
+    { 2, 28.0f, CUSTOM_TURN,  120,   -90.0f,false,  135.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 2: x55 南下至 (55,140)，过 R3；几何 140 - 5 = 135 cm */
+    { 3, 28.0f, CUSTOM_TURN,  160,    90.0f,false,  185.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM + 5.0f}, /* 3: y140 东至 Q6(245,140)，右转南下；Q4 位于上一转弯传感器扫过区，计 R5/目标；几何 190 - 5 = 185 cm */
     { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   25.0f, 30.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 4: x245 南下至 (245,170)；几何 30 - 5 = 25 cm */
-    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  130.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 5: y170 西至 (95,170)，过 Q11；几何 150 - 5 = 145 cm */
+    { 2, 28.0f, CUSTOM_TURN,  120,   -90.0f,false,  130.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 5: y170 西至 (95,170)，过 Q11；几何 150 - 5 = 145 cm */
     { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   45.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 6: x95 南下至 (95,220)；几何 50 - 5 = 45 cm */
     /* 2026-11-10 实车：角点在段进度239.61确认，275门禁247.15已晚7.54 cm。
      * 本行按动作完成点的实测里程校准为265，门禁237.15；前节点205.56仍只通过。
@@ -399,14 +469,14 @@ const RouteStep route[] = {
     { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 8: x375 北上至 (375,110)，过 R12；几何 110 - 5 = 105 cm */
     { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   25.0f, 30.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 9: y110 西至 Q13(345,110)；几何 30 - 5 = 25 cm */
     //{ 1, 28.0f, HEXAGON    ,  80,   360.0f,false,   50.0f, 0.0f, 0.0f}, /* 10: HEXAGON：x345 南下入环（北进），绕环一周后从南侧 x345 出环到 (345,220)；几何 55 - 5 = 50 cm */
-    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  100.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM + 5.0f}, /* 11: x345 南下至 (345,220)；几何 55 - 5 = 50 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   90, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM + 5.0f}, /* 11: x345 南下至 (345,220)；几何 55 - 5 = 50 cm */
     { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   25.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 12: 底边东至 (375,220)，左转北上；几何 30 - 5 = 25 cm */
-    { 6, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  215.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 13: x375 北上至 (375,0)，过 R12/R15/y110/y50；几何 220 - 5 = 215 cm */
-    { 3, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   95.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 14: 顶边西至 (275,0)，过 Q16/R17；几何 100 - 5 = 95 cm */
+    { 5, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  215.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 13: x375 北上至 (375,0)，过 R12/R15/y110/y50；几何 220 - 5 = 215 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   95.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 14: 顶边西至 (275,0)，过 Q16/R17；几何 100 - 5 = 95 cm */
     { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   45.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM + 5.0f}, /* 15: x275 南下至 Q18(275,50)；几何 50 - 5 = 45 cm */
     { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   65.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 16: y50 东至 (345,50)，过 R19；几何 70 - 5 = 65 cm */
     { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   45.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 17: x345 北上至 Q16(345,0)；几何 50 - 5 = 45 cm */
-    { 7, 28.0f, CUSTOM_TURN,  100,   -90.0f,false,  245.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 18: 顶边西至 Q22(95,0)，过 R17/x275/x245/R20/R21；几何 250 - 5 = 245 cm */
+    { 7, 28.0f, CUSTOM_TURN,  160,   -90.0f,false,  245.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 18: 顶边西至 Q22(95,0)，过 R17/x275/x245/R20/R21；几何 250 - 5 = 245 cm */
     { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 19: x95 南下至 (95,40)；几何 40 - 5 = 35 cm */
     { 2, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   65.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 20: y40 东至 (165,40)，过 R23；几何 70 - 5 = 65 cm */
     { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 21: x165 南下至 (165,80)；几何 40 - 5 = 35 cm */
@@ -491,8 +561,59 @@ const RouteStep route[] = {
     { 6, 64.0f, CUSTOM_TURN, 260,    90.0f,false,  370.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 3: 外框 3：底边西至 (0,220)；几何 375 - 5 = 370 cm */
     { 2, 64.0f, STOP       , 260,     0.0f,false,  105.0f, 0.0f, 0.0f}, /* 4: 外框 4：x0 北上至 P；几何 110 - 5 = 105 cm */
 
+#elif (ROUTE_SCHEME_SELECT == 8)
+    /* 临时方案 */
+    { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 0: P 北上至 (0,0)；几何 110 - 5 = 105 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   30.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 1: 顶边东至 (55,0)；R2 在上一转弯传感器扫过区内，不再计数；几何 55 - 5 = 50 cm */
+    { 2, 28.0f, CUSTOM_TURN,  120,   -90.0f,false,  135.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 2: x55 南下至 (55,140)，过 R3；几何 140 - 5 = 135 cm */
+    { 3, 28.0f, CUSTOM_TURN,  160,    90.0f,false,  185.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM + 5.0f}, /* 3: y140 东至 Q6(245,140)，右转南下；Q4 位于上一转弯传感器扫过区，计 R5/目标；几何 190 - 5 = 185 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   25.0f, 30.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 4: x245 南下至 (245,170)；几何 30 - 5 = 25 cm */
+    { 2, 28.0f, CUSTOM_TURN,  120,   -90.0f,false,  130.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 5: y170 西至 (95,170)，过 Q11；几何 150 - 5 = 145 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   45.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 6: x95 南下至 (95,220)；几何 50 - 5 = 45 cm */
+    /* 2026-11-10 实车：角点在段进度239.61确认，275门禁247.15已晚7.54 cm。
+     * 本行按动作完成点的实测里程校准为265，门禁237.15；前节点205.56仍只通过。
+     * 几何原长280不变；此列现为实车门禁标定值，生成器会覆盖手工标定。 */
+    { 5, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  265.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 7: 底边东至 (375,220)，过 R8/R9/R10；段距门禁实车校准265 cm */
+    // 右下角
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 8: x375 北上至 (375,110)，过 R12；几何 110 - 5 = 105 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   25.0f, 30.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 9: y110 西至 Q13(345,110)；几何 30 - 5 = 25 cm */
+    //{ 1, 28.0f, HEXAGON    ,  80,   360.0f,false,   50.0f, 0.0f, 0.0f}, /* 10: HEXAGON：x345 南下入环（北进），绕环一周后从南侧 x345 出环到 (345,220)；几何 55 - 5 = 50 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   90, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM + 5.0f}, /* 11: x345 南下至 (345,220)；几何 55 - 5 = 50 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   25.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 12: 底边东至 (375,220)，左转北上；几何 30 - 5 = 25 cm */
+    { 5, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,  215.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 13: x375 北上至 (375,0)，过 R12/R15/y110/y50；几何 220 - 5 = 215 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   95.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 14: 顶边西至 (275,0)，过 Q16/R17；几何 100 - 5 = 95 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   45.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM + 5.0f}, /* 15: x275 南下至 Q18(275,50)；几何 50 - 5 = 45 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   65.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 16: y50 东至 (345,50)，过 R19；几何 70 - 5 = 65 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   45.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 17: x345 北上至 Q16(345,0)；几何 50 - 5 = 45 cm */
+    { 9, 28.0f, CUSTOM_TURN,  160,   -90.0f,false,  245.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 18: 顶边西至 Q22(95,0)，过 R17/x275/x245/R20/R21；几何 250 - 5 = 245 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   95.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 25: x95 南下至 Q4(95,140)；几何 100 - 5 = 95 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,   -90.0f,false,   35.0f, 40.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 26: y140 西至 (55,140)，左转进入虚线；几何 40 - 5 = 35 cm */
+    { 2, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   75.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 27: x55 虚线仅南下至 (55,220)，过 R26；几何 80 - 5 = 75 cm */
+    { 1, 28.0f, CUSTOM_TURN,  80,    90.0f,false,   50.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 28: 底边西至 (0,220)；几何 55 - 5 = 50 cm */
+    { 2, 28.0f, STOP       ,  80,     0.0f,false,  105.0f, 0.0f, 0.0f},
 #endif
 };
 
 const size_t route_count = sizeof(route) / sizeof(route[0]);
+
+/* 电阻 R17 紧接 (275,0) 角点的 95 cm 行（用户明确允许的特例）。
+ * 按表内容定位：段长 95、-90°、普通直角直走距离，且前一行是 x=375/350 北上
+ * 的长直段（215/220 cm）。不绑定行号，用户手工改表或增删行也不会失效；
+ * 方案 2/6 里 95 cm 的左转行前面是 185 cm 横段，不会被误判。 */
+bool route_scenario_close_corner(const RouteStep *step)
+{
+#if (ROUTE_SCHEME_SELECT == 1 || ROUTE_SCHEME_SELECT == 4 || \\
+     ROUTE_SCHEME_SELECT == 5 || ROUTE_SCHEME_SELECT == 8)
+    for(size_t i=1;i<route_count;++i) {
+        const RouteStep *r=&route[i];
+        float prev=route[i-1].segment_length_cm;
+        if(r->action==CUSTOM_TURN && r->short_link_cm==0.0f &&
+           r->segment_length_cm==95.0f && r->angle_deg==-90.0f &&
+           (prev==215.0f || prev==220.0f) &&
+           fabsf(r->turn_approach_cm-TURN_RIGHT_ANGLE_STRAIGHT_CM)<0.002f)
+            return step==r;
+    }
+#endif
+    (void)step;return false;
+}
 `;
