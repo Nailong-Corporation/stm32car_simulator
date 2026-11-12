@@ -135,14 +135,14 @@ console.log('PASS: short-link projected turn-in geometry stays unchanged for 0/4
 {
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
   assert.equal(parsed.activeSchemeId, 4); /* firmware ROUTE_SCHEME_SELECT=4 */
-  assert.equal(parsed.schemes.length, 9); /* 0..8: firmware 2e751de adds the scheme-8 ring test */
+  assert.equal(parsed.schemes.length, 10); /* schemes 0..9, including the current continuation route */
   for (const scheme of parsed.schemes) {
     for (const s of scheme.steps) {
       assert.equal(s.corner_arc_enabled, false);
       const ordinary = s.action === Action.LEFT || s.action === Action.RIGHT ||
         (s.action === Action.CUSTOM_TURN && Math.abs(s.angle_deg) === 90);
       const approach = s.turn_approach_cm ?? 0;
-      assert.ok(ordinary ? [9, 14, 19].includes(approach) : approach === 0,
+      assert.ok(ordinary ? [9, 14, 15, 19].includes(approach) : approach === 0,
         `ordinary right angles use 9/14/19 cm (Q6 calibration +5); other actions use zero, got ${approach}`);
     }
   }

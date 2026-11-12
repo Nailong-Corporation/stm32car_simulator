@@ -31,6 +31,9 @@ import {
   POSITION_CURVE_SLOWDOWN,
   LINE_CONFIRM_SAMPLES,
   INTERFERENCE_TIMEOUT_MS,
+  DASHED_HOLD_LOSS_MS,
+  DASHED_HOLD_LOSS_CM,
+  DASHED_HOLD_EXTRA_CM,
   INTERFERENCE_MAX_DISTANCE_CM,
   COMPONENT_CROSS_MAX_CM,
   COMPONENT_CROSS_MS,
@@ -86,6 +89,7 @@ import {
   JUNCTION_CROSS_KP,
   POSE_PURSUIT_LOOKAHEAD_CM,
   ROUTE_WAYPOINT_GATE_CM,
+  ROUTE_WAYPOINT_MARGIN_CM,
   HEXAGON_TURN_TOL_RAD,
 } from './config';
 import { OdometryModel, defaultOdometryCalibration } from './odometry';
@@ -483,8 +487,16 @@ export class LineFollowModel {
     const poseBoundedLoss = this.route.pose_mode &&
       (this.route.state === RouteState.ROUTE_FOLLOW ||
         this.route.state === RouteState.ROUTE_CANDIDATE);
-    const lost_ms = poseBoundedLoss ? POSE_BOUNDED_LOSS_MS : INTERFERENCE_TIMEOUT_MS;
-    const lost_cm = poseBoundedLoss ? POSE_BOUNDED_LOSS_CM : INTERFERENCE_MAX_DISTANCE_CM;
+    let lost_ms = poseBoundedLoss ? POSE_BOUNDED_LOSS_MS : INTERFERENCE_TIMEOUT_MS;
+    let lost_cm = poseBoundedLoss ? POSE_BOUNDED_LOSS_CM : INTERFERENCE_MAX_DISTANCE_CM;
+    const dashed_hold = this.route.dashedHold();
+    if (dashed_hold) {
+      lost_ms = DASHED_HOLD_LOSS_MS;
+      lost_cm = DASHED_HOLD_LOSS_CM;
+      const rowLen = this.route.steps[this.route.index]?.segment_length_cm ?? 0;
+      lost_cm = Math.max(lost_cm, rowLen + ROUTE_WAYPOINT_MARGIN_CM + DASHED_HOLD_EXTRA_CM);
+      lost_ms = Math.max(lost_ms, (lost_cm / 10) * 1000);
+    }
     const gray_loss_expired = this.abnormal && !component_crossing &&
       (now_ms - this.last_reliable_ms >= lost_ms ||
         Math.abs(this.odometry.distance_cm - this.abnormal_origin_cm) >= lost_cm);
@@ -746,7 +758,19 @@ export class LineFollowModel {
       return;
     }
 
-    if (this.route.barHoldActive(this.odometry.distance_cm)) {
+    const dashedStraight = dashed_hold && (this.route.state === RouteState.ROUTE_FOLLOW ||
+      this.route.state === RouteState.ROUTE_CANDIDATE || this.route.state === RouteState.ROUTE_CLEARING);
+    if (dashedStraight) {
+      this.state = LineState.LINE_GAP_HOLD;
+      this.pid.reset();
+      if (!this.abnormal) { this.abnormal = true; this.abnormal_origin_cm = this.odometry.distance_cm; }
+      const entering = this.route.state === RouteState.ROUTE_CLEARING && !this.route.passing_junction &&
+        !!this.route.steps[this.route.index + 1]?.dashed_row;
+      const heading = entering ? this.route.entry_heading + this.route.turnTargetRad() : this.route.pose_seg_heading_rad;
+      const correction = HEADING_KP_CM_S_PER_RAD * Math.atan2(Math.sin(heading - this.odometry.heading_rad),
+        Math.cos(heading - this.odometry.heading_rad)) - JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
+      this.straightTargets(base_speed, correction, dt);
+    } else if (this.route.barHoldActive(this.odometry.distance_cm)) {
       /* A transistor stroke must not regain the position PID merely because a
        * non-target node cleared after 2 cm or its candidate was cancelled.
        * Hold the latched entry heading for the row's straight distance. */

@@ -12,6 +12,16 @@ export const SENSOR_MAX_REGION_WIDTH = 6;
 export const SENSOR_CONTINUITY_DISTANCE = 3.0;
 export const SENSOR_CONTINUITY_MARGIN = 1.0;
 export const LINE_CONFIRM_SAMPLES = 3;
+export const DASHED_HOLD_LOSS_MS = 3200;
+export const DASHED_HOLD_LOSS_CM = 50.0;
+export const DASHED_HOLD_EXTRA_CM = 15.0;
+export const DASHED_NODE_MIN_WHITE = 6;
+export const TRANSISTOR_NODE_APPROACH_MAX_CM = 16.85;
+export const TRANSISTOR_PIVOT_LEAD_CM = 0.0;
+export const TRANSISTOR_PIVOT_APPROACH_MIN_CM = 12.0;
+export const SHORT_LINK_TURN_EARLY_CM = 1.0;
+export const EXIT_COMPONENT_EXTEND_ENABLED = true;
+
 
 /* Wheel & Vehicle Dimensions */
 /* 2026-11-08 实测轮径改为 4.8 cm（用户更新为 48 mm），左右轮同值。 */
