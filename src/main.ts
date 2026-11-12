@@ -198,8 +198,14 @@ class App {
 
     this.lineFollow.init(sc.steps, (completedStep) => {
       console.log(`Route finished step: ${completedStep}`);
-    });
-    this.vehicleSim.reset();
+    }, sc.start_pose);
+    this.vehicleSim.reset(sc.start_pose
+      ? {
+        x: sc.start_pose.x_cm,
+        y: sc.start_pose.y_cm,
+        heading: sc.start_pose.heading_rad,
+      }
+      : undefined);
     this.timeAccumulator = 0;
     this.isRunning = false;
     this.updateStatusPill();

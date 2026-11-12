@@ -80,3 +80,19 @@ Verification on the simulator side: `npm test` exits 0 (schemes 1/4 now pass Q6
 and reach the ring entrance, `maxIndex=10`), `npm run parity` is frame-identical
 for schemes 1-7 against firmware `59a7268`, and `npm run build` succeeds. The
 firmware repository was not modified.
+
+## 2026-11-12 `2e751de` follow-up (simulator only)
+
+The simulator `dev` branch now mirrors `car_stm32_school_competition` `main` at
+`2e751de`, without modifying the firmware repository. In addition to the
+updated route table (schemes 0-8), it mirrors the partial-bar passage/anchor
+rules, same-side short-link edge confirmation, 100 ms / 0.5 cm ordinary edge
+exit with a 0.30 rad heading gate, the 50 ms / 0.5 cm short-link edge limit,
+the close-corner R17 exception, and the per-scheme start pose. The simulator
+tracks the scheme 1 start-anchor mismatch in issue #4 and mirrors the firmware
+condition while that upstream route-table inconsistency is reviewed.
+
+Verification: `npx tsc --noEmit` passes, `npm test` exits 0 with current known
+route stops reported as `KNOWN`, and `node tests/firmware_parity.mjs` matches
+schemes 1-8 frame-for-frame (maximum target error 0.0043 cm/s, no threshold
+frames).

@@ -22,8 +22,20 @@ export interface RouteStep {
   segment_length_cm: number; /* START / previous action completion -> target; 0 means unknown */
   short_link_cm?: number; /* Explicit full corner spacing; 0/omitted disables dead reckoning. */
   turn_approach_cm?: number;  /* Absolute straight travel after grey confirmation; 0 uses the legacy approach. */
+  /* R17 紧接 (275,0) 角点的 95 cm 行（route_scenario_close_corner）：本行的
+   * 枢轴直走距离改用“到几何角点”的里程。由 route_parser 按表内容标记，不绑定行号。 */
+  close_corner?: boolean;
   comment?: string;        /* Associated comment in route_table.c */
   rawLine?: string;
+}
+
+/* Track-frame start anchor of a compiled table (route.h RouteStartPose).
+ * 0 = +x east, +PI/2 = +y south; heading is absolute, route mile headings are
+ * relative to it (0 = start heading). */
+export interface RouteStartPose {
+  x_cm: number;
+  y_cm: number;
+  heading_rad: number;
 }
 
 export enum RouteState {
@@ -44,6 +56,9 @@ export enum RouteBarHoldState {
   ROUTE_BAR_HOLD_PENDING = 1,
   ROUTE_BAR_HOLD_PASS = 2,
   ROUTE_BAR_HOLD_TARGET = 3,
+  /* 侧向三极管首帧只盖住部分杆（0x1f、0x0f）：先锁航向等它变窄，但这一帧
+   * 不能当角点锚点（route.h ROUTE_BAR_HOLD_SIDE）。 */
+  ROUTE_BAR_HOLD_SIDE = 4,
 }
 
 export enum RouteFailure {
