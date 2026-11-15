@@ -172,20 +172,19 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   assert.equal(scheme1.steps[3].turn_approach_cm, 19, 'Q6 row: 14 cm transistor hold + 5 cm calibration');
   assert.equal(scheme1.steps[7].segment_length_cm, 265, 'bottom-right gate calibrated on the car');
   assert.equal(scheme1.steps[29].action, Action.STOP);
-  /* Firmware 2e751de anchors scheme 1 on the ring-test pose as well. That looks
-   * like a leftover from the scheme-8 test (row 0 still drives 105 cm north from
-   * P); the simulator mirrors the table so parity and the web preview agree, and
-   * the defect is reported in the tracking issue. */
-  assert.ok(scheme1.start_pose, 'scheme 1 mirrors ROUTE_SCHEME_SELECT==1 in route_scenario_start_pose');
-  assert.deepEqual(scheme1.start_pose, { x_cm: 345, y_cm: 110, heading_rad: 1.570796327 });
+  /* 固件 2026-11-13 起 route_scenario_start_pose 只有两段特例：#if 9 →
+   * (375,220) 朝北、#elif 8||10 → (345,110) 朝南；方案 1/4/5 走 #else 的生产
+   * 起点 P(0,110) 朝北。方案 1 不再借用环岛测试锚点。 */
+  assert.equal(scheme1.start_pose, undefined,
+    'scheme 1 uses the production start pose, not the ring-test anchor');
   const scheme4 = parsed.schemes.find((s) => s.id === 4);
   assert.ok(scheme4);
   assert.equal(scheme4.steps.length, 29, 'scheme 4 skips the commented HEXAGON row (29 active rows)');
   assert.equal(scheme4.steps[0].junction_count, 1, 'scheme 4 exit search fixture starts with one node');
-  assert.equal(scheme4.steps[0].turn_speed, 28);
-  assert.equal(scheme4.steps[2].cruise_speed, 120, 'firmware 2e751de: x55 south leg cruises at 120');
-  assert.equal(scheme4.steps[3].cruise_speed, 160, 'firmware 2e751de: Q6 leg cruises at 160');
-  assert.equal(scheme4.steps[5].cruise_speed, 120);
+  assert.equal(scheme4.steps[0].turn_speed, 50);
+  assert.equal(scheme4.steps[2].cruise_speed, 80, 'firmware 2e751de: x55 south leg cruises at 120');
+  assert.equal(scheme4.steps[3].cruise_speed, 80, 'firmware 2e751de: Q6 leg cruises at 160');
+  assert.equal(scheme4.steps[5].cruise_speed, 80);
   assert.equal(scheme4.steps[10].action, Action.CUSTOM_TURN,
     'the commented-out HEXAGON row must not be parsed');
   assert.equal(scheme4.steps[10].junction_count, 2);
@@ -197,20 +196,22 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
     'firmware 2e751de: x375 north leg counts five nodes (R12/R15/y110/y50)');
   assert.equal(scheme4.steps[13].junction_count, 2,
     'firmware 2e751de: top-edge (275,0) row counts Q16/R17');
-  assert.equal(scheme4.steps[14].turn_approach_cm, 19,
+  assert.equal(scheme4.steps[14].turn_approach_cm, 14,
     'Q18 row keeps the 14+5 cm transistor hold');
-  assert.equal(scheme4.steps[17].junction_count, 7,
-    'firmware 59a7268 top-edge Q22 row counts seven nodes');
+  assert.equal(scheme4.steps[16].junction_count, 1,
+    'Q16 row counts the Q16 node only (Q18 is counted by the previous row)');
+  assert.equal(scheme4.steps[17].junction_count, 6,
+    'top-edge Q22 row counts six nodes (R17/x275/x245/R20/R21)');
   assert.equal(scheme4.steps[17].cruise_speed, 160,
     'firmware 2e751de top-edge Q22 row cruises at 160');
   assert.equal(scheme4.steps[7].segment_length_cm, 265);
   assert.equal(scheme4.steps[28].action, Action.STOP);
   /* route_scenario_close_corner(): the R17 row is marked by content, not index,
    * and only for the schemes in the firmware gate {1,4,5,8}. */
-  assert.equal(scheme4.steps[13].close_corner, true,
-    'R17 row (95 cm, -90 deg, after a 215 cm leg) must take the geometric-corner pivot');
-  assert.equal(scheme4.steps.filter((step) => step.close_corner).length, 1,
-    'exactly one close-corner row per table');
+  assert.deepEqual(
+    scheme4.steps.flatMap((step, i) => (step.close_corner ? [i] : [])),
+    [13, 14, 16, 17],
+    'close-corner rows: R17 (95), Q18 (45), Q16 (45 after 65) and Q22 (232)');
   const scheme2 = parsed.schemes.find((s) => s.id === 2);
   assert.ok(scheme2);
   assert.equal(scheme2.steps.some((step) => step.close_corner), false,
@@ -224,6 +225,27 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
     'scheme 8 starts on the x=345 approach heading south');
   assert.equal(scheme8.steps[17].junction_count, 9,
     'scheme 8 top-edge row keeps the nine-node count');
+  /* 方案 9 = 方案 4 的后半程（右下角起跑）；方案 10 = 环岛单独测试的新几何。
+   * 两者都是 2026-11-13 新增的现场调试方案。 */
+  const scheme9 = parsed.schemes.find((s) => s.id === 9);
+  assert.ok(scheme9, 'scheme 9 is the finals-start suffix of scheme 4');
+  assert.equal(scheme9.steps.length, 17);
+  assert.deepEqual(scheme9.start_pose, { x_cm: 375, y_cm: 220, heading_rad: -1.570796327 },
+    'scheme 9 starts at the bottom-right corner heading north');
+  assert.equal(scheme9.steps[0].junction_count, 5,
+    'scheme 9 row 0 is the 215 cm x375 north leg counting five nodes');
+  assert.equal(scheme9.steps[0].segment_length_cm, 215);
+  assert.equal(scheme9.steps[1].close_corner, true,
+    'scheme 9 keeps scheme 4 rows 12..28 verbatim, including the R17 close corner');
+  assert.equal(scheme9.steps[scheme9.steps.length - 1].action, Action.STOP);
+  const scheme10 = parsed.schemes.find((s) => s.id === 10);
+  assert.ok(scheme10, 'scheme 10 is the isolated ring test');
+  assert.equal(scheme10.steps.length, 2);
+  assert.equal(scheme10.steps[0].action, Action.HEXAGON);
+  assert.equal(scheme10.steps[0].segment_length_cm, 50);
+  assert.deepEqual(scheme10.start_pose, { x_cm: 345, y_cm: 110, heading_rad: 1.570796327 },
+    'scheme 10 shares the scheme-8 ring approach anchor');
+
   // ROUTE_REPEAT_COUNT=1 must reach a freshly initialised planner.
   const planner = new RoutePlannerModel();
   planner.init(scheme0.steps);

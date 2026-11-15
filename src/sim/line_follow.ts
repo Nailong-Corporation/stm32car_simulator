@@ -36,6 +36,10 @@ import {
   COMPONENT_CROSS_MS,
   POSE_BOUNDED_LOSS_MS,
   POSE_BOUNDED_LOSS_CM,
+  DASHED_HOLD_LOSS_MS,
+  DASHED_HOLD_LOSS_CM,
+  DASHED_HOLD_EXTRA_CM,
+  ROUTE_WAYPOINT_MARGIN_CM,
   BRAKING_ACCEL_FILTER_TAU_S,
   BRAKING_SAFE_DECEL_CM_S2,
   BRAKING_DISTANCE_MARGIN_CM,
@@ -94,25 +98,10 @@ import { SpeedControlModel } from './speed_control';
 import { Pid } from './pid';
 import { BrakingSlewModel, brakingPlan, brakingDecide, brakingSlew } from './braking_planner';
 
-/** True while the grayscale pattern matches a printed component symbol
- * (hollow resistor interior / symmetric wide graphic band). */
-export function grayIsComponentPattern(o: GrayObservation): boolean {
-  if (
-    o.region_count >= 2 &&
-    (o.line_mask & 0x18) === 0 &&
-    (o.line_mask & 0x03) !== 0 &&
-    (o.line_mask & 0xc0) !== 0
-  ) {
-    return true;
-  }
-  return (
-    o.region_count === 1 &&
-    o.white_count >= 5 &&
-    o.white_count <= 7 &&
-    (o.line_mask & 0x07) !== 0 &&
-    (o.line_mask & 0xe0) !== 0
-  );
-}
+/* 印刷元件图形判定已移到 gray_sensor.ts（固件把它放在 gray_sensor.h 的 inline
+ * 里，route.c 也要用），此处仅转出以保持既有导入路径不变。 */
+import { grayIsComponentPattern } from './gray_sensor';
+export { grayIsComponentPattern };
 
 export class LineFollowModel {
   public state: LineState = LineState.LINE_IDLE;
@@ -182,7 +171,7 @@ export class LineFollowModel {
     seam_mask: 0,
   };
 
-  constructor(steps: RouteStep[] = []) {
+  constructor(steps: RouteStep[] = [], startPose?: RouteStartPose) {
     this.odometry = new OdometryModel(defaultOdometryCalibration());
     this.route = new RoutePlannerModel();
     this.speed = new SpeedControlModel();
@@ -194,7 +183,7 @@ export class LineFollowModel {
       integral_limit: PID_INTEGRAL_LIMIT,
       derivative_tau: PID_DERIVATIVE_TAU_S,
     });
-    this.init(steps);
+    this.init(steps, undefined, startPose);
   }
 
   public init(steps: RouteStep[], callback?: (step_index: number) => void,
@@ -483,8 +472,22 @@ export class LineFollowModel {
     const poseBoundedLoss = this.route.pose_mode &&
       (this.route.state === RouteState.ROUTE_FOLLOW ||
         this.route.state === RouteState.ROUTE_CANDIDATE);
-    const lost_ms = poseBoundedLoss ? POSE_BOUNDED_LOSS_MS : INTERFERENCE_TIMEOUT_MS;
-    const lost_cm = poseBoundedLoss ? POSE_BOUNDED_LOSS_CM : INTERFERENCE_MAX_DISTANCE_CM;
+    /* 虚线行（用户 2026-11-12 实车）：24 cm 前伸杆常正好落在短划之间的空白上，
+     * 那是虚线本身的结构，不是丢线。虚线行（含进入它的那一弯）按位姿航向直行，
+     * 整行的有界丢线窗口按段距放宽到“整行 + 余量”，避免真丢线时一直盲行。 */
+    const dashed_hold = this.route.dashedHold();
+    let lost_ms = dashed_hold ? DASHED_HOLD_LOSS_MS
+      : (poseBoundedLoss ? POSE_BOUNDED_LOSS_MS : INTERFERENCE_TIMEOUT_MS);
+    let lost_cm = dashed_hold ? DASHED_HOLD_LOSS_CM
+      : (poseBoundedLoss ? POSE_BOUNDED_LOSS_CM : INTERFERENCE_MAX_DISTANCE_CM);
+    if (dashed_hold) {
+      const row_len = this.route.index < this.route.count
+        ? this.route.steps[this.route.index].segment_length_cm : 0;
+      lost_cm = Math.max(lost_cm, row_len + ROUTE_WAYPOINT_MARGIN_CM + DASHED_HOLD_EXTRA_CM);
+      /* 时间上限也按整行算（按 10 cm/s 的最慢车速折算）。 */
+      const row_ms = (lost_cm / 10.0) * 1000.0;
+      if (row_ms > lost_ms) lost_ms = row_ms;
+    }
     const gray_loss_expired = this.abnormal && !component_crossing &&
       (now_ms - this.last_reliable_ms >= lost_ms ||
         Math.abs(this.odometry.distance_cm - this.abnormal_origin_cm) >= lost_cm);
@@ -704,7 +707,7 @@ export class LineFollowModel {
       base_speed = Math.min(
         base_speed,
         rolled_corner
-          ? CORNER_ARC_SPEED_CM_S
+          ? Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S)
           : Math.min(step.turn_speed, JUNCTION_EXIT_SPEED_CM_S)
       );
     }
@@ -746,7 +749,35 @@ export class LineFollowModel {
       return;
     }
 
-    if (this.route.barHoldActive(this.odometry.distance_cm)) {
+    /* 出弯清线期与整条虚线行保持出弯轴直行：只在 FOLLOW 抑制会让清线/候选
+     * 回退逻辑在短划边缘重新接管位置 PID，横向追踪会把直线带弯。 */
+    const on_dashed_row = this.route.index < this.route.count &&
+      this.route.steps[this.route.index].dashed_row === true;
+    const entering_dashed = this.route.state === RouteState.ROUTE_CLEARING &&
+      !this.route.passing_junction &&
+      this.route.index + 1 < this.route.count &&
+      this.route.steps[this.route.index + 1].dashed_row === true;
+    const dashed_straight = entering_dashed || (on_dashed_row &&
+      (this.route.state === RouteState.ROUTE_FOLLOW ||
+        this.route.state === RouteState.ROUTE_CANDIDATE ||
+        (this.route.state === RouteState.ROUTE_CLEARING && this.route.passing_junction)));
+    if (dashed_straight) {
+      this.state = LineState.LINE_GAP_HOLD;
+      this.pid.reset();
+      if (!this.abnormal) {
+        this.abnormal = true;
+        this.abnormal_origin_cm = this.odometry.distance_cm;
+      }
+      const heading = entering_dashed
+        ? this.route.entry_heading + this.route.turnTargetRad()
+        : this.route.pose_seg_heading_rad;
+      const correction = HEADING_KP_CM_S_PER_RAD *
+        Math.atan2(Math.sin(heading - this.odometry.heading_rad),
+          Math.cos(heading - this.odometry.heading_rad)) -
+        JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
+      this.straightTargets(base_speed, correction, dt);
+      base_speed = this.base;
+    } else if (this.route.barHoldActive(this.odometry.distance_cm)) {
       /* A transistor stroke must not regain the position PID merely because a
        * non-target node cleared after 2 cm or its candidate was cancelled.
        * Hold the latched entry heading for the row's straight distance. */
@@ -756,7 +787,11 @@ export class LineFollowModel {
         this.abnormal = true;
         this.abnormal_origin_cm = this.odometry.distance_cm;
       }
-      const cap = Math.min(base_speed, Math.min(step.turn_speed, JUNCTION_SETTLE_SPEED_CM_S));
+      /* 固件 2026-11-14：EXECUTING 期间外轮直接按本行 turn_speed（天花板
+       * WHEEL_TARGET_MAX）；其它阶段仍以 base_speed 为上限。 */
+      const cap = this.route.state === RouteState.ROUTE_EXECUTING
+        ? Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S)
+        : Math.min(base_speed, step.turn_speed);
       const correction = HEADING_KP_CM_S_PER_RAD *
         (this.route.bar_hold_heading_rad - this.odometry.heading_rad) -
         JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
@@ -837,21 +872,18 @@ export class LineFollowModel {
         this.state = LineState.LINE_TRACKING;
         this.outerTargets(base, correction, dt);
       } else {
-        // Grey unusable: hold the pose segment direction and pull the car back
-        // onto that segment with the cross-track term (inside the bounded window
-        // while a printed symbol hides the wire or the narrow line is lost).
-        const cross = this.route.pose_cross_cm;
-        const desired = this.route.pose_seg_heading_rad +
-          Math.atan2(-cross, POSE_PURSUIT_LOOKAHEAD_CM);
-        let corr = HEADING_KP_CM_S_PER_RAD *
-          Math.atan2(Math.sin(desired - this.odometry.heading_rad),
-            Math.cos(desired - this.odometry.heading_rad));
-        // Right after a rolling corner the released differential keeps yawing the
-        // car for ~0.1-0.3 s; damping the measured yaw rate stops the drift much
-        // sooner than the cross-track term alone.
-        if (this.inCornerExit()) {
-          corr -= CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s;
-        }
+        /* 灰度不可用：按本段航向保持直行（不用全局 waypoint 链的 pose_cross_cm，
+         * 避免长距离累积/门禁校准偏移在过电阻或短丢线时把车拉偏主线）。 */
+        let corr = HEADING_KP_CM_S_PER_RAD * Math.atan2(
+          Math.sin(this.route.pose_seg_heading_rad - this.odometry.heading_rad),
+          Math.cos(this.route.pose_seg_heading_rad - this.odometry.heading_rad)
+        );
+        /* 滚动转弯刚交出时差速仍在回落，按实测横摆角速度抑制漂移。 */
+        /* 固件用 (arc_just_exited || state==CLEARING)；本分支已限定 route 处于
+         * FOLLOW，CLEARING 的等价条件收敛到 inCornerExit()。 */
+        corr -= this.inCornerExit()
+          ? CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s
+          : STRAIGHT_YAW_DAMPING * this.turn_yaw_rate_rad_s;
         const cap = 0.5 * Math.max(base_speed, 1);
         corr = Math.max(-cap, Math.min(cap, corr));
         this.state = LineState.LINE_GAP_HOLD;
@@ -924,7 +956,7 @@ export class LineFollowModel {
       // speed on the edges with a braking envelope toward the next vertex).
       const outer = x.speed_cm_s > 0
         ? x.speed_cm_s
-        : Math.min(step.turn_speed, Math.min(HEXAGON_SPEED_CM_S, JUNCTION_SETTLE_SPEED_CM_S));
+        : Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S);
       let correction = 0;
       if (x.turning) {
         // Pose-mode ring: pivot to the next 30/60 degree vertex heading.  The
@@ -941,13 +973,29 @@ export class LineFollowModel {
         this.outerTargets(outer, correction, dt);
       } else {
         this.pid.reset();
-        correction =
-          HEADING_KP_CM_S_PER_RAD * (x.target_heading - this.odometry.heading_rad) -
-          JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
-        // Inside-ring legs use the leg cross-track; the entry approach still
-        // uses the incoming segment's cross-track so a drifted approach lands
-        // on V0 instead of beside it.
-        if (this.route.pose_mode) {
+        /* 2026-11-13（方案 1 实车）：出环最后 30° 枢轴以 0.06 rad 门限结束时仍有
+         * 约 0.2 rad/s 横摆；EXITING 若沿用 HEADING_KP(12)/阻尼 2.5，车头会继续
+         * 转到 π+0.28 rad，24 cm 前伸杆横偏约 7 cm 离开主线。出环保持段沿用
+         * 环内 40/2.0 的枢轴增益先把横摆压住。 */
+        const exiting = x.state === HexagonState.HEXAGON_EXITING;
+        const kp = exiting ? HEXAGON_TURN_KP : HEADING_KP_CM_S_PER_RAD;
+        const kd = exiting ? HEXAGON_TURN_DAMPING : JUNCTION_YAW_DAMPING;
+        correction = kp * Math.atan2(Math.sin(x.target_heading - this.odometry.heading_rad),
+          Math.cos(x.target_heading - this.odometry.heading_rad)) -
+          kd * this.turn_yaw_rate_rad_s;
+        if (exiting && this.route.pose_mode) {
+          /* 出环横偏以“锚定 V0 + 出口航向”定义的主线量取，不能再用 pose_cross_cm：
+           * 那是 waypoint 链（表内段距含手工门禁标定，环岛处比真实主线偏西约
+           * 15 cm），会把车进一步带离主线。 */
+          const wh = x.target_heading + this.route.start_heading_rad;
+          const dx = this.route.pose_axle_x_cm - x.vertex_x_cm;
+          const dy = this.route.pose_axle_y_cm - x.vertex_y_cm;
+          const cross = -dx * Math.sin(wh) + dy * Math.cos(wh);
+          correction -= JUNCTION_CROSS_KP * cross;
+        } else if (this.route.pose_mode) {
+          /* Inside-ring legs use the leg cross-track; the entry approach still
+           * uses the incoming segment's cross-track so a drifted approach lands
+           * on V0 instead of beside it. */
           correction -= JUNCTION_CROSS_KP * (x.cross_cm !== 0
             ? x.cross_cm : this.route.pose_cross_cm);
         }
@@ -965,10 +1013,9 @@ export class LineFollowModel {
       const direction = this.route.currentAction() === Action.LEFT ? -1.0 : 1.0;
       const target = this.route.turnTargetRad();
       const turn = direction * (this.odometry.heading_rad - this.route.entry_heading);
-      const outer =
-        this.route.currentAction() === Action.STRAIGHT
-          ? step.turn_speed
-          : Math.min(step.turn_speed, JUNCTION_SETTLE_SPEED_CM_S);
+      /* 固件 2026-11-14：外轮目标直接按路径表 turn_speed 执行（受
+       * WHEEL_TARGET_MAX_CM_S 天花板保护），不再用固定 settle 常量钳死。 */
+      const outer = Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S);
       const remaining = Math.abs(target) - turn;
       const band = Math.min(JUNCTION_SETTLE_BAND_RAD, 0.4 * Math.abs(target));
       const settling = this.route.currentAction() !== Action.STRAIGHT && band > 0 && remaining <= band;
@@ -986,7 +1033,7 @@ export class LineFollowModel {
         // desired heading from the circle, so this is real path following)
         // steers back onto the circle. The inner wheel keeps rolling.
         this.pid.reset();
-        const axle = CORNER_ARC_SPEED_CM_S;
+        const axle = Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S);
         const err = Math.atan2(
           Math.sin(this.route.arc_desired_heading_rad - this.odometry.heading_rad),
           Math.cos(this.route.arc_desired_heading_rad - this.odometry.heading_rad)
