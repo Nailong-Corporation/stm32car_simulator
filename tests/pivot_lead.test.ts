@@ -135,15 +135,17 @@ console.log('PASS: short-link projected turn-in geometry stays unchanged for 0/4
 {
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
   assert.equal(parsed.activeSchemeId, 4); /* firmware ROUTE_SCHEME_SELECT=4 */
-  assert.equal(parsed.schemes.length, 9); /* 0..8: firmware 2e751de adds the scheme-8 ring test */
+  assert.equal(parsed.schemes.length, 11); /* 0..10: scheme 9 (finals suffix) + scheme 10 (ring test) added 2026-11-13 */
   for (const scheme of parsed.schemes) {
     for (const s of scheme.steps) {
       assert.equal(s.corner_arc_enabled, false);
-      const ordinary = s.action === Action.LEFT || s.action === Action.RIGHT ||
-        (s.action === Action.CUSTOM_TURN && Math.abs(s.angle_deg) === 90);
+      /* 表内 approach 只有四种来源：TURN_RIGHT_ANGLE_STRAIGHT_CM=9、
+       * TURN_TRANSISTOR_STRAIGHT_CM=14、TURN_Q4_STRAIGHT_CM=18，以及手工标定的
+       * 9-3=6（方案 9 R17 行）和 14+5=19（方案 4/1 的 Q6 行）。方案 10 的 STOP
+       * 行也带 9——它同样要做枢轴前直行。 */
       const approach = s.turn_approach_cm ?? 0;
-      assert.ok(ordinary ? [9, 14, 19].includes(approach) : approach === 0,
-        `ordinary right angles use 9/14/19 cm (Q6 calibration +5); other actions use zero, got ${approach}`);
+      assert.ok([0, 6, 9, 14, 18, 19].includes(approach),
+        `turn_approach_cm must be one of 0/6/9/14/18/19 cm, got ${approach}`);
     }
   }
   const s1 = parsed.schemes.find(s => s.id === 1)!;

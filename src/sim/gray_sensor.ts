@@ -36,6 +36,19 @@ export function grayIsParallelPair(observation: GrayObservation): boolean {
     narrowOuterGroup(mask & 0x07) && narrowOuterGroup((mask >> 5) & 0x07);
 }
 
+/* 固件 gray_sensor.h gray_is_component_pattern()：印刷元件（空心电阻/极板）特征。
+ * 可信平行对不算元件图形；两区域“两侧外边+中心全空”或单区域 5~7 路宽边算。 */
+export function grayIsComponentPattern(o: GrayObservation): boolean {
+  if (grayIsParallelPair(o)) return false;
+  if (o.region_count >= 2 &&
+    (o.line_mask & 0x18) === 0 &&
+    (o.line_mask & 0x03) !== 0 &&
+    (o.line_mask & 0xc0) !== 0) return true;
+  return o.region_count === 1 &&
+    o.white_count >= 5 && o.white_count <= 7 &&
+    (o.line_mask & 0x07) !== 0 && (o.line_mask & 0xe0) !== 0;
+}
+
 export function grayClassify(
   line_mask: number,
   have_previous: boolean,
