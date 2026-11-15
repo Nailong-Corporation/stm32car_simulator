@@ -192,15 +192,15 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   assert.equal(scheme4.steps[10].segment_length_cm, 90,
     'firmware 2e751de: x=345 south leg measures 90 cm');
   assert.equal(scheme4.steps[10].turn_approach_cm, 19,
-    'x=345 south leg crosses the ring vertex with the 14+5 cm transistor hold');
+      'x=345 south leg crosses the ring vertex with the 14+5 cm transistor hold');
   assert.equal(scheme4.steps[12].junction_count, 5,
     'firmware 2e751de: x375 north leg counts five nodes (R12/R15/y110/y50)');
   assert.equal(scheme4.steps[13].junction_count, 2,
     'firmware 2e751de: top-edge (275,0) row counts Q16/R17');
-  assert.equal(scheme4.steps[14].turn_approach_cm, 19,
-    'Q18 row keeps the 14+5 cm transistor hold');
-  assert.equal(scheme4.steps[17].junction_count, 7,
-    'firmware 59a7268 top-edge Q22 row counts seven nodes');
+  assert.equal(scheme4.steps[14].turn_approach_cm, 14,
+    'Q18 row uses the current base transistor approach');
+  assert.equal(scheme4.steps[17].junction_count, 6,
+    'current firmware Q22 row counts six nodes');
   assert.equal(scheme4.steps[17].cruise_speed, 160,
     'firmware 2e751de top-edge Q22 row cruises at 160');
   assert.equal(scheme4.steps[7].segment_length_cm, 265);
@@ -209,8 +209,8 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
    * and only for the schemes in the firmware gate {1,4,5,8}. */
   assert.equal(scheme4.steps[13].close_corner, true,
     'R17 row (95 cm, -90 deg, after a 215 cm leg) must take the geometric-corner pivot');
-  assert.equal(scheme4.steps.filter((step) => step.close_corner).length, 1,
-    'exactly one close-corner row per table');
+  assert.equal(scheme4.steps.filter((step) => step.close_corner).length, 4,
+    'R17, Q18, Q16 and Q22 use geometric-corner positioning');
   const scheme2 = parsed.schemes.find((s) => s.id === 2);
   assert.ok(scheme2);
   assert.equal(scheme2.steps.some((step) => step.close_corner), false,
@@ -223,7 +223,12 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   assert.deepEqual(scheme8.start_pose, { x_cm: 345, y_cm: 110, heading_rad: 1.570796327 },
     'scheme 8 starts on the x=345 approach heading south');
   assert.equal(scheme8.steps[17].junction_count, 9,
-    'scheme 8 top-edge row keeps the nine-node count');
+      'scheme 8 Q22 row keeps its route specific nine-node count');
+  const scheme9 = parsed.schemes.find((s) => s.id === 9);
+  assert.ok(scheme9, 'firmware adds the scheme-9 continuation table');
+  assert.equal(scheme9.steps.length, 17);
+  assert.deepEqual(scheme9.start_pose, { x_cm: 375, y_cm: 220, heading_rad: -1.570796327 });
+  assert.equal(scheme9.steps[12].turn_approach_cm, 15);
   // ROUTE_REPEAT_COUNT=1 must reach a freshly initialised planner.
   const planner = new RoutePlannerModel();
   planner.init(scheme0.steps);

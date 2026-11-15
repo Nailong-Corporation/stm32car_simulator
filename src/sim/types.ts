@@ -25,6 +25,7 @@ export interface RouteStep {
   /* R17 紧接 (275,0) 角点的 95 cm 行（route_scenario_close_corner）：本行的
    * 枢轴直走距离改用“到几何角点”的里程。由 route_parser 按表内容标记，不绑定行号。 */
   close_corner?: boolean;
+  dashed_row?: boolean;
   comment?: string;        /* Associated comment in route_table.c */
   rawLine?: string;
 }

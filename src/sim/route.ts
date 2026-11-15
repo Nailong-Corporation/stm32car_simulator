@@ -120,6 +120,13 @@ import {
   WHEEL_TRACK_CM,
   INTERFERENCE_TIMEOUT_MS,
   INTERFERENCE_MAX_DISTANCE_CM,
+  COMPONENT_CROSS_MAX_CM,
+  COMPONENT_CROSS_MS,
+  EXIT_COMPONENT_EXTEND_ENABLED,
+  SHORT_LINK_TURN_EARLY_CM,
+  DASHED_NODE_MIN_WHITE,
+  TRANSISTOR_NODE_APPROACH_MAX_CM,
+  TRANSISTOR_PIVOT_LEAD_CM,
 } from './config';
 
 const SHORT_LINK_MIN_CM = 20;
@@ -128,6 +135,12 @@ const SHORT_LINK_MAX_LATERAL_CM = 14;
 const SHORT_LINK_MAX_HEADING_RAD = 0.30;
 const SHORT_LINK_TIMEOUT_MS = 6000;
 function shortLinkLength(s: RouteStep): number { return s.short_link_cm ?? 0; }
+function componentPattern(o: GrayObservation): boolean {
+  return (o.region_count >= 2 && (o.line_mask & 0x18) === 0 &&
+      (o.line_mask & 0x03) !== 0 && (o.line_mask & 0xc0) !== 0) ||
+    (o.region_count === 1 && o.white_count >= 5 && o.white_count <= 7 &&
+      (o.line_mask & 0x07) !== 0 && (o.line_mask & 0xe0) !== 0);
+}
 function ordinaryRightAngle(s: RouteStep): boolean {
   return !s.corner_arc_enabled && (s.action === Action.LEFT || s.action === Action.RIGHT ||
     (s.action === Action.CUSTOM_TURN && Math.abs(Math.abs(s.angle_deg) - 90) < 0.001));
@@ -323,6 +336,7 @@ export class RoutePlannerModel {
   public post_turn_slow = false;
   public post_turn_samples = 0;
   public short_link_tracking = false;
+  public close_corner_tracking = false;
   public short_link_active = false;
   public short_link_heading = 0;
   public short_link_forward_cm = 0;
@@ -382,6 +396,7 @@ export class RoutePlannerModel {
   public line_exit_confirmed = false;
   public capture_line_samples = 0;
   public capture_line_ms = 0;
+  public exit_component_extension_used = false;
   public capture_line_cm = 0;
   public turn_exit_search = false;
   public line_exit_heading_rad = 0;
@@ -507,6 +522,7 @@ export class RoutePlannerModel {
 
   public start(d: number, now: number): void {
     this.short_link_tracking = this.short_link_active = this.turn_approaching = false;
+    this.close_corner_tracking = false;
     this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
     this.bar_hold_clear_count = 0;
     this.post_turn_slow = false;
@@ -789,11 +805,24 @@ export class RoutePlannerModel {
     const s = this.steps[this.index];
     if (!(s.segment_length_cm > 0)) return 0;
     const corner = this.origin_cm + s.segment_length_cm + ROUTE_WAYPOINT_MARGIN_CM;
-    return Math.max(0, corner - d);
+    let pivot = corner - WHEEL_TRACK_CM * 0.5;
+    const transistor = (s.segment_length_cm === 45 || s.segment_length_cm === 245) &&
+      (s.turn_approach_cm ?? 0) >= 12;
+    if (transistor && s.segment_length_cm >= 200) {
+      pivot = Math.min(pivot, d + TRANSISTOR_NODE_APPROACH_MAX_CM - TRANSISTOR_PIVOT_LEAD_CM);
+    }
+    return Math.max(0, pivot - d);
   }
 
   /** Mirror of route_bar_hold_active(): the latched transverse bar keeps the
    * confirmed entry heading for the row's configured straight distance. */
+  public dashedHold(): boolean {
+    if (this.index >= this.count) return false;
+    if (this.steps[this.index].dashed_row) return true;
+    return this.state === RouteState.ROUTE_CLEARING && !this.passing_junction &&
+      this.index + 1 < this.count && !!this.steps[this.index + 1].dashed_row;
+  }
+
   public barHoldActive(d: number): boolean {
     if (this.index >= this.count ||
       this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_NONE ||
@@ -999,6 +1028,10 @@ export class RoutePlannerModel {
   private anchorNextSegment(d: number, now: number): void {
     this.next_segment_origin_cm = d;
     this.next_segment_ms = now;
+    if (this.close_corner_tracking && this.index + 1 < this.count && this.steps[this.index + 1].close_corner) {
+      this.next_segment_origin_cm -= this.short_link_forward_cm;
+      this.close_corner_tracking = false;
+    }
     this.next_segment_origin_valid = true;
     this.search_pending = false;
   }
@@ -1007,7 +1040,9 @@ export class RoutePlannerModel {
     this.short_link_active = false;
     this.short_link_tracking = !this.passing_junction && this.index + 1 < this.count &&
       shortLinkLength(this.steps[this.index + 1]) > 0 && ordinaryRightAngle(this.steps[this.index]);
-    if (!this.short_link_tracking) return;
+    this.close_corner_tracking = this.pose_mode && !this.passing_junction && this.index + 1 < this.count &&
+      !!this.steps[this.index + 1].close_corner && ordinaryRightAngle(this.steps[this.index]);
+    if (!this.short_link_tracking && !this.close_corner_tracking) return;
     this.short_link_heading = this.entry_heading + this.turnTargetRad();
     this.short_link_forward_cm = this.short_link_lateral_cm = 0;
     this.short_link_last_cm = d; this.short_link_last_heading = h; this.short_link_ms = now;
@@ -1027,7 +1062,9 @@ export class RoutePlannerModel {
         this.short_link_tracking = false;
       } else {
         // Previous lateral pivot motion includes its actual coast footprint.
-        this.short_link_pivot_lead_cm = Math.max(WHEEL_TRACK_CM * 0.5, Math.abs(this.short_link_lateral_cm));
+        const early = this.index + 1 < this.count &&
+          this.steps[this.index + 1].segment_length_cm === 145 ? SHORT_LINK_TURN_EARLY_CM : 0;
+        this.short_link_pivot_lead_cm = Math.max(WHEEL_TRACK_CM * 0.5 - early, Math.abs(this.short_link_lateral_cm));
         if (this.short_link_pivot_lead_cm > SHORT_LINK_MAX_LATERAL_CM ||
           shortLinkLength(this.steps[this.index + 1]) - this.short_link_pivot_lead_cm - this.short_link_forward_cm < 1) {
           this.short_link_tracking = false; this.fail(RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE); return;
@@ -1064,6 +1101,7 @@ export class RoutePlannerModel {
     this.turn_exit_search = true;
     this.capture_line_ms = now;
     this.capture_line_cm = d;
+    this.exit_component_extension_used = false;
     this.capture_line_samples = this.exit_count = 0;
     this.exit_candidate_pending = false;
     this.short_exit_edge_side = this.short_exit_edge_samples = 0;
@@ -1080,9 +1118,18 @@ export class RoutePlannerModel {
     now: number,
     adjacent: boolean
   ): void {
-    /* Deadlines precede even the third valid exit frame. Noise never renews them. */
-    if (now - this.capture_line_ms >= JUNCTION_EXIT_SEARCH_TIMEOUT_MS ||
-      Math.abs(d - this.capture_line_cm) >= JUNCTION_EXIT_SEARCH_MAX_CM) {
+    /* R25 wide component may cover the exit wire; extend the deadline once, without
+     * moving the original time/distance baseline. */
+    if (EXIT_COMPONENT_EXTEND_ENABLED && componentPattern(o) && !this.exit_component_extension_used &&
+      this.index + 1 < this.count && this.steps[this.index + 1].segment_length_cm === 145) {
+      this.exit_component_extension_used = true;
+    }
+    const limitMs = JUNCTION_EXIT_SEARCH_TIMEOUT_MS +
+      (this.exit_component_extension_used ? COMPONENT_CROSS_MS : 0);
+    const limitCm = JUNCTION_EXIT_SEARCH_MAX_CM +
+      (this.exit_component_extension_used ? COMPONENT_CROSS_MAX_CM : 0);
+    if (now - this.capture_line_ms >= limitMs ||
+      Math.abs(d - this.capture_line_cm) >= limitCm) {
       this.fail(RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE);
       return;
     }
@@ -1110,6 +1157,12 @@ export class RoutePlannerModel {
     else if (this.exit_count < LINE_CONFIRM_SAMPLES) this.exit_count++;
     this.capture_line_samples = this.exit_count;
     let confirmed = this.exit_count >= LINE_CONFIRM_SAMPLES;
+    if (EXIT_COMPONENT_EXTEND_ENABLED && adjacent && componentPattern(o) &&
+      this.index + 1 < this.count && this.steps[this.index + 1].segment_length_cm === 145 &&
+      Math.abs(h - (this.entry_heading + this.turnTargetRad())) <= SHORT_LINK_MAX_HEADING_RAD) {
+      confirmed = true;
+      this.capture_line_samples = this.exit_count = LINE_CONFIRM_SAMPLES;
+    }
     if (shortExit) {
       /* Q13 leaves only a brief, same-side edge window before the 12 cm
        * deadline. Keep the fast +/-3 exit; farther edges need both time and
@@ -1270,6 +1323,7 @@ export class RoutePlannerModel {
     this.component_recovery_active = false;
     this.capture_line_ms = now;
     this.capture_line_cm = d;
+    this.exit_component_extension_used = false;
     this.capture_line_samples = LINE_CONFIRM_SAMPLES;
     return false;
   }
@@ -1598,6 +1652,7 @@ export class RoutePlannerModel {
         return false;
     }
     this.short_link_tracking = this.short_link_active = this.turn_approaching = false;
+    this.close_corner_tracking = false;
     this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
     this.bar_hold_clear_count = 0;
     this.navigation_warning = this.failure;
@@ -1691,7 +1746,7 @@ export class RoutePlannerModel {
     const s = this.steps[this.index];
     this.updateBarHold(o, d, h, now);
     if ((this.state as RouteState) === RouteState.ROUTE_FAILED) return;
-    if (this.short_link_tracking) {
+    if (this.short_link_tracking || this.close_corner_tracking) {
       const ds = d - this.short_link_last_cm, dh = h - this.short_link_last_heading;
       const half = 0.5 * dh;
       const chord = Math.abs(half) < 0.0001 ? 1 : Math.sin(half) / half;
@@ -1807,8 +1862,12 @@ export class RoutePlannerModel {
         d >= this.approach_center_cm &&
         d - this.approach_center_cm <= JUNCTION_CENTER_MEMORY_CM;
 
-      const history = (this.state === RouteState.ROUTE_CANDIDATE && d >= this.entry_cm) || recent_center;
-      const { kind, sides } = junctionShape(o);
+      let history = (this.state === RouteState.ROUTE_CANDIDATE && d >= this.entry_cm) || recent_center;
+      let { kind, sides } = junctionShape(o);
+      if (s.dashed_row) {
+        if (o.white_count < DASHED_NODE_MIN_WHITE) { kind = JunctionEvidence.JUNCTION_EVIDENCE_NONE; sides = 0; }
+        else if (kind !== JunctionEvidence.JUNCTION_EVIDENCE_NONE) history = true;
+      }
       // A gradually shifting single line can still include a center channel
       // (e.g. 0x38 -> 0x30 -> 0x70). Keep its same-side suppression when
       // classified CENTER_BRANCH; an abrupt or separated branch stays eligible.
