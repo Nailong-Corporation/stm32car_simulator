@@ -134,21 +134,25 @@ console.log('PASS: short-link projected turn-in geometry stays unchanged for 0/4
 // The bundled table keeps every existing route value and only changes column 9.
 {
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
-  assert.equal(parsed.activeSchemeId, 4); /* firmware ROUTE_SCHEME_SELECT=4 */
-  assert.equal(parsed.schemes.length, 9); /* 0..8: firmware 2e751de adds the scheme-8 ring test */
+  assert.equal(parsed.activeSchemeId, 1); /* firmware 4207868 ROUTE_SCHEME_SELECT=1 */
+  assert.equal(parsed.schemes.length, 11); /* 0..10: schemes 8/10 are the ring tests, 9 the corner start */
   for (const scheme of parsed.schemes) {
     for (const s of scheme.steps) {
       assert.equal(s.corner_arc_enabled, false);
       const ordinary = s.action === Action.LEFT || s.action === Action.RIGHT ||
         (s.action === Action.CUSTOM_TURN && Math.abs(s.angle_deg) === 90);
       const approach = s.turn_approach_cm ?? 0;
-      assert.ok(ordinary ? [9, 14, 19].includes(approach) : approach === 0,
-        `ordinary right angles use 9/14/19 cm (Q6 calibration +5); other actions use zero, got ${approach}`);
+      /* 2026-11-15: the HEXAGON row carries HEXAGON_ARC_APPROACH_CM (30 cm) in
+       * the same column; close-corner rows carry 6/14/19/18 cm. */
+      const hexagon = s.action === Action.HEXAGON;
+      const good = hexagon ? approach === 30 : [0, 6, 9, 14, 18, 19].includes(approach);
+      assert.ok(good,
+        `rows use 0/6/9/14/18/19 cm, HEXAGON uses 30 cm, got ${approach}`);
     }
   }
   const s1 = parsed.schemes.find(s => s.id === 1)!;
   assert.equal(s1.steps.length, 30);
-  const transistorRows = s1.steps.flatMap((s, i) => (s.turn_approach_cm ?? 0) >= 14 ? [i] : []);
-  assert.deepEqual(transistorRows, [3, 9, 15, 17, 18, 25]);
-  console.log('PASS: bundled schemes use absolute 9/14/19 cm and preserve the six scheme-1 transistor corners');
+  const transistorRows = s1.steps.flatMap((s, i) => (s.turn_approach_cm ?? 0) >= 14 ? [i] : []); /* row 10 = HEXAGON 30 cm */
+  assert.deepEqual(transistorRows, [3, 9, 10, 11, 15, 17, 18, 25]);
+  console.log('PASS: bundled schemes use the absolute 6/9/14/18/19 cm holds and the 30 cm HEXAGON approach');
 }

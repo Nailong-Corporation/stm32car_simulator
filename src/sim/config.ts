@@ -195,7 +195,15 @@ export const JUNCTION_TURN_TARGET_RAD = 1.570796327;
 export const JUNCTION_SETTLE_BAND_RAD = 0.60;
 export const JUNCTION_PASS_ALIGNED_RAD = 0.10;
 export const JUNCTION_PASS_SETTLED_YAW_RAD_S = 0.15;
-export const JUNCTION_SETTLE_SPEED_CM_S = 28.0;
+/* motion_config.h 2026-11-13 解锁：入弯门禁与外轮目标直接读表内 turn_speed，
+ * 同名常量保留为上限对照（= WHEEL_TARGET_MAX_CM_S），不再钳死高速表值。 */
+export const JUNCTION_SETTLE_SPEED_CM_S = WHEEL_TARGET_MAX_CM_S;
+/* motion_config.h SHORT_LINK_TURN_EARLY_CM：145/142 cm 电阻行的短连接枢轴提前量。 */
+export const SHORT_LINK_TURN_EARLY_CM = 1.0;
+/* motion_config.h 2026-11-12 虚线整行保持：短划/空白都不是丢线。 */
+export const DASHED_HOLD_LOSS_MS = 3200;
+export const DASHED_HOLD_LOSS_CM = 50.0;
+export const DASHED_HOLD_EXTRA_CM = 15.0;
 export const JUNCTION_SETTLE_HEADING_KP = 24.0;
 /* 2026-11-10 现场：枢轴尾段比例项趋零时，混速器把两轮都放到外轮速度，车“边直行边拧”，
  * 最后 1–2° 要跑十几厘米，转弯点被推过线。尾段必须保留能继续转的轮速差。 */
@@ -397,6 +405,22 @@ export const HEXAGON_ENTRY_APPROACH_MAX_CM = 35.0;
 /* A ring leg is blind for most of its 35 cm; only a real off-path excursion
  * (instead of the grey loss timer) aborts it. */
 export const HEXAGON_LEG_CROSS_MAX_CM = 10.0;
+
+/* INS circular-arc hexagon traversal (2026-11-15, motion_config.h)：
+ * 入环直行到切点后按 R=32.5 cm 匀速圆弧绕一周，灰度 PID 全程暂停。 */
+export const HEXAGON_ARC_RADIUS_CM = 32.5;
+export const HEXAGON_ARC_APPROACH_CM = GRAY_FORWARD_OFFSET_CM + 6.0; /* 30 cm */
+export const HEXAGON_ARC_HEADING_KP = 24.0;
+export const HEXAGON_ARC_RADIAL_KP = 0.04;
+export const HEXAGON_ARC_RADIAL_MAX_RAD = 0.25;
+export const HEXAGON_ARC_YAW_DAMPING = 1.5;
+export const HEXAGON_ARC_EXIT_TOL_RAD = 0.05;
+export const HEXAGON_ARC_MIN_PROGRESS_RATIO = 0.75;
+
+/* 单轮目标 0 而另一轮仍驱动时，TB6612 该通道两输入同为低电平 = 短路制动
+ * （motor.c set_wheel 注释），不是滑行；制动转矩远大于滑行。 */
+export const MOTOR_SHORT_BRAKE_DECEL_CM_S2 = 600.0;
+
 
 export const ROUTE_SHORT_SPEED_CM_S = 60.0;
 export const ROUTE_LONG_SEGMENT_CM = 100.0;

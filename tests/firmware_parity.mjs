@@ -22,7 +22,10 @@ try {
   for(const scheme of schemes.filter(s=>poseNav ? s.id>0 : true)) {
     const executable=join(temp,`controller-${scheme.id}`);
     const defines=poseNav ? [] : ['-DPOSE_NAV_ENABLED=0'];
-    const compile=spawnSync('cc',['-std=c11','-Wall','-Wextra','-Werror','-pedantic',
+    /* The firmware builds with PlatformIO's default -std=gnu11, so M_PI and the
+     * other GNU libm extensions must stay visible here; -pedantic would reject
+     * them on a strict ISO dialect. */
+    const compile=spawnSync(process.env.CC ?? 'cc',['-std=gnu11','-Wall','-Wextra','-Werror',
       '-I'+join(firmware,'include'),'-DROUTE_SCHEME_SELECT='+scheme.id,...defines,
       ...['test/replay_controller.c','src/route_table.c','src/line_follow.c','src/route.c',
       'src/gray_sensor.c','src/pid.c','src/odometry.c','src/braking_planner.c','src/speed_control.c'].map(p=>join(firmware,p)),

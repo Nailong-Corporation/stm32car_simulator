@@ -96,3 +96,30 @@ Verification: `npx tsc --noEmit` passes, `npm test` exits 0 with current known
 route stops reported as `KNOWN`, and `node tests/firmware_parity.mjs` matches
 schemes 1-8 frame-for-frame (maximum target error 0.0043 cm/s, no threshold
 frames).
+
+## 2026-11-15 `4207868` follow-up (simulator only)
+
+The simulator `main` now mirrors `car_stm32_school_competition` `main` at
+`4207868` (`feat/INS-hexagon`), without touching the firmware repository. The
+`HEXAGON` polygon/pivot FSM is replaced by the INS `R = 32.5 cm` constant-speed
+arc, the dashed-row hold and the `turn_speed` unlock are ported, the R17/Q18/Q22/Q16
+close-corner rules and the 145/142 cm short-link early pivot are mirrored, and
+`DEFAULT_ROUTE_TABLE_C` is now a verbatim copy of the current `src/route_table.c`
+(schemes 0-10, `ROUTE_SCHEME_SELECT=1`).
+
+Two simulator-only models changed:
+
+- `advanceWheel()` now treats a zero duty on one channel as the TB6612 short
+  brake that `src/motor.c set_wheel()` selects (PWM low + STBY high), instead of
+  coasting with the 150 cm/s² limit. This removed a ~10° heading overshoot at the
+  end of every 50 cm/s single-wheel pivot.
+- `tests/firmware_parity.mjs` builds with `-std=gnu11` (the firmware's own
+  dialect; `M_PI` is not visible under `-std=c11 -pedantic`) and honours `CC`.
+
+Verification: `npx tsc --noEmit` passes, `npm test` exits 0, `npm run build`
+succeeds, and `node tests/firmware_parity.mjs` matches schemes 1-10 frame-for-frame
+(maximum target error 0.0031 cm/s, no threshold frames). Scheme 1 still stops in
+simulation after the first Q4/Q6 corner group: the axle leaves each 50 cm/s pivot
+~5 cm inside the next line and the 24 cm look-ahead bar (half span 3.85 cm) goes
+blind, while the real car completes with the same firmware. That remaining gap is
+a vehicle/sensor-model calibration, documented in the top-level `README.md`.

@@ -25,6 +25,8 @@ export interface RouteStep {
   /* R17 紧接 (275,0) 角点的 95 cm 行（route_scenario_close_corner）：本行的
    * 枢轴直走距离改用“到几何角点”的里程。由 route_parser 按表内容标记，不绑定行号。 */
   close_corner?: boolean;
+  /* 虚线行（route_scenario_dashed_row）：短划/空白都不参与巡检，整行按位姿航向直行。 */
+  dashed?: boolean;
   comment?: string;        /* Associated comment in route_table.c */
   rawLine?: string;
 }
@@ -137,6 +139,15 @@ export interface HexagonNavigation {
   leg_from_x_cm: number;
   leg_from_y_cm: number;
   cross_cm: number;
+  /* 2026-11-13 整圈现场：入环位姿锚点（只平移固定六边形，保持车与环的相对关系）。 */
+  anchor_dx_cm: number;
+  anchor_dy_cm: number;
+  /* 2026-11-15 INS 圆弧状态（R = HEXAGON_ARC_RADIUS_CM）。 */
+  center_x_cm: number;
+  center_y_cm: number;
+  radius_err_cm: number;
+  arc_progress_rad: number;
+  last_alpha_rad: number;
 }
 
 export enum GrayKind {

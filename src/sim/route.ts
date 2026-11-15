@@ -54,6 +54,7 @@ import {
   JUNCTION_CLEAR_MAX_CM,
   JUNCTION_TURN_TARGET_RAD,
   JUNCTION_SETTLE_SPEED_CM_S,
+  SHORT_LINK_TURN_EARLY_CM,
   COMPONENT_RECOVERY_MAX_CM,
   COMPONENT_RECOVERY_TIMEOUT_MS,
   BRAKING_CALIBRATION_CONFIRMED,
@@ -94,6 +95,13 @@ import {
   ROUTE_WAYPOINT_EXIT_ANGLE_RAD,
   HEXAGON_ENTRY_APPROACH_MAX_CM,
   HEXAGON_LEG_CROSS_MAX_CM,
+  HEXAGON_ARC_RADIUS_CM,
+  HEXAGON_ARC_APPROACH_CM,
+  HEXAGON_ARC_RADIAL_KP,
+  HEXAGON_ARC_RADIAL_MAX_RAD,
+  HEXAGON_ARC_EXIT_TOL_RAD,
+  HEXAGON_ARC_MIN_PROGRESS_RATIO,
+  JUNCTION_EXIT_SPEED_CM_S,
   ROUTE_CLEAR_POSE_CM,
   HEXAGON_CENTER_X_CM,
   HEXAGON_CENTER_Y_CM,
@@ -275,6 +283,13 @@ export class RoutePlannerModel {
     leg_from_x_cm: 0,
     leg_from_y_cm: 0,
     cross_cm: 0,
+    anchor_dx_cm: 0,
+    anchor_dy_cm: 0,
+    center_x_cm: 0,
+    center_y_cm: 0,
+    radius_err_cm: 0,
+    arc_progress_rad: 0,
+    last_alpha_rad: 0,
   };
 
   public navigation_warning = RouteFailure.ROUTE_FAILURE_NONE;
@@ -625,24 +640,10 @@ export class RoutePlannerModel {
     return this.entrySpeedLimitAt(this.index, true);
   }
 
-  private entrySpeedLimitAt(index: number, active_action: boolean): number {
-    const a = this.steps[index].action;
-    const turn =
-      a === Action.LEFT ||
-      a === Action.RIGHT ||
-      a === Action.CUSTOM_TURN ||
-      a === Action.HEXAGON ||
-      (a === Action.STOP &&
-        ((active_action && this.lap_boundary) || this.anotherLap()) &&
-        this.repeat_action !== Action.STRAIGHT);
-    let limit = this.steps[index].turn_speed;
-    if (a === Action.HEXAGON) limit = Math.min(limit, HEXAGON_SPEED_CM_S);
-    if (turn && cornerArcRow(this.steps[index], this.steps[index + 1])) {
-      // A rolling corner never stops the inner wheel, so the entry gate is the
-      // axle arc speed rather than the settle/pivot cap.
-      return CORNER_ARC_SPEED_CM_S;
-    }
-    return turn ? Math.min(limit, JUNCTION_SETTLE_SPEED_CM_S) : limit;
+  private entrySpeedLimitAt(index: number, _active_action: boolean): number {
+    /* 2026-11-13 固件解锁：入弯门禁直接取本行 turn_speed，唯一上限是单轮
+     * 目标天花板。滚动圆弧也读同一表值，不再固定 45 cm/s。 */
+    return Math.min(this.steps[index].turn_speed, WHEEL_TARGET_MAX_CM_S);
   }
 
   private entrySpeedReady(): boolean {
@@ -723,7 +724,9 @@ export class RoutePlannerModel {
     this.arc_roll_cm = this.arc_progress_rad = this.arc_radius_err_cm = 0;
     this.arc_diff_slew_cm_s = 0;
     this.arc_desired_heading_rad = this.entry_heading;
-    this.arc_outer_cm_s = CORNER_ARC_SPEED_CM_S;
+    this.arc_outer_cm_s = this.steps && this.index < this.count
+      ? Math.min(this.steps[this.index].turn_speed, WHEEL_TARGET_MAX_CM_S)
+      : CORNER_ARC_SPEED_CM_S;
     this.arc_diff_cm_s = 0;
     this.arc_lateral_cm = 0;
     this.turn_rewind_active = this.turn_rewind_pending = false;
@@ -773,6 +776,13 @@ export class RoutePlannerModel {
       leg_from_x_cm: 0,
       leg_from_y_cm: 0,
       cross_cm: 0,
+      anchor_dx_cm: 0,
+      anchor_dy_cm: 0,
+      center_x_cm: 0,
+      center_y_cm: 0,
+      radius_err_cm: 0,
+      arc_progress_rad: 0,
+      last_alpha_rad: 0,
     };
   }
 
@@ -968,16 +978,23 @@ export class RoutePlannerModel {
         use_line: false,
         center_pending: false,
         exit_armed: false,
-        target_heading: 0,
+        target_heading: h,
         turning: false,
         turn_index: 0,
         vertex_x_cm: 0,
-        speed_cm_s: 0,
+        speed_cm_s: Math.min(this.steps[this.index].turn_speed, WHEEL_TARGET_MAX_CM_S),
         vertex_y_cm: 0,
         leg_start_cm: 0,
         leg_from_x_cm: 0,
         leg_from_y_cm: 0,
         cross_cm: 0,
+        anchor_dx_cm: 0,
+        anchor_dy_cm: 0,
+        center_x_cm: 0,
+        center_y_cm: 0,
+        radius_err_cm: 0,
+        arc_progress_rad: 0,
+        last_alpha_rad: 0,
       };
     }
   }
@@ -994,6 +1011,19 @@ export class RoutePlannerModel {
       this.lap_boundary = true;
     }
     this.beginAction(d, h, now);
+  }
+
+  /** route.c route_dashed_hold(): the dashed row and the turn that enters it. */
+  public dashedHold(): boolean {
+    if (this.index >= this.count) return false;
+    if (this.steps[this.index].dashed === true) return true;
+    return this.index + 1 < this.count && this.steps[this.index + 1].dashed === true;
+  }
+
+  /** route.c adjacent_close_or_hexagon(): a HEXAGON row right after a pivot also
+   * needs the "corner point" origin bookkeeping the R17 special case uses. */
+  private static adjacentCloseOrHexagon(next: RouteStep | undefined): boolean {
+    return !!next && (next.close_corner === true || next.action === Action.HEXAGON);
   }
 
   private anchorNextSegment(d: number, now: number): void {
@@ -1027,7 +1057,12 @@ export class RoutePlannerModel {
         this.short_link_tracking = false;
       } else {
         // Previous lateral pivot motion includes its actual coast footprint.
-        this.short_link_pivot_lead_cm = Math.max(WHEEL_TRACK_CM * 0.5, Math.abs(this.short_link_lateral_cm));
+        // 145/142 cm component rows pivot 1 cm early so the exit bar lands
+        // ahead of the printed resistor (route.c SHORT_LINK_TURN_EARLY_CM).
+        const nextLen = this.steps[this.index + 1].segment_length_cm;
+        const early = nextLen === 145 || nextLen === 142 ? SHORT_LINK_TURN_EARLY_CM : 0;
+        this.short_link_pivot_lead_cm = Math.max(WHEEL_TRACK_CM * 0.5 - early,
+          Math.abs(this.short_link_lateral_cm));
         if (this.short_link_pivot_lead_cm > SHORT_LINK_MAX_LATERAL_CM ||
           shortLinkLength(this.steps[this.index + 1]) - this.short_link_pivot_lead_cm - this.short_link_forward_cm < 1) {
           this.short_link_tracking = false; this.fail(RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE); return;
@@ -1274,16 +1309,15 @@ export class RoutePlannerModel {
     return false;
   }
 
-  /** Pose-driven regular-hexagon traversal (2026-11-06).
+  /** INS circular-arc hexagon traversal (2026-11-15, mirrors route.c).
    *
-   * The ring has one external connection (right vertex V0), so a loop entered
-   * from one side has to leave on the other side.  The table's HEXAGON angle
-   * sign selects the direction (+ = clockwise) and the traversal uses the known
-   * 35 cm edges / 60 deg vertices with odometry + IMU: waiting for the 24 cm
-   * look-ahead bar to find the next vertex cannot work on 35 cm edges, and the
-   * old tangent/branch exit assumption does not hold for this lollipop.
-   * The 8-channel line still centres the car along each edge and confirms the
-   * outgoing line after the exit turn. */
+   * The ring has one external connection (right vertex V0(345,165)), so a loop
+   * entered from one side leaves on the other side.  After the entry junction
+   * confirms, the axle drives straight by turn_approach_cm (default
+   * HEXAGON_ARC_APPROACH_CM = 30 cm) onto the tangent point V0, then follows a
+   * constant-speed circular arc of radius HEXAGON_ARC_RADIUS_CM (32.5 cm) using
+   * odometry + IMU heading.  The grey PID is paused for the whole manoeuvre, so
+   * a missing line or the printed R14 graphic can neither steer nor abort it. */
   private hexagonUpdate(
     o: GrayObservation,
     d: number,
@@ -1295,162 +1329,164 @@ export class RoutePlannerModel {
   ): void {
     const x = this.hexagon;
     const dir = this.turnTargetRad() >= 0 ? 1 : -1;
+    const targetRad = Math.abs(this.turnTargetRad());
     const h0 = this.entry_heading;
-    const turnAngles = [
-      HEXAGON_ENTRY_TURN_RAD, HEXAGON_TURN_RAD, HEXAGON_TURN_RAD,
-      HEXAGON_TURN_RAD, HEXAGON_TURN_RAD, HEXAGON_TURN_RAD, HEXAGON_ENTRY_TURN_RAD,
-    ];
-    const cumulative: number[] = [];
-    for (let i = 0; i < turnAngles.length; ++i) {
-      cumulative.push((cumulative[i - 1] ?? 0) + turnAngles[i]);
-    }
-    const vertex = (i: number): { x: number; y: number } => {
-      const k = dir > 0 ? (6 - (i % 6)) % 6 : i % 6;
-      const ang = (-k * Math.PI) / 3;
-      return {
-        x: HEXAGON_CENTER_X_CM + HEXAGON_SIDE_CM * Math.cos(ang),
-        y: HEXAGON_CENTER_Y_CM + HEXAGON_SIDE_CM * Math.sin(ang),
-      };
-    };
-    const wrap = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
+    // Baseline = the row's planned heading (relative to entry_heading, unwrapped)
+    // so a pivot residual from the previous row cannot skew the arc tangent;
+    // the net-rotation guard still uses the measured entry heading h0.
+    let hbase = h0;
+    if (this.pose_cross_valid) hbase = h0 + wrapRad(this.pose_seg_heading_rad - h0);
 
-    if (
-      now - x.action_ms >= HEXAGON_ACTION_TIMEOUT_MS ||
-      Math.abs(d - this.entry_cm) >= HEXAGON_ACTION_MAX_CM
-    ) {
+    {
+      let ringSpeed = Math.min(this.steps[this.index].turn_speed, WHEEL_TARGET_MAX_CM_S);
+      if (x.state === HexagonState.HEXAGON_EXITING) {
+        ringSpeed = Math.min(ringSpeed, JUNCTION_EXIT_SPEED_CM_S);
+      }
+      x.speed_cm_s = ringSpeed;
+    }
+    if (now - x.action_ms >= HEXAGON_ACTION_TIMEOUT_MS ||
+      Math.abs(d - this.entry_cm) >= HEXAGON_ACTION_MAX_CM) {
       this.fail(RouteFailure.ROUTE_FAILURE_ACTION_TIMEOUT);
       return;
     }
-    // Direction / over-rotation guards: the polygon FSM bypasses the generic
-    // EXECUTING checks, so it keeps them explicitly.
-    const targetRad = Math.abs(this.turnTargetRad());
-    const netTurn = (h - h0) * dir;
-    if (netTurn < -JUNCTION_WRONG_WAY_RAD) {
-      this.fail(RouteFailure.ROUTE_FAILURE_WRONG_WAY);
-      return;
+    {
+      const net = (h - h0) * dir;
+      if (net < -JUNCTION_WRONG_WAY_RAD) {
+        this.fail(RouteFailure.ROUTE_FAILURE_WRONG_WAY);
+        return;
+      }
+      if (net > targetRad + HEXAGON_OVERANGLE_RAD) {
+        this.fail(RouteFailure.ROUTE_FAILURE_TURN_LIMIT);
+        return;
+      }
     }
-    if (netTurn > targetRad + HEXAGON_OVERANGLE_RAD) {
-      this.fail(RouteFailure.ROUTE_FAILURE_TURN_LIMIT);
-      return;
-    }
-
-    const narrow = routeIsNarrowLine(o);
-    const centered = narrow && Math.abs(o.position) <= JUNCTION_CENTER_LIMIT;
-    // Only a completely blank bar is treated as true line loss inside the ring;
-    // the printed R14 symbol and the vertex joins keep some channel lit.
+    /* Diagnostic timestamp only: grey lines/losses cannot steer or abort HEXAGON. */
     if (o.line_mask !== 0 && adjacent) {
       x.line_ms = now;
       x.line_cm = d;
     }
 
-    // Ring speed plan (2026-11-09): pivots stay at the settle speed; straight
-    // legs run at HEXAGON_LEG_SPEED_CM_S and brake toward the next vertex with
-    // a_safe so each pivot still starts on its tangent point.
-    {
-      const ringStep = this.steps[this.index];
-      const pivot = Math.min(HEXAGON_SPEED_CM_S, JUNCTION_SETTLE_SPEED_CM_S, ringStep.turn_speed);
-      let ringSpeed = pivot;
-      if (x.state === HexagonState.HEXAGON_FOLLOWING && !x.turning) {
-        const leg = Math.min(HEXAGON_LEG_SPEED_CM_S, this.cruiseSpeed());
-        const gap = Math.hypot(x.vertex_x_cm - axle_x_cm, x.vertex_y_cm - axle_y_cm) - HEXAGON_PIVOT_LEAD_CM;
-        ringSpeed = Math.min(leg, Math.sqrt(pivot * pivot + 2 * BRAKING_SAFE_DECEL_CM_S2 * Math.max(0, gap)));
-      }
-      x.speed_cm_s = ringSpeed;
-    }
-
     if (x.state === HexagonState.HEXAGON_ENTERING) {
-      // The action starts when the 24 cm look-ahead bar reaches V0, so first
-      // drive straight (V0 is ~24 cm ahead of the axle) and only pivot when the
-      // axle is one turn-lead short of the vertex.
-      const rawGap = Math.hypot(axle_x_cm - vertex(0).x, axle_y_cm - vertex(0).y);
-      const entryLead = WHEEL_TRACK_CM * 0.5 * Math.tan(0.5 * turnAngles[0]);
-      if (rawGap > entryLead + 0.6) {
+      const approach = this.steps[this.index].turn_approach_cm ?? 0;
+      const approachCm = approach > 0 ? approach : HEXAGON_ARC_APPROACH_CM;
+      const legacyPoseOnly = this.steps[this.index].segment_length_cm <= 0 &&
+        approach <= 0 && this.pose_mode;
+      let reached: boolean;
+      if (legacyPoseOnly) {
+        const vx0 = HEXAGON_CENTER_X_CM + HEXAGON_SIDE_CM;
+        const vy0 = HEXAGON_CENTER_Y_CM;
+        reached = Math.hypot(axle_x_cm - vx0, axle_y_cm - vy0) <= 1.0;
+      } else {
+        reached = d - this.entry_cm >= approachCm;
+      }
+      if (!reached) {
         x.turning = false;
-        x.use_line = narrow && centered;
-        x.target_heading = h0;
+        x.use_line = false;
+        x.target_heading = hbase;
+        const maxApproach = legacyPoseOnly
+          ? HEXAGON_ENTRY_APPROACH_MAX_CM
+          : Math.max(HEXAGON_ENTRY_APPROACH_MAX_CM, approachCm + 5.0);
         if (now - x.action_ms >= HEXAGON_ACTION_TIMEOUT_MS ||
-          Math.abs(d - this.entry_cm) >= HEXAGON_ENTRY_APPROACH_MAX_CM) {
+          Math.abs(d - this.entry_cm) >= maxApproach) {
           this.fail(RouteFailure.ROUTE_FAILURE_ENTRY_SPEED);
         }
         return;
       }
+      const R = HEXAGON_ARC_RADIUS_CM;
+      const wh0 = hbase + this.start_heading_rad;
+      const nx = -dir * Math.sin(wh0);
+      const ny = dir * Math.cos(wh0);
+      if (this.pose_mode) {
+        x.center_x_cm = axle_x_cm + R * nx;
+        x.center_y_cm = axle_y_cm + R * ny;
+        x.vertex_x_cm = axle_x_cm;
+        x.vertex_y_cm = axle_y_cm;
+        x.leg_from_x_cm = axle_x_cm;
+        x.leg_from_y_cm = axle_y_cm;
+        x.anchor_dx_cm = axle_x_cm - (HEXAGON_CENTER_X_CM + HEXAGON_SIDE_CM);
+        x.anchor_dy_cm = axle_y_cm - HEXAGON_CENTER_Y_CM;
+        x.last_alpha_rad = Math.atan2(-ny, -nx);
+      }
+      x.phase_ms = now;
+      x.phase_cm = d;
+      x.leg_start_cm = d;
+      x.arc_progress_rad = 0;
+      x.radius_err_cm = 0;
+      x.cross_cm = 0;
       x.turning = true;
       x.turn_index = 0;
-      x.target_heading = h0 + dir * turnAngles[0];
-      x.vertex_x_cm = vertex(1).x;
-      x.vertex_y_cm = vertex(1).y;
-      x.leg_from_x_cm = vertex(0).x;
-      x.leg_from_y_cm = vertex(0).y;
+      x.use_line = false;
+      x.target_heading = hbase;
       x.state = HexagonState.HEXAGON_FOLLOWING;
       return;
     }
 
     if (x.state === HexagonState.HEXAGON_FOLLOWING) {
-      if (x.turning) {
-        x.use_line = false;
-        if (Math.abs(wrap(x.target_heading - h)) <= HEXAGON_TURN_TOL_RAD) {
-          x.turning = false;
-          x.leg_start_cm = d;
-          x.line_seen = true;
-          x.line_ms = now;
-          x.line_cm = d;
-          if (x.turn_index >= turnAngles.length - 1) {
-            // Pose-mode ring exit: the axle is at V0 and already turned onto the
-            // external line, so hand over directly instead of waiting for a
-            // centred grey line whose bar may still be inside the ring.
-            x.state = HexagonState.HEXAGON_DONE;
-            x.use_line = false;
-            this.line_exit_confirmed = true;
-            this.line_exit_heading_rad = h;
-            this.enterClear(d, now);
-            return;
-          } else {
-            const from = vertex(x.turn_index);
-            const v = vertex(x.turn_index + 1);
-            x.leg_from_x_cm = from.x;
-            x.leg_from_y_cm = from.y;
-            x.vertex_x_cm = v.x;
-            x.vertex_y_cm = v.y;
-          }
+      const R = HEXAGON_ARC_RADIUS_CM;
+      const sArc = Math.max(0, d - x.phase_cm);
+      let phi = sArc / R;
+      let radialTrim = 0;
+      if (this.pose_mode) {
+        const rx = axle_x_cm - x.center_x_cm;
+        const ry = axle_y_cm - x.center_y_cm;
+        const r = Math.hypot(rx, ry);
+        x.radius_err_cm = r - R;
+        x.cross_cm = x.radius_err_cm;
+        if (r > 5.0) {
+          const alpha = Math.atan2(ry, rx);
+          const da = wrapRad(alpha - x.last_alpha_rad) * dir;
+          x.last_alpha_rad = alpha;
+          x.arc_progress_rad += da;
+          phi = Math.max(0, x.arc_progress_rad);
+        } else {
+          x.arc_progress_rad = phi;
         }
-        return;
-      }
-      const nextAngle = Math.abs(turnAngles[x.turn_index + 1]);
-      const lead = WHEEL_TRACK_CM * 0.5 * Math.tan(0.5 * nextAngle);
-      const gap = Math.hypot(x.vertex_x_cm - axle_x_cm, x.vertex_y_cm - axle_y_cm);
-      if (gap <= lead + (Number.isFinite(axle_x_cm) ? 0.6 : 0)) {
-        ++x.turn_index;
-        x.turning = true;
-        x.target_heading = h0 + dir * cumulative[x.turn_index];
-        x.use_line = false;
-        return;
-      }
-      x.use_line = centered || (narrow && Math.abs(o.position) <= JUNCTION_CENTER_LIMIT + 1);
-      // Blind stretch: the 24 cm bar leaves a 35 cm edge long before the axle
-      // reaches the vertex, so bound the leg by the pose cross-track instead of
-      // the 400 ms grey-loss timer.
-      const ldx = x.vertex_x_cm - x.leg_from_x_cm;
-      const ldy = x.vertex_y_cm - x.leg_from_y_cm;
-      const llen = Math.hypot(ldx, ldy);
-      if (llen > 1e-3) {
-        x.cross_cm = (-(axle_x_cm - x.leg_from_x_cm) * ldy +
-          (axle_y_cm - x.leg_from_y_cm) * ldx) / llen;
+        const maxTrim = targetRad - phi < 0.35 ? 0.10 : HEXAGON_ARC_RADIAL_MAX_RAD;
+        radialTrim = Math.max(-maxTrim, Math.min(maxTrim,
+          HEXAGON_ARC_RADIAL_KP * x.radius_err_cm));
+        if (targetRad - phi < 0.25) {
+          radialTrim *= Math.max(0, (targetRad - phi) / 0.25);
+        }
       } else {
+        x.arc_progress_rad = phi;
+        x.radius_err_cm = 0;
         x.cross_cm = 0;
       }
-      if (Number.isFinite(axle_x_cm) && Math.abs(x.cross_cm) > HEXAGON_LEG_CROSS_MAX_CM) {
-        this.fail(RouteFailure.ROUTE_FAILURE_EXIT_LOST);
-        return;
+      const clampedPhi = Math.min(targetRad, phi);
+      x.target_heading = hbase + dir * (clampedPhi + radialTrim);
+      x.turning = true;
+      x.use_line = false;
+      const yawProgress = (h - hbase) * dir;
+      const distReady = sArc >= HEXAGON_ARC_MIN_PROGRESS_RATIO * R * targetRad;
+      const poseReady = !this.pose_mode || x.arc_progress_rad >= targetRad - 0.35;
+      if (yawProgress >= targetRad - HEXAGON_ARC_EXIT_TOL_RAD &&
+        distReady && poseReady) {
+        x.turning = false;
+        x.use_line = false;
+        if (this.pose_mode) {
+          x.state = HexagonState.HEXAGON_DONE;
+          this.line_exit_confirmed = true;
+          this.line_exit_heading_rad = hbase + dir * targetRad;
+          this.arc_just_exited = true;
+          this.enterClear(d, now);
+        } else {
+          x.state = HexagonState.HEXAGON_EXITING;
+          x.phase_ms = now;
+          x.phase_cm = d;
+          x.center_samples = 0;
+          x.center_pending = false;
+        }
       }
       return;
     }
 
     if (x.state === HexagonState.HEXAGON_EXITING) {
-      x.use_line = centered;
-      if (
-        now - x.phase_ms >= HEXAGON_EXIT_TIMEOUT_MS ||
-        Math.abs(d - x.phase_cm) >= HEXAGON_EXIT_MAX_CM
-      ) {
+      /* Retained for the legacy POSE_NAV_ENABLED=0 (grey-only) contract. */
+      const narrow = routeIsNarrowLine(o);
+      const centered = narrow && Math.abs(o.position) <= JUNCTION_CENTER_LIMIT;
+      x.use_line = narrow;
+      if (now - x.phase_ms >= HEXAGON_EXIT_TIMEOUT_MS ||
+        Math.abs(d - x.phase_cm) >= HEXAGON_EXIT_MAX_CM) {
         this.fail(RouteFailure.ROUTE_FAILURE_EXIT_LOST);
         return;
       }
@@ -1465,11 +1501,9 @@ export class RoutePlannerModel {
         }
         if (x.center_samples < LINE_CONFIRM_SAMPLES) ++x.center_samples;
       }
-      if (
-        x.center_samples >= LINE_CONFIRM_SAMPLES &&
+      if (x.center_samples >= LINE_CONFIRM_SAMPLES &&
         now - x.center_ms >= HEXAGON_EXIT_CONFIRM_MS &&
-        d - x.center_cm >= HEXAGON_EXIT_CONFIRM_CM
-      ) {
+        d - x.center_cm >= HEXAGON_EXIT_CONFIRM_CM) {
         x.state = HexagonState.HEXAGON_DONE;
         this.line_exit_confirmed = true;
         this.line_exit_heading_rad = h;
@@ -1539,7 +1573,7 @@ export class RoutePlannerModel {
     this.arc_desired_heading_rad = this.arc_active
       ? alpha + dir * (Math.PI / 2) + Math.PI / 2
       : segHeading;
-    const v = CORNER_ARC_SPEED_CM_S;
+    const v = Math.min(this.steps[this.index].turn_speed, WHEEL_TARGET_MAX_CM_S);
     this.arc_outer_cm_s = this.arc_active ? v * (1 + track / (2 * R)) : v;
     const diffTarget = this.arc_active ? (v * track) / (2 * R) : 0;
     const step = CORNER_ARC_DIFF_SLEW_CM_S2 * dt;
@@ -1807,8 +1841,32 @@ export class RoutePlannerModel {
         d >= this.approach_center_cm &&
         d - this.approach_center_cm <= JUNCTION_CENTER_MEMORY_CM;
 
-      const history = (this.state === RouteState.ROUTE_CANDIDATE && d >= this.entry_cm) || recent_center;
-      const { kind, sides } = junctionShape(o);
+      let history = (this.state === RouteState.ROUTE_CANDIDATE && d >= this.entry_cm) || recent_center;
+      /* 整排横杠是横向结构，不会像窄线那样向边缘横移，可以独立作为节点证据；
+       * 仍受同一距离门禁、计数和离口去重约束。2026-11-13（方案 1 实车）：
+       * 环岛出口后车体略偏，接近段没有 3 帧中心记忆，到 (345,220) 的整排横杠
+       * 时被 JUNCTION_REJECT_HISTORY 拒绝，直行出赛道。 */
+      if (o.line_mask === 0xff && (!this.steps[this.index].close_corner || d - this.clear_cm > 4.0)) {
+        history = true;
+      }
+      /* After a HEXAGON INS arc the car may leave the circle slightly offset
+       * without building 3 centred frames before (345,220) or Q13: accept a
+       * confirmed >=4-channel target branch/bar. */
+      if (this.index > 0 && this.steps[this.index - 1].action === Action.HEXAGON &&
+        this.targetReady(d, true) && o.white_count >= 4) {
+        history = true;
+        this.smooth_edge_sides = 0;
+      }
+      let { kind, sides } = junctionShape(o);
+      /* R17 紧接 (275,0) 的 T 形路口：出电阻后车体微偏（|position|>2）就没有
+       * 3 帧中心记忆，可能还锁存 smooth_edge_sides。该行已计过 R17 且达段距
+       * 门禁后，单侧左支 T 口（0x0e/0x0f/0x1f/0x3f）直接放行历史。 */
+      if (this.steps[this.index].close_corner === true && this.junctions_seen >= 1 &&
+        this.targetReady(d, true) && kind !== JunctionEvidence.JUNCTION_EVIDENCE_NONE &&
+        (sides & 1) !== 0 && o.line_mask !== 0xff) {
+        history = true;
+        this.smooth_edge_sides = 0;
+      }
       // A gradually shifting single line can still include a center channel
       // (e.g. 0x38 -> 0x30 -> 0x70). Keep its same-side suppression when
       // classified CENTER_BRANCH; an abrupt or separated branch stays eligible.
@@ -2243,12 +2301,13 @@ export class RoutePlannerModel {
        * 只要求 0.3 cm 就交回正常候选流程；角点仍须自己完成连续帧/位移确认，
        * 段距门禁、计数和解口去重其它行均不变。 */
       const closeRow = this.steps[this.index].close_corner === true;
-      const clearDistance = closeRow ? JUNCTION_ADJACENT_EXIT_CM : ROUTE_CLEAR_POSE_CM;
-      if (d - this.clear_cm < clearDistance || (branch && !history)) return;
+      const clearDistance = closeRow && history ? JUNCTION_ADJACENT_EXIT_CM : ROUTE_CLEAR_POSE_CM;
+      if (d - this.clear_cm < clearDistance ||
+        ((!routeIsNarrowLine(o) || branch) && !history)) return;
       const centerMs = this.approach_center_ms;
       const centerCm = this.approach_center_cm;
-      if (history && this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_PASS &&
-        (branch || this.targetReady(d, false))) {
+      if (this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_PASS &&
+        (closeRow || (history && (branch || this.targetReady(d, false))))) {
         this.bar_hold_state = RouteBarHoldState.ROUTE_BAR_HOLD_NONE;
       }
       if (!this.completeClear(d, now) || !history) return;
@@ -2269,6 +2328,8 @@ export class RoutePlannerModel {
       this.completeClear(d, now);
       return;
     }
+    /* 环岛圆弧自己完成出环交棒，不再走 2 cm 位姿离口重置。 */
+    if (this.pose_mode && s.action === Action.HEXAGON && !this.passing_junction) return;
 
     const straight = this.currentAction() === Action.STRAIGHT;
 

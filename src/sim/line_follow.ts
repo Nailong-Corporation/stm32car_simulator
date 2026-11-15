@@ -87,6 +87,14 @@ import {
   POSE_PURSUIT_LOOKAHEAD_CM,
   ROUTE_WAYPOINT_GATE_CM,
   HEXAGON_TURN_TOL_RAD,
+  DASHED_HOLD_LOSS_MS,
+  DASHED_HOLD_LOSS_CM,
+  DASHED_HOLD_EXTRA_CM,
+  ROUTE_WAYPOINT_MARGIN_CM,
+  HEXAGON_ARC_RADIUS_CM,
+  ODOMETRY_HEADING_SCALE,
+  HEXAGON_ARC_HEADING_KP,
+  HEXAGON_ARC_YAW_DAMPING,
 } from './config';
 import { OdometryModel, defaultOdometryCalibration } from './odometry';
 import { RoutePlannerModel, routeIsNarrowLine, routeIsClearLine, routeGrayShowsBranch } from './route';
@@ -374,14 +382,14 @@ export class LineFollowModel {
     return routeIsNarrowLine(obs);
   }
 
-  /** Ordinary maneuvers use route phase bounds; HEXAGON keeps its own loss rules. */
+  /** ROUTE owns gray loss across active manoeuvres (including the HEXAGON INS
+   * arc) and clearances (line_follow.c 2026-11-15). */
   private routeOwnsGrayLoss(): boolean {
     const r = this.route;
     return r.state === RouteState.ROUTE_BRAKING ||
       r.state === RouteState.ROUTE_RECOVERING ||
-      ((r.state === RouteState.ROUTE_EXECUTING || r.state === RouteState.ROUTE_CLEARING) &&
-        (r.steps[r.index]?.action !== Action.HEXAGON ||
-         (r.state === RouteState.ROUTE_EXECUTING && r.turn_approaching)));
+      r.state === RouteState.ROUTE_EXECUTING ||
+      r.state === RouteState.ROUTE_CLEARING;
   }
 
   public update(
@@ -483,8 +491,27 @@ export class LineFollowModel {
     const poseBoundedLoss = this.route.pose_mode &&
       (this.route.state === RouteState.ROUTE_FOLLOW ||
         this.route.state === RouteState.ROUTE_CANDIDATE);
-    const lost_ms = poseBoundedLoss ? POSE_BOUNDED_LOSS_MS : INTERFERENCE_TIMEOUT_MS;
-    const lost_cm = poseBoundedLoss ? POSE_BOUNDED_LOSS_CM : INTERFERENCE_MAX_DISTANCE_CM;
+    /* 虚线行（2026-11-12 实车）：24 cm 前伸杆常落在短划之间的空白上，那是
+     * 虚线本身的结构，不是丢线。虚线行（含进入它的那一弯）按位姿航向直行。 */
+    const dashedHold = this.route.dashedHold();
+    const afterHexagon = this.route.pose_mode && this.route.index > 0 &&
+      this.route.steps[this.route.index - 1]?.action === Action.HEXAGON &&
+      (this.route.state === RouteState.ROUTE_FOLLOW ||
+        this.route.state === RouteState.ROUTE_CANDIDATE);
+    let lost_ms = dashedHold ? DASHED_HOLD_LOSS_MS
+      : (poseBoundedLoss ? POSE_BOUNDED_LOSS_MS : INTERFERENCE_TIMEOUT_MS);
+    let lost_cm = dashedHold ? DASHED_HOLD_LOSS_CM
+      : (poseBoundedLoss ? POSE_BOUNDED_LOSS_CM : INTERFERENCE_MAX_DISTANCE_CM);
+    if (dashedHold || afterHexagon) {
+      /* 虚线整行或环岛出环直行段允许覆盖本行段距并留余量，避免未到下一路口
+       * 就按 30 cm 判丢线。 */
+      const rowLen = this.route.index < this.route.count
+        ? this.route.steps[this.route.index].segment_length_cm : 0;
+      const extra = dashedHold ? DASHED_HOLD_EXTRA_CM : 10.0;
+      lost_cm = Math.max(lost_cm, rowLen + ROUTE_WAYPOINT_MARGIN_CM + extra);
+      const rowMs = Math.floor((lost_cm / 10.0) * 1000);
+      if (rowMs > lost_ms) lost_ms = rowMs;
+    }
     const gray_loss_expired = this.abnormal && !component_crossing &&
       (now_ms - this.last_reliable_ms >= lost_ms ||
         Math.abs(this.odometry.distance_cm - this.abnormal_origin_cm) >= lost_cm);
@@ -704,7 +731,7 @@ export class LineFollowModel {
       base_speed = Math.min(
         base_speed,
         rolled_corner
-          ? CORNER_ARC_SPEED_CM_S
+          ? Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S)
           : Math.min(step.turn_speed, JUNCTION_EXIT_SPEED_CM_S)
       );
     }
@@ -756,7 +783,9 @@ export class LineFollowModel {
         this.abnormal = true;
         this.abnormal_origin_cm = this.odometry.distance_cm;
       }
-      const cap = Math.min(base_speed, Math.min(step.turn_speed, JUNCTION_SETTLE_SPEED_CM_S));
+      const cap = this.route.state === RouteState.ROUTE_EXECUTING
+        ? Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S)
+        : Math.min(base_speed, step.turn_speed);
       const correction = HEADING_KP_CM_S_PER_RAD *
         (this.route.bar_hold_heading_rad - this.odometry.heading_rad) -
         JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
@@ -772,8 +801,7 @@ export class LineFollowModel {
     } else if (
       this.route.pose_mode &&
       this.route.pose_cross_valid &&
-      this.route.state === RouteState.ROUTE_FOLLOW &&
-      step.action !== Action.HEXAGON
+      this.route.state === RouteState.ROUTE_FOLLOW
     ) {
       // 2026-11-08 field fix: on a straight the lateral correction must be owned
       // by the grey position PID. The old branch treated the pose segment as the
@@ -793,7 +821,8 @@ export class LineFollowModel {
        * 分支并入时保持本行线段方向，等支路离开杆后再交回位置 PID；它是结构而
        * 不是丢线，因此不启动丢线窗口。 */
       const branch = routeGrayShowsBranch(obs);
-      const usable = trusted && narrow && !branch;
+      /* 虚线行：短划不是可靠控制目标，保持位姿航向直行，等末端整排实线确认。 */
+      const usable = trusted && narrow && !branch && !dashedHold;
       if (usable) {
         if (stable) {
           this.have_reliable = true;
@@ -837,21 +866,18 @@ export class LineFollowModel {
         this.state = LineState.LINE_TRACKING;
         this.outerTargets(base, correction, dt);
       } else {
-        // Grey unusable: hold the pose segment direction and pull the car back
-        // onto that segment with the cross-track term (inside the bounded window
-        // while a printed symbol hides the wire or the narrow line is lost).
-        const cross = this.route.pose_cross_cm;
-        const desired = this.route.pose_seg_heading_rad +
-          Math.atan2(-cross, POSE_PURSUIT_LOOKAHEAD_CM);
+        // Grey unusable: hold this segment's heading (not the global waypoint
+        // chain's cross-track, whose accumulated drift would pull the car off
+        // the wire while crossing a resistor or a short loss).
         let corr = HEADING_KP_CM_S_PER_RAD *
-          Math.atan2(Math.sin(desired - this.odometry.heading_rad),
-            Math.cos(desired - this.odometry.heading_rad));
+          Math.atan2(Math.sin(this.route.pose_seg_heading_rad - this.odometry.heading_rad),
+            Math.cos(this.route.pose_seg_heading_rad - this.odometry.heading_rad));
         // Right after a rolling corner the released differential keeps yawing the
         // car for ~0.1-0.3 s; damping the measured yaw rate stops the drift much
-        // sooner than the cross-track term alone.
-        if (this.inCornerExit()) {
-          corr -= CORNER_ARC_EXIT_DAMPING * this.turn_yaw_rate_rad_s;
-        }
+        // sooner than the axis hold alone.
+        corr -= (this.inCornerExit()
+          ? CORNER_ARC_EXIT_DAMPING
+          : STRAIGHT_YAW_DAMPING) * this.turn_yaw_rate_rad_s;
         const cap = 0.5 * Math.max(base_speed, 1);
         corr = Math.max(-cap, Math.min(cap, corr));
         this.state = LineState.LINE_GAP_HOLD;
@@ -914,46 +940,74 @@ export class LineFollowModel {
           JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s,
         dt
       );
-    } else if (this.route.state === RouteState.ROUTE_EXECUTING && step.action === Action.HEXAGON) {
+    } else if ((this.route.state === RouteState.ROUTE_EXECUTING ||
+      (this.route.state === RouteState.ROUTE_CLEARING && this.route.pose_mode &&
+        !this.route.passing_junction)) &&
+      step.action === Action.HEXAGON && !this.route.passing_junction) {
+      /* HEXAGON INS arc (line_follow.c 2026-11-15): constant axle speed on the
+       * circle, feed-forward differential v*track/(2R), heading feedback against
+       * the tangent and yaw-rate damping. The grey line never steers here. */
       const x = this.route.hexagon;
       this.state = LineState.LINE_JUNCTION;
       this.abnormal = false;
-      this.exit_accelerating = false;
-      if (previous_route !== RouteState.ROUTE_EXECUTING) this.pid.reset();
-      // Ring speed comes from the route plan (pivot speed at the vertices, leg
-      // speed on the edges with a braking envelope toward the next vertex).
-      const outer = x.speed_cm_s > 0
+      this.component_cross_latched = false;
+      this.have_reliable = true;
+      this.last_reliable_ms = now_ms;
+      this.pid.reset();
+      const requested = x.speed_cm_s > 0
         ? x.speed_cm_s
-        : Math.min(step.turn_speed, Math.min(HEXAGON_SPEED_CM_S, JUNCTION_SETTLE_SPEED_CM_S));
-      let correction = 0;
-      if (x.turning) {
-        // Pose-mode ring: pivot to the next 30/60 degree vertex heading.  The
-        // saturated proportional term reproduces the track/2 pivot radius the
-        // rounded-corner polygon assumes; damping kills the residual rate.
-        this.pid.reset();
-        const err = x.target_heading - this.odometry.heading_rad;
-        correction = HEXAGON_TURN_KP * err - HEXAGON_TURN_DAMPING * this.turn_yaw_rate_rad_s;
-        correction = Math.max(-0.5 * outer, Math.min(0.5 * outer, correction));
-        this.outerTargets(outer, correction, dt);
-      } else if (x.use_line) {
-        const res = this.pid.update(obs.position, dt, 0.5 * outer);
-        correction = res.output - JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
-        this.outerTargets(outer, correction, dt);
-      } else {
-        this.pid.reset();
-        correction =
-          HEADING_KP_CM_S_PER_RAD * (x.target_heading - this.odometry.heading_rad) -
-          JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
-        // Inside-ring legs use the leg cross-track; the entry approach still
-        // uses the incoming segment's cross-track so a drifted approach lands
-        // on V0 instead of beside it.
-        if (this.route.pose_mode) {
-          correction -= JUNCTION_CROSS_KP * (x.cross_cm !== 0
-            ? x.cross_cm : this.route.pose_cross_cm);
+        : Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S);
+      const axle = Math.min(WHEEL_TARGET_MAX_CM_S, this.nextOuter(requested, dt));
+      let diff = 0;
+      if (this.route.state === RouteState.ROUTE_EXECUTING && x.turning) {
+        const dir = this.route.turnTargetRad() >= 0 ? 1 : -1;
+        const R = HEXAGON_ARC_RADIUS_CM;
+        const yawScale =
+          this.heading_source === HeadingSource.HEADING_ENCODER &&
+          ODOMETRY_HEADING_SCALE > 0.1 ? ODOMETRY_HEADING_SCALE : 1;
+        const ff = (dir * axle * WHEEL_TRACK_CM) / (2 * R);
+        const omegaRef = (dir * axle) / R;
+        const err = Math.atan2(
+          Math.sin(x.target_heading - this.odometry.heading_rad),
+          Math.cos(x.target_heading - this.odometry.heading_rad)
+        );
+        diff = (ff + HEXAGON_ARC_HEADING_KP * err -
+          HEXAGON_ARC_YAW_DAMPING * (this.turn_yaw_rate_rad_s - omegaRef)) / yawScale;
+        diff = Math.max(-0.9 * axle, Math.min(0.9 * axle, diff));
+      } else if (!this.route.pose_mode && this.route.state === RouteState.ROUTE_EXECUTING && x.use_line) {
+        const res = this.pid.update(obs.position, dt, 0.5 * axle);
+        if (!res.success) {
+          this.stop(LineStopReason.LINE_STOP_FAULT);
+          return;
         }
-        correction = Math.max(-0.5 * outer, Math.min(0.5 * outer, correction));
-        this.outerTargets(outer, correction, dt);
+        diff = res.output - JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
+        diff = Math.max(-0.5 * axle, Math.min(0.5 * axle, diff));
+      } else {
+        const refHeading = this.route.state === RouteState.ROUTE_CLEARING
+          ? this.route.line_exit_heading_rad
+          : x.target_heading;
+        const err = Math.atan2(
+          Math.sin(refHeading - this.odometry.heading_rad),
+          Math.cos(refHeading - this.odometry.heading_rad)
+        );
+        diff = HEADING_KP_CM_S_PER_RAD * err -
+          JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s;
+        diff = Math.max(-0.5 * axle, Math.min(0.5 * axle, diff));
       }
+      let left = axle + diff;
+      let right = axle - diff;
+      const peak = Math.max(left, right);
+      if (peak > WHEEL_TARGET_MAX_CM_S) {
+        const scale = WHEEL_TARGET_MAX_CM_S / peak;
+        left *= scale;
+        right *= scale;
+      }
+      this.left_target_cm_s = Math.max(0, left);
+      this.right_target_cm_s = Math.max(0, right);
+      this.base = 0.5 * (this.left_target_cm_s + this.right_target_cm_s);
+      this.correction = 0.5 * (this.left_target_cm_s - this.right_target_cm_s);
+      this.startup_elapsed_s = Math.min(STARTUP_RAMP_TIME_S, this.startup_elapsed_s + dt);
+      this.exit_accelerating = this.route.state === RouteState.ROUTE_CLEARING;
     } else if (this.route.state === RouteState.ROUTE_EXECUTING) {
       this.exit_accelerating = false;
       if (previous_route !== RouteState.ROUTE_EXECUTING) {
@@ -965,10 +1019,9 @@ export class LineFollowModel {
       const direction = this.route.currentAction() === Action.LEFT ? -1.0 : 1.0;
       const target = this.route.turnTargetRad();
       const turn = direction * (this.odometry.heading_rad - this.route.entry_heading);
-      const outer =
-        this.route.currentAction() === Action.STRAIGHT
-          ? step.turn_speed
-          : Math.min(step.turn_speed, JUNCTION_SETTLE_SPEED_CM_S);
+      /* 外轮目标直接按表内 turn_speed 执行（受单轮天花板保护），不再用固定
+       * settle 常量钳死高速转弯表值。 */
+      const outer = Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S);
       const remaining = Math.abs(target) - turn;
       const band = Math.min(JUNCTION_SETTLE_BAND_RAD, 0.4 * Math.abs(target));
       const settling = this.route.currentAction() !== Action.STRAIGHT && band > 0 && remaining <= band;
@@ -986,7 +1039,7 @@ export class LineFollowModel {
         // desired heading from the circle, so this is real path following)
         // steers back onto the circle. The inner wheel keeps rolling.
         this.pid.reset();
-        const axle = CORNER_ARC_SPEED_CM_S;
+        const axle = Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S);
         const err = Math.atan2(
           Math.sin(this.route.arc_desired_heading_rad - this.odometry.heading_rad),
           Math.cos(this.route.arc_desired_heading_rad - this.odometry.heading_rad)
@@ -1076,7 +1129,7 @@ export class LineFollowModel {
       this.abnormal = false;
       this.pid.reset();
       this.outerTargets(
-        Math.min(base_speed, JUNCTION_SETTLE_SPEED_CM_S),
+        Math.min(base_speed, step.turn_speed),
         HEADING_KP_CM_S_PER_RAD * (this.route.line_exit_heading_rad - this.odometry.heading_rad),
         dt
       );
