@@ -165,6 +165,17 @@ export class VehicleSimulator {
   }
 
   /** One user START: sample the line first, then submit a single controller request. */
+  /* route_scenario_start_pose() 把赛道坐标系整体挪到表的起跑锚点（方案 9 右下角、
+   * 方案 8/10 环岛南向）。车体与灰度采样都必须从这个锚点起步，否则仿真的车
+   * 还在 P(0,110) 朝北，而路径链已经在锚点上——前 20 cm 就会判丢线。 */
+  public applyRouteAnchor(): void {
+    const r = this.follow.route;
+    const heading = r.start_heading_rad;
+    if (this.pose.x === r.start_x_cm && this.pose.y === r.start_y_cm &&
+      Math.abs(this.pose.heading - heading) < 1e-9) return;
+    this.reset({ x: r.start_x_cm, y: r.start_y_cm, heading });
+  }
+
   public requestStart(): void {
     if (this.follow.state === LineState.LINE_IDLE && this.startupSamplesRemaining === 0) {
       this.startupSamplesRemaining = LINE_CONFIRM_SAMPLES;

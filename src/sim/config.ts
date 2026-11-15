@@ -195,15 +195,10 @@ export const JUNCTION_TURN_TARGET_RAD = 1.570796327;
 export const JUNCTION_SETTLE_BAND_RAD = 0.60;
 export const JUNCTION_PASS_ALIGNED_RAD = 0.10;
 export const JUNCTION_PASS_SETTLED_YAW_RAD_S = 0.15;
-/* motion_config.h 2026-11-13 解锁：入弯门禁与外轮目标直接读表内 turn_speed，
- * 同名常量保留为上限对照（= WHEEL_TARGET_MAX_CM_S），不再钳死高速表值。 */
+/* 固件 2026-11-14（motion_config.h）：JUNCTION_SETTLE_SPEED_CM_S 直接等于
+ * WHEEL_TARGET_MAX_CM_S——转弯入弯门禁与外轮目标改读本行 turn_speed，28 cm/s 的
+ * 全局上限已解除。常量保留同名，供旧夹具对照。 */
 export const JUNCTION_SETTLE_SPEED_CM_S = WHEEL_TARGET_MAX_CM_S;
-/* motion_config.h SHORT_LINK_TURN_EARLY_CM：145/142 cm 电阻行的短连接枢轴提前量。 */
-export const SHORT_LINK_TURN_EARLY_CM = 1.0;
-/* motion_config.h 2026-11-12 虚线整行保持：短划/空白都不是丢线。 */
-export const DASHED_HOLD_LOSS_MS = 3200;
-export const DASHED_HOLD_LOSS_CM = 50.0;
-export const DASHED_HOLD_EXTRA_CM = 15.0;
 export const JUNCTION_SETTLE_HEADING_KP = 24.0;
 /* 2026-11-10 现场：枢轴尾段比例项趋零时，混速器把两轮都放到外轮速度，车“边直行边拧”，
  * 最后 1–2° 要跑十几厘米，转弯点被推过线。尾段必须保留能继续转的轮速差。 */
@@ -434,3 +429,17 @@ export const NAVIGATION_RECOVERY_SPEED_CM_S = 16.0;
 export const GRAY_INVERT_ENABLED = 0;
 export const LOST_LINE_STOP_ENABLED = 0;
 export const FLOOR_SEAM_FILTER_ENABLED = 0;
+
+/* 2026-11-12 firmware motion_config.h：进入“y40 西行过 R25”那一行（表内 145/142
+ * cm）的短连接转弯再提前 1 cm，让出弯探头落在电阻之前；0 = 半个轮距几何。 */
+export const SHORT_LINK_TURN_EARLY_CM = 1.0;
+/* 出口搜索在印刷元件（空心电阻/极板）下允许延长一次 COMPONENT_CROSS_* 预算。 */
+export const EXIT_COMPONENT_EXTEND_ENABLED = true;
+
+/* 2026-11-12 firmware motion_config.h：虚线行（5/5 cm）的短划/空白不是丢线。
+ * 虚线行（以及进入它的那一行）放宽有界丢线窗口，按位姿航向直行捕线。 */
+export const DASHED_HOLD_LOSS_MS = 3200;
+export const DASHED_HOLD_LOSS_CM = 50.0;
+export const DASHED_HOLD_EXTRA_CM = 15.0;
+/* 虚线行内的路口判据：只有末端“一排光电管全检测到”的实线才算节点。 */
+export const DASHED_NODE_MIN_WHITE = 6;

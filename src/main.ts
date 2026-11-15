@@ -47,7 +47,8 @@ class App {
 
     this.trackRenderer = new TrackRenderer(this.canvas);
     this.carRenderer = new CarRenderer(this.trackRenderer);
-    this.lineFollow = new LineFollowModel(this.parseResult.activeSteps);
+    this.lineFollow = new LineFollowModel(this.parseResult.activeSteps,
+      this.parseResult.activeStartPose);
     this.vehicleSim = new VehicleSimulator(this.lineFollow);
 
     this.initCanvasSize();

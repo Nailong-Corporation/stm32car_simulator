@@ -22,16 +22,21 @@ try {
   for(const scheme of schemes.filter(s=>poseNav ? s.id>0 : true)) {
     const executable=join(temp,`controller-${scheme.id}`);
     const defines=poseNav ? [] : ['-DPOSE_NAV_ENABLED=0'];
-    /* The firmware builds with PlatformIO's default -std=gnu11, so M_PI and the
-     * other GNU libm extensions must stay visible here; -pedantic would reject
-     * them on a strict ISO dialect. */
-    const compile=spawnSync(process.env.CC ?? 'cc',['-std=gnu11','-Wall','-Wextra','-Werror',
+    /* 固件的 route.c 直接用 M_PI（PlatformIO 以 gnu11 构建）；宿主 gcc 在严格 c11
+     * 下需要 _USE_MATH_DEFINES 或 gnu11。这里用 gnu11 并保留 -Wall -Wextra，
+     * 去掉 -Werror/-pedantic 以兼容 MinGW（w64devkit）与 clang 的差异。 */
+    const compile=spawnSync(process.env.CC ?? 'cc',['-std=gnu11','-Wall','-Wextra',
       '-I'+join(firmware,'include'),'-DROUTE_SCHEME_SELECT='+scheme.id,...defines,
       ...['test/replay_controller.c','src/route_table.c','src/line_follow.c','src/route.c',
       'src/gray_sensor.c','src/pid.c','src/odometry.c','src/braking_planner.c','src/speed_control.c'].map(p=>join(firmware,p)),
       '-lm','-o',executable],{encoding:'utf8'});
     assert.equal(compile.status,0,compile.stderr);
-    const f=new LineFollowModel(scheme.steps), sim=new VehicleSimulator(f);
+    /* route_scenario_start_pose(): 方案 9（右下角）与方案 8/10（环岛南向）在
+     * 表内重锚赛道坐标系；仿真的车体与灰度采样必须从同一锚点起步，C 侧直接
+     * 使用编译进表的锚点。 */
+    const f=new LineFollowModel(scheme.steps,scheme.start_pose), sim=new VehicleSimulator(f);
+    if(scheme.start_pose) sim.reset({x:scheme.start_pose.x_cm,y:scheme.start_pose.y_cm,
+      heading:scheme.start_pose.heading_rad});
     f.route.repeat_count=1;
     if(!poseNav) f.route.pose_enabled=false;
     const inputs=[], expected=[];

@@ -25,8 +25,8 @@ export interface RouteStep {
   /* R17 紧接 (275,0) 角点的 95 cm 行（route_scenario_close_corner）：本行的
    * 枢轴直走距离改用“到几何角点”的里程。由 route_parser 按表内容标记，不绑定行号。 */
   close_corner?: boolean;
-  /* 虚线行（route_scenario_dashed_row）：短划/空白都不参与巡检，整行按位姿航向直行。 */
-  dashed?: boolean;
+  /* route_scenario_dashed_row(): 虚线行（内容匹配，不绑定行号）。 */
+  dashed_row?: boolean;
   comment?: string;        /* Associated comment in route_table.c */
   rawLine?: string;
 }
@@ -132,6 +132,12 @@ export interface HexagonNavigation {
   vertex_x_cm: number;
   /** Ring speed plan (pivot at vertices, leg speed + braking envelope on edges). */
   speed_cm_s: number;
+  /* 2026-11-13 整圈现场的环岛位姿锚点：入环直行按本行段距剩余推进，在
+   * ENTERING→FOLLOWING 的枢轴点用“当前轴 + entry_lead”把固定六边形平移过来。
+   * 整圈 1000+ cm 的里程/航向误差可达几十 cm，固定几何的绝对位姿入口会永远
+   * 到不了 V0；只平移、不旋转。 */
+  anchor_dx_cm: number;
+  anchor_dy_cm: number;
   vertex_y_cm: number;
   leg_start_cm: number;
   /* Inside-ring leg line (from the vertex just passed to the next one) and the
@@ -139,15 +145,8 @@ export interface HexagonNavigation {
   leg_from_x_cm: number;
   leg_from_y_cm: number;
   cross_cm: number;
-  /* 2026-11-13 整圈现场：入环位姿锚点（只平移固定六边形，保持车与环的相对关系）。 */
-  anchor_dx_cm: number;
-  anchor_dy_cm: number;
-  /* 2026-11-15 INS 圆弧状态（R = HEXAGON_ARC_RADIUS_CM）。 */
-  center_x_cm: number;
-  center_y_cm: number;
-  radius_err_cm: number;
-  arc_progress_rad: number;
-  last_alpha_rad: number;
+  /** 出环回中基准航向（= 入环时的计划航向 hbase，整圈 360° 后回到它）。 */
+  exit_heading_rad: number;
 }
 
 export enum GrayKind {

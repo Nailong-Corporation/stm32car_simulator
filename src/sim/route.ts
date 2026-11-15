@@ -12,6 +12,7 @@ import {
   type GrayObservation,
   GrayKind,
 } from './types';
+import { grayIsComponentPattern } from './gray_sensor';
 import {
   CONTROL_MAX_INTERVAL_MS,
   LINE_CONFIRM_SAMPLES,
@@ -54,7 +55,7 @@ import {
   JUNCTION_CLEAR_MAX_CM,
   JUNCTION_TURN_TARGET_RAD,
   JUNCTION_SETTLE_SPEED_CM_S,
-  SHORT_LINK_TURN_EARLY_CM,
+  JUNCTION_EXIT_SPEED_CM_S,
   COMPONENT_RECOVERY_MAX_CM,
   COMPONENT_RECOVERY_TIMEOUT_MS,
   BRAKING_CALIBRATION_CONFIRMED,
@@ -90,6 +91,10 @@ import {
   ROUTE_START_HEADING_RAD,
   ROUTE_REPEAT_COUNT,
   ROUTE_WAYPOINT_MARGIN_CM,
+  DASHED_HOLD_LOSS_MS,
+  DASHED_HOLD_LOSS_CM,
+  DASHED_HOLD_EXTRA_CM,
+  DASHED_NODE_MIN_WHITE,
   ROUTE_MAX_STEPS,
   ROUTE_WAYPOINT_EXIT_CM,
   ROUTE_WAYPOINT_EXIT_ANGLE_RAD,
@@ -114,6 +119,10 @@ import {
   NAVIGATION_RECOVERY_MS,
   NAVIGATION_RECOVERY_CM,
   WHEEL_TARGET_MAX_CM_S,
+  SHORT_LINK_TURN_EARLY_CM,
+  EXIT_COMPONENT_EXTEND_ENABLED,
+  COMPONENT_CROSS_MS,
+  COMPONENT_CROSS_MAX_CM,
   CORNER_RADIUS_CM,
   CORNER_ARC_RADIUS_CM,
   CORNER_ARC_SPEED_CM_S,
@@ -256,6 +265,9 @@ export class RoutePlannerModel {
 
   public hexagon: HexagonNavigation = {
     state: HexagonState.HEXAGON_OFF,
+    exit_heading_rad: 0,
+    anchor_dx_cm: 0,
+    anchor_dy_cm: 0,
     phase_ms: 0,
     action_ms: 0,
     line_ms: 0,
@@ -352,6 +364,8 @@ export class RoutePlannerModel {
   public exit_candidate_ms = 0;
   public exit_candidate_cm = 0;
   public exit_candidate_pending = false;
+  /* 宽线图形只延长一次出口搜索（firmware exit_component_extension_used）。 */
+  public exit_component_extension_used = false;
   /* 短连接/普通偏边出口的“同侧连续采样”：side 1 = 负位置、2 = 正位置。
    * 换侧即清零，避免把扫线时的一帧当出口（route.h short_exit_edge_*）。 */
   public short_exit_edge_side = 0;
@@ -451,6 +465,10 @@ export class RoutePlannerModel {
    * this corner), used for path-following between the grey line drops. */
   public pose_seg_heading_rad = 0;
   public pose_cross_valid = false;
+  /* 本周期传入的轮轴位姿（firmware route.pose_axle_x/y_cm）：出环横偏要用它
+   * 相对“锚定 V0 + 出口航向”量取，而不是全局 waypoint 链的 cross。 */
+  public pose_axle_x_cm = 0;
+  public pose_axle_y_cm = 0;
   /* Track-frame pose the route table is anchored on.  The official run starts
    * at P (0,110) heading north; scenario tests may re-anchor it before start. */
   public start_x_cm = ROUTE_START_X_CM;
@@ -641,8 +659,8 @@ export class RoutePlannerModel {
   }
 
   private entrySpeedLimitAt(index: number, _active_action: boolean): number {
-    /* 2026-11-13 固件解锁：入弯门禁直接取本行 turn_speed，唯一上限是单轮
-     * 目标天花板。滚动圆弧也读同一表值，不再固定 45 cm/s。 */
+    /* 固件 2026-11-14：入弯门禁直接读本行 turn_speed（受 WHEEL_TARGET_MAX 天花板），
+     * 不再有 settle/settle-arc 常量覆盖。 */
     return Math.min(this.steps[index].turn_speed, WHEEL_TARGET_MAX_CM_S);
   }
 
@@ -745,10 +763,14 @@ export class RoutePlannerModel {
     this.previous_line_valid = false;
     this.smooth_edge_sides = 0;
     this.component_recovery_active = this.component_recovery_used = false;
+    this.exit_component_extension_used = false;
     this.component_recovery_line_samples = 0;
     this.last_sample_ms = now;
     this.hexagon = {
       state: HexagonState.HEXAGON_OFF,
+      exit_heading_rad: 0,
+      anchor_dx_cm: 0,
+      anchor_dy_cm: 0,
       phase_ms: 0,
       action_ms: 0,
       line_ms: 0,
@@ -971,6 +993,10 @@ export class RoutePlannerModel {
         branch_cm: d,
         center_cm: 0,
         hold_heading: h,
+        speed_cm_s: Math.min(this.steps[this.index].turn_speed, WHEEL_TARGET_MAX_CM_S),
+        exit_heading_rad: 0,
+        anchor_dx_cm: 0,
+        anchor_dy_cm: 0,
         line_samples: 0,
         branch_samples: 0,
         center_samples: 0,
@@ -982,7 +1008,6 @@ export class RoutePlannerModel {
         turning: false,
         turn_index: 0,
         vertex_x_cm: 0,
-        speed_cm_s: Math.min(this.steps[this.index].turn_speed, WHEEL_TARGET_MAX_CM_S),
         vertex_y_cm: 0,
         leg_start_cm: 0,
         leg_from_x_cm: 0,
@@ -1056,11 +1081,15 @@ export class RoutePlannerModel {
       if (Math.abs(this.line_exit_heading_rad - this.short_link_heading) > SHORT_LINK_MAX_HEADING_RAD) {
         this.short_link_tracking = false;
       } else {
+        /* 用户 2026-11-12（R25）：进入“y40 西行过 R25”那一行（表内 145/142 cm）的
+         * 短连接转弯再提前 SHORT_LINK_TURN_EARLY_CM，让出弯探头落在电阻之前。
+         * 其它短连接（Q13 25/30、Q22 链）保持原“半个轮距”几何。 */
+        let early = 0;
+        if (this.index + 1 < this.count) {
+          const nextLen = this.steps[this.index + 1].segment_length_cm;
+          if (nextLen === 145 || nextLen === 142) early = SHORT_LINK_TURN_EARLY_CM;
+        }
         // Previous lateral pivot motion includes its actual coast footprint.
-        // 145/142 cm component rows pivot 1 cm early so the exit bar lands
-        // ahead of the printed resistor (route.c SHORT_LINK_TURN_EARLY_CM).
-        const nextLen = this.steps[this.index + 1].segment_length_cm;
-        const early = nextLen === 145 || nextLen === 142 ? SHORT_LINK_TURN_EARLY_CM : 0;
         this.short_link_pivot_lead_cm = Math.max(WHEEL_TRACK_CM * 0.5 - early,
           Math.abs(this.short_link_lateral_cm));
         if (this.short_link_pivot_lead_cm > SHORT_LINK_MAX_LATERAL_CM ||
@@ -1108,6 +1137,22 @@ export class RoutePlannerModel {
     this.component_recovery_active = false;
   }
 
+  /** 固件 route_dashed_hold()：本行或下一行是虚线行。虚线行（及其入口弯）
+   * **整行**按位姿直行：短划/空白都是结构，不交给位置 PID，也不按 400 ms 判丢线。 */
+  public dashedHold(): boolean {
+    if (this.index < this.count && this.steps[this.index].dashed_row) return true;
+    return this.index + 1 < this.count && this.steps[this.index + 1].dashed_row === true;
+  }
+
+  /** 固件 exit_component_row()：出弯时可能压在印刷元件下的行（R25 145/142、
+   * 以及短连接后 65 cm 的 Q22 链）。 */
+  private exitComponentRow(): boolean {
+    if (this.index + 1 >= this.count) return false;
+    const nextLen = this.steps[this.index + 1].segment_length_cm;
+    if (nextLen === 145 || nextLen === 142) return true;
+    return shortLinkLength(this.steps[this.index]) > 0 && nextLen === 65;
+  }
+
   private updateTurnExitSearch(
     o: GrayObservation,
     d: number,
@@ -1115,9 +1160,24 @@ export class RoutePlannerModel {
     now: number,
     adjacent: boolean
   ): void {
+    /* 宽线（空心电阻 R25/R23/极板等）是可穿越图形，不是出口丢失：图形压在杆下
+     * 时把出口搜索的时/距**上限**加一段（只加一次，其它故障保护不变）。
+     * 2026-11-12 教训：不能去改 capture_line_ms/cm 本身（那会让 now < 基准，
+     * 无符号相减溢出成“已超时”，一看到电阻就立刻停车）。 */
+    let limitMs = JUNCTION_EXIT_SEARCH_TIMEOUT_MS;
+    let limitCm = JUNCTION_EXIT_SEARCH_MAX_CM;
+    if (EXIT_COMPONENT_EXTEND_ENABLED) {
+      if (grayIsComponentPattern(o) && !this.exit_component_extension_used && this.exitComponentRow()) {
+        this.exit_component_extension_used = true;
+      }
+      if (this.exit_component_extension_used) {
+        limitMs += COMPONENT_CROSS_MS;
+        limitCm += COMPONENT_CROSS_MAX_CM;
+      }
+    }
     /* Deadlines precede even the third valid exit frame. Noise never renews them. */
-    if (now - this.capture_line_ms >= JUNCTION_EXIT_SEARCH_TIMEOUT_MS ||
-      Math.abs(d - this.capture_line_cm) >= JUNCTION_EXIT_SEARCH_MAX_CM) {
+    if (now - this.capture_line_ms >= limitMs ||
+      Math.abs(d - this.capture_line_cm) >= limitCm) {
       this.fail(RouteFailure.ROUTE_FAILURE_EXIT_RECAPTURE);
       return;
     }
@@ -1145,6 +1205,16 @@ export class RoutePlannerModel {
     else if (this.exit_count < LINE_CONFIRM_SAMPLES) this.exit_count++;
     this.capture_line_samples = this.exit_count;
     let confirmed = this.exit_count >= LINE_CONFIRM_SAMPLES;
+    if (EXIT_COMPONENT_EXTEND_ENABLED) {
+      /* 宽线/空心图形压在出口杆下时不是歧义也不是丢线，是可穿越图形：
+       * 航向已与出口轴对齐就按“出口已过”交棒。 */
+      const componentExit = adjacent && grayIsComponentPattern(o) && this.exitComponentRow() &&
+        Math.abs(h - (this.entry_heading + this.turnTargetRad())) <= SHORT_LINK_MAX_HEADING_RAD;
+      if (componentExit) {
+        confirmed = true;
+        this.capture_line_samples = this.exit_count = LINE_CONFIRM_SAMPLES;
+      }
+    }
     if (shortExit) {
       /* Q13 leaves only a brief, same-side edge window before the 12 cm
        * deadline. Keep the fast +/-3 exit; farther edges need both time and
@@ -1331,11 +1401,30 @@ export class RoutePlannerModel {
     const dir = this.turnTargetRad() >= 0 ? 1 : -1;
     const targetRad = Math.abs(this.turnTargetRad());
     const h0 = this.entry_heading;
-    // Baseline = the row's planned heading (relative to entry_heading, unwrapped)
-    // so a pivot residual from the previous row cannot skew the arc tangent;
-    // the net-rotation guard still uses the measured entry heading h0.
+    const wrap = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
+    /* 环岛顶点方向是赛道固定几何：枢轴目标应相对“本行计划航向”，而不是动作
+     * 开始瞬间的实测车头。整圈多个枢轴的残差会让入口实测航向偏 20~30°，
+     * 若直接拿它当 30/60° 的基准，整个六边形会跟着转偏。净转角保护仍用 h0
+     * （实测入口航向），避免把既有残差误判成反向。 */
     let hbase = h0;
-    if (this.pose_cross_valid) hbase = h0 + wrapRad(this.pose_seg_heading_rad - h0);
+    if (this.pose_cross_valid) hbase = h0 + wrap(this.pose_seg_heading_rad - h0);
+    const turnAngles = [
+      HEXAGON_ENTRY_TURN_RAD, HEXAGON_TURN_RAD, HEXAGON_TURN_RAD,
+      HEXAGON_TURN_RAD, HEXAGON_TURN_RAD, HEXAGON_TURN_RAD, HEXAGON_ENTRY_TURN_RAD,
+    ];
+    const cumulative: number[] = [];
+    for (let i = 0; i < turnAngles.length; ++i) {
+      cumulative.push((cumulative[i - 1] ?? 0) + turnAngles[i]);
+    }
+    /* 固定六边形几何 + 整环平移锚点（firmware anchor_dx/dy）。 */
+    const vertex = (i: number): { x: number; y: number } => {
+      const k = dir > 0 ? (6 - (i % 6)) % 6 : i % 6;
+      const ang = (-k * Math.PI) / 3;
+      return {
+        x: HEXAGON_CENTER_X_CM + HEXAGON_SIDE_CM * Math.cos(ang) + x.anchor_dx_cm,
+        y: HEXAGON_CENTER_Y_CM + HEXAGON_SIDE_CM * Math.sin(ang) + x.anchor_dy_cm,
+      };
+    };
 
     {
       let ringSpeed = Math.min(this.steps[this.index].turn_speed, WHEEL_TARGET_MAX_CM_S);
@@ -1344,9 +1433,13 @@ export class RoutePlannerModel {
       }
       x.speed_cm_s = ringSpeed;
     }
-    if (now - x.action_ms >= HEXAGON_ACTION_TIMEOUT_MS ||
-      Math.abs(d - this.entry_cm) >= HEXAGON_ACTION_MAX_CM) {
-      this.fail(RouteFailure.ROUTE_FAILURE_ACTION_TIMEOUT);
+    /* 基准必须用 h0（实测入口航向）：净转角是“相对进入环岛时的车头”转了多少。
+     * 若用计划航向作基准，入口残留偏差本身就成了净转角——残差方向与环岛转向
+     * 相反时会第一帧误判 WRONG_WAY。 */
+    const targetRad = Math.abs(this.turnTargetRad());
+    const netTurn = (h - h0) * dir;
+    if (netTurn < -JUNCTION_WRONG_WAY_RAD) {
+      this.fail(RouteFailure.ROUTE_FAILURE_WRONG_WAY);
       return;
     }
     {
@@ -1360,133 +1453,154 @@ export class RoutePlannerModel {
         return;
       }
     }
-    /* Diagnostic timestamp only: grey lines/losses cannot steer or abort HEXAGON. */
+
+    const narrow = routeIsNarrowLine(o);
+    const centered = narrow && Math.abs(o.position) <= JUNCTION_CENTER_LIMIT;
+    /* Only a completely blank bar is true loss inside the ring; the printed
+     * R14 symbol and the vertex joins keep some channel lit. */
     if (o.line_mask !== 0 && adjacent) {
       x.line_ms = now;
       x.line_cm = d;
     }
 
+    /* 环岛速度计划：顶点枢轴直接读本行 turn_speed；直边用 a_safe 向下一顶点
+     * 做减速包络；出环按离口速度收线。 */
+    {
+      const step = this.steps[this.index];
+      const pivot = Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S);
+      let ringSpeed = pivot;
+      if (x.state === HexagonState.HEXAGON_FOLLOWING && !x.turning) {
+        const leg = Math.min(Math.max(HEXAGON_LEG_SPEED_CM_S, pivot), this.cruiseSpeed());
+        const gap = Math.hypot(x.vertex_x_cm - axle_x_cm, x.vertex_y_cm - axle_y_cm) -
+          HEXAGON_PIVOT_LEAD_CM;
+        ringSpeed = Math.min(leg,
+          Math.sqrt(pivot * pivot + 2 * BRAKING_SAFE_DECEL_CM_S2 * Math.max(0, gap)));
+      } else if (x.state === HexagonState.HEXAGON_EXITING) {
+        ringSpeed = Math.min(ringSpeed, JUNCTION_EXIT_SPEED_CM_S);
+      }
+      x.speed_cm_s = ringSpeed;
+    }
+
     if (x.state === HexagonState.HEXAGON_ENTERING) {
-      const approach = this.steps[this.index].turn_approach_cm ?? 0;
-      const approachCm = approach > 0 ? approach : HEXAGON_ARC_APPROACH_CM;
-      const legacyPoseOnly = this.steps[this.index].segment_length_cm <= 0 &&
-        approach <= 0 && this.pose_mode;
+      /* 入环直行长度按“本行段距剩余”判定：动作授权时门禁已保证剩余
+       * ≤ 段距+5−27.85 = 32.85 cm。整圈累计的位姿平移/航向残差会让绝对 V0
+       * 偏出 entry lead，而最后 ~31 cm 只有轮轴里程，比绝对位姿可靠。
+       * 无段距（仅计数授权）的旧表仍按固定 V0 的位姿距离。 */
+      const entryLead = WHEEL_TRACK_CM * 0.5 * Math.tan(0.5 * turnAngles[0]);
+      const step = this.steps[this.index];
       let reached: boolean;
-      if (legacyPoseOnly) {
-        const vx0 = HEXAGON_CENTER_X_CM + HEXAGON_SIDE_CM;
-        const vy0 = HEXAGON_CENTER_Y_CM;
-        reached = Math.hypot(axle_x_cm - vx0, axle_y_cm - vy0) <= 1.0;
+      if (step.segment_length_cm > 0) {
+        const remaining = (step.segment_length_cm + ROUTE_WAYPOINT_MARGIN_CM) -
+          (d - this.origin_cm);
+        reached = remaining <= entryLead + 0.6;
       } else {
-        reached = d - this.entry_cm >= approachCm;
+        const v0 = vertex(0);
+        reached = Math.hypot(axle_x_cm - v0.x, axle_y_cm - v0.y) <= entryLead + 0.6;
       }
       if (!reached) {
         x.turning = false;
-        x.use_line = false;
+        x.use_line = narrow && centered;
         x.target_heading = hbase;
-        const maxApproach = legacyPoseOnly
-          ? HEXAGON_ENTRY_APPROACH_MAX_CM
-          : Math.max(HEXAGON_ENTRY_APPROACH_MAX_CM, approachCm + 5.0);
         if (now - x.action_ms >= HEXAGON_ACTION_TIMEOUT_MS ||
           Math.abs(d - this.entry_cm) >= maxApproach) {
           this.fail(RouteFailure.ROUTE_FAILURE_ENTRY_SPEED);
         }
         return;
       }
-      const R = HEXAGON_ARC_RADIUS_CM;
-      const wh0 = hbase + this.start_heading_rad;
-      const nx = -dir * Math.sin(wh0);
-      const ny = dir * Math.cos(wh0);
-      if (this.pose_mode) {
-        x.center_x_cm = axle_x_cm + R * nx;
-        x.center_y_cm = axle_y_cm + R * ny;
-        x.vertex_x_cm = axle_x_cm;
-        x.vertex_y_cm = axle_y_cm;
-        x.leg_from_x_cm = axle_x_cm;
-        x.leg_from_y_cm = axle_y_cm;
-        x.anchor_dx_cm = axle_x_cm - (HEXAGON_CENTER_X_CM + HEXAGON_SIDE_CM);
-        x.anchor_dy_cm = axle_y_cm - HEXAGON_CENTER_Y_CM;
-        x.last_alpha_rad = Math.atan2(-ny, -nx);
-      }
-      x.phase_ms = now;
-      x.phase_cm = d;
-      x.leg_start_cm = d;
-      x.arc_progress_rad = 0;
-      x.radius_err_cm = 0;
-      x.cross_cm = 0;
+      /* 环岛几何固定为右顶点 (345,165)，整圈 1000+ cm 后位姿误差可达几十 cm，
+       * 直接用绝对 V0 永远进不了 lead（从环岛起步时误差≈0，所以单独走环岛能过）。
+       * 枢轴点按当前位姿把六边形平移过来：锚定 V0 = 当前轴 + entry_lead，方向取
+       * 本周期实测航向。只平移不旋转；后续顶点都用这个锚点。 */
+      const wh = h + this.start_heading_rad;
+      x.anchor_dx_cm = (axle_x_cm + entryLead * Math.cos(wh)) -
+        (HEXAGON_CENTER_X_CM + HEXAGON_SIDE_CM);
+      x.anchor_dy_cm = (axle_y_cm + entryLead * Math.sin(wh)) - HEXAGON_CENTER_Y_CM;
+      const v0 = vertex(0);
+      const v1 = vertex(1);
       x.turning = true;
       x.turn_index = 0;
-      x.use_line = false;
-      x.target_heading = hbase;
+      x.target_heading = hbase + dir * turnAngles[0];
+      x.vertex_x_cm = v1.x;
+      x.vertex_y_cm = v1.y;
+      x.leg_from_x_cm = v0.x;
+      x.leg_from_y_cm = v0.y;
       x.state = HexagonState.HEXAGON_FOLLOWING;
       return;
     }
 
     if (x.state === HexagonState.HEXAGON_FOLLOWING) {
-      const R = HEXAGON_ARC_RADIUS_CM;
-      const sArc = Math.max(0, d - x.phase_cm);
-      let phi = sArc / R;
-      let radialTrim = 0;
-      if (this.pose_mode) {
-        const rx = axle_x_cm - x.center_x_cm;
-        const ry = axle_y_cm - x.center_y_cm;
-        const r = Math.hypot(rx, ry);
-        x.radius_err_cm = r - R;
-        x.cross_cm = x.radius_err_cm;
-        if (r > 5.0) {
-          const alpha = Math.atan2(ry, rx);
-          const da = wrapRad(alpha - x.last_alpha_rad) * dir;
-          x.last_alpha_rad = alpha;
-          x.arc_progress_rad += da;
-          phi = Math.max(0, x.arc_progress_rad);
-        } else {
-          x.arc_progress_rad = phi;
+      if (x.turning) {
+        x.use_line = false;
+        if (Math.abs(wrap(x.target_heading - h)) <= HEXAGON_TURN_TOL_RAD) {
+          x.turning = false;
+          x.leg_start_cm = d;
+          x.line_seen = true;
+          x.line_ms = now;
+          x.line_cm = d;
+          if (x.turn_index >= 6) {
+            /* 出环不能用位姿直接交棒：环岛固定几何靠里程链推算 V0，六个顶点后
+             * 累计几厘米误差，实车出环时线已在探头最右侧（position≈+7），随后
+             * STOP 行的节点被判成“通过型”而直行、最终丢线。改为进入
+             * HEXAGON_EXITING：用真实出口线回中并确认（连续帧/时距），确认后
+             * 才 enterClear，下一行的段距原点也随之落到真实出环点。 */
+            x.state = HexagonState.HEXAGON_EXITING;
+            x.exit_heading_rad = hbase;
+            x.phase_ms = now;
+            x.phase_cm = d;
+            x.center_samples = 0;
+            x.center_pending = false;
+            x.cross_cm = 0;
+            x.use_line = false;
+            return;
+          }
+          const from = vertex(x.turn_index);
+          const v = vertex(x.turn_index + 1);
+          x.leg_from_x_cm = from.x;
+          x.leg_from_y_cm = from.y;
+          x.vertex_x_cm = v.x;
+          x.vertex_y_cm = v.y;
         }
-        const maxTrim = targetRad - phi < 0.35 ? 0.10 : HEXAGON_ARC_RADIAL_MAX_RAD;
-        radialTrim = Math.max(-maxTrim, Math.min(maxTrim,
-          HEXAGON_ARC_RADIAL_KP * x.radius_err_cm));
-        if (targetRad - phi < 0.25) {
-          radialTrim *= Math.max(0, (targetRad - phi) / 0.25);
-        }
+        return;
+      }
+      const nextAngle = Math.abs(turnAngles[x.turn_index + 1]);
+      const lead = WHEEL_TRACK_CM * 0.5 * Math.tan(0.5 * nextAngle);
+      /* 顶点枢轴仍按“位姿到锚定顶点的间隙”触发；锚点只做整环平移，位姿残差
+       * 在环内一致，间隙时序不受绝对误差影响。 */
+      const gap = Math.hypot(x.vertex_x_cm - axle_x_cm, x.vertex_y_cm - axle_y_cm);
+      if (gap <= lead + (this.pose_mode ? 0.6 : 0)) {
+        ++x.turn_index;
+        x.turning = true;
+        x.target_heading = hbase + dir * cumulative[x.turn_index];
+        x.use_line = false;
+        return;
+      }
+      x.use_line = centered || (narrow && Math.abs(o.position) <= JUNCTION_CENTER_LIMIT + 1);
+      const ldx = x.vertex_x_cm - x.leg_from_x_cm;
+      const ldy = x.vertex_y_cm - x.leg_from_y_cm;
+      const llen = Math.hypot(ldx, ldy);
+      if (llen > 1e-3) {
+        x.cross_cm = (-(axle_x_cm - x.leg_from_x_cm) * ldy +
+          (axle_y_cm - x.leg_from_y_cm) * ldx) / llen;
       } else {
         x.arc_progress_rad = phi;
         x.radius_err_cm = 0;
         x.cross_cm = 0;
       }
-      const clampedPhi = Math.min(targetRad, phi);
-      x.target_heading = hbase + dir * (clampedPhi + radialTrim);
-      x.turning = true;
-      x.use_line = false;
-      const yawProgress = (h - hbase) * dir;
-      const distReady = sArc >= HEXAGON_ARC_MIN_PROGRESS_RATIO * R * targetRad;
-      const poseReady = !this.pose_mode || x.arc_progress_rad >= targetRad - 0.35;
-      if (yawProgress >= targetRad - HEXAGON_ARC_EXIT_TOL_RAD &&
-        distReady && poseReady) {
-        x.turning = false;
-        x.use_line = false;
-        if (this.pose_mode) {
-          x.state = HexagonState.HEXAGON_DONE;
-          this.line_exit_confirmed = true;
-          this.line_exit_heading_rad = hbase + dir * targetRad;
-          this.arc_just_exited = true;
-          this.enterClear(d, now);
-        } else {
-          x.state = HexagonState.HEXAGON_EXITING;
-          x.phase_ms = now;
-          x.phase_cm = d;
-          x.center_samples = 0;
-          x.center_pending = false;
-        }
+      if (this.pose_mode && Math.abs(x.cross_cm) > HEXAGON_LEG_CROSS_MAX_CM) {
+        this.fail(RouteFailure.ROUTE_FAILURE_EXIT_LOST);
+        return;
       }
       return;
     }
 
     if (x.state === HexagonState.HEXAGON_EXITING) {
-      /* Retained for the legacy POSE_NAV_ENABLED=0 (grey-only) contract. */
-      const narrow = routeIsNarrowLine(o);
-      const centered = narrow && Math.abs(o.position) <= JUNCTION_CENTER_LIMIT;
+      /* 线只要还是单区域窄线就交给位置 PID 回中（贴边也算），确认仍要求居中；
+       * 只看 centered 会让偏边的出口永远无法回中。 */
       x.use_line = narrow;
-      if (now - x.phase_ms >= HEXAGON_EXIT_TIMEOUT_MS ||
-        Math.abs(d - x.phase_cm) >= HEXAGON_EXIT_MAX_CM) {
+      if (
+        now - x.phase_ms >= HEXAGON_EXIT_TIMEOUT_MS ||
+        Math.abs(d - x.phase_cm) >= HEXAGON_EXIT_MAX_CM
+      ) {
         this.fail(RouteFailure.ROUTE_FAILURE_EXIT_LOST);
         return;
       }
@@ -1508,6 +1622,12 @@ export class RoutePlannerModel {
         this.line_exit_confirmed = true;
         this.line_exit_heading_rad = h;
         this.enterClear(d, now);
+        /* 下一行段距的原点回填到“真实出环顶点”（最终枢轴完成的里程），不把
+         * 出环后的回中行程算进段距；clear_cm 仍用当前里程，避免 20 cm 离口超时。 */
+        if (this.state === RouteState.ROUTE_CLEARING && !this.passing_junction &&
+          this.next_segment_origin_valid) {
+          this.next_segment_origin_cm = x.phase_cm;
+        }
       }
       return;
     }
@@ -1573,6 +1693,7 @@ export class RoutePlannerModel {
     this.arc_desired_heading_rad = this.arc_active
       ? alpha + dir * (Math.PI / 2) + Math.PI / 2
       : segHeading;
+    /* 固件 2026-11-14：滚动圆弧轴速直接读本行 turn_speed（天花板 WHEEL_TARGET_MAX）。 */
     const v = Math.min(this.steps[this.index].turn_speed, WHEEL_TARGET_MAX_CM_S);
     this.arc_outer_cm_s = this.arc_active ? v * (1 + track / (2 * R)) : v;
     const diffTarget = this.arc_active ? (v * track) / (2 * R) : 0;
@@ -1680,6 +1801,10 @@ export class RoutePlannerModel {
     // contract.
     this.pose_mode = Number.isFinite(axle_x_cm) && Number.isFinite(axle_y_cm) &&
       this.pose_enabled && this.count > 0 && this.waypoint_x_cm.length === this.count;
+    if (this.pose_mode) {
+      this.pose_axle_x_cm = axle_x_cm;
+      this.pose_axle_y_cm = axle_y_cm;
+    }
     if (this.pose_mode && this.waypoint_x_cm.length === this.count) {
       /* h is the mileage heading relative to START (START aligns 0), so the
        * world heading is start_heading + h.  The old code hard-coded h - PI/2
@@ -1843,25 +1968,28 @@ export class RoutePlannerModel {
 
       let history = (this.state === RouteState.ROUTE_CANDIDATE && d >= this.entry_cm) || recent_center;
       /* 整排横杠是横向结构，不会像窄线那样向边缘横移，可以独立作为节点证据；
-       * 仍受同一距离门禁、计数和离口去重约束。2026-11-13（方案 1 实车）：
-       * 环岛出口后车体略偏，接近段没有 3 帧中心记忆，到 (345,220) 的整排横杠
-       * 时被 JUNCTION_REJECT_HISTORY 拒绝，直行出赛道。 */
-      if (o.line_mask === 0xff && (!this.steps[this.index].close_corner || d - this.clear_cm > 4.0)) {
+       * 仍受同一距离门禁、计数和离口去重约束。2026-11-13（方案 1 实车）：环岛
+       * 出口后车体略偏，接近段没有满足 |position|<=2 的中心记忆，到 (345,220) 的
+       * 整排横杠时被 JUNCTION_REJECT_HISTORY 拒绝，直行出赛道。 */
+      if (o.line_mask === 0xff &&
+        (!this.steps[this.index].close_corner || d - this.clear_cm > 4.0)) {
         history = true;
-      }
-      /* After a HEXAGON INS arc the car may leave the circle slightly offset
-       * without building 3 centred frames before (345,220) or Q13: accept a
-       * confirmed >=4-channel target branch/bar. */
-      if (this.index > 0 && this.steps[this.index - 1].action === Action.HEXAGON &&
-        this.targetReady(d, true) && o.white_count >= 4) {
-        history = true;
-        this.smooth_edge_sides = 0;
       }
       let { kind, sides } = junctionShape(o);
-      /* R17 紧接 (275,0) 的 T 形路口：出电阻后车体微偏（|position|>2）就没有
-       * 3 帧中心记忆，可能还锁存 smooth_edge_sides。该行已计过 R17 且达段距
-       * 门禁后，单侧左支 T 口（0x0e/0x0f/0x1f/0x3f）直接放行历史。 */
-      if (this.steps[this.index].close_corner === true && this.junctions_seen >= 1 &&
+      /* 虚线行可以一直空到末端整排实线：那里不能要求“近端窄线居中”的历史。
+       * 真正的宽横杠仍要满足原有的连续帧/行程/段距门禁。 */
+      if (this.steps[this.index].dashed_row) {
+        if (o.white_count < DASHED_NODE_MIN_WHITE) {
+          kind = JunctionEvidence.JUNCTION_EVIDENCE_NONE;
+          sides = 0;
+        } else if (kind !== JunctionEvidence.JUNCTION_EVIDENCE_NONE) {
+          history = true;
+        }
+      }
+      /* R17 紧接 (275,0) 的 T 形路口：穿越空心电阻期间灰度 PID 冻结，出电阻后
+       * 至 (275,0) 车体微偏（|position|>2）即无 3 帧中心记忆且可能锁存
+       * smooth_edge_sides；已计过 R17 且达段距门禁后直接放行历史并清除横移锁存。 */
+      if (this.steps[this.index].close_corner && this.junctions_seen >= 1 &&
         this.targetReady(d, true) && kind !== JunctionEvidence.JUNCTION_EVIDENCE_NONE &&
         (sides & 1) !== 0 && o.line_mask !== 0xff) {
         history = true;
@@ -2302,8 +2430,7 @@ export class RoutePlannerModel {
        * 段距门禁、计数和解口去重其它行均不变。 */
       const closeRow = this.steps[this.index].close_corner === true;
       const clearDistance = closeRow && history ? JUNCTION_ADJACENT_EXIT_CM : ROUTE_CLEAR_POSE_CM;
-      if (d - this.clear_cm < clearDistance ||
-        ((!routeIsNarrowLine(o) || branch) && !history)) return;
+      if (d - this.clear_cm < clearDistance || ((!routeIsNarrowLine(o) || branch) && !history)) return;
       const centerMs = this.approach_center_ms;
       const centerCm = this.approach_center_cm;
       if (this.bar_hold_state === RouteBarHoldState.ROUTE_BAR_HOLD_PASS &&
