@@ -150,7 +150,7 @@ console.log('PASS: short-link projected turn-in geometry stays unchanged for 0/4
   }
   const s1 = parsed.schemes.find(s => s.id === 1)!;
   assert.equal(s1.steps.length, 30);
-  const transistorRows = s1.steps.flatMap((s, i) => (s.turn_approach_cm ?? 0) >= 14 ? [i] : []);
-  assert.deepEqual(transistorRows, [3, 9, 15, 17, 18, 25]);
-  console.log('PASS: bundled schemes use absolute 9/14/19 cm and preserve the six scheme-1 transistor corners');
+  const transistorRows = s1.steps.flatMap((s, i) => (s.turn_approach_cm ?? 0) >= 14 ? [i] : []); /* row 10 = HEXAGON 30 cm */
+  assert.deepEqual(transistorRows, [3, 9, 10, 11, 15, 17, 18, 25]);
+  console.log('PASS: bundled schemes use the absolute 6/9/14/18/19 cm holds and the 30 cm HEXAGON approach');
 }

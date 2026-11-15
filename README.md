@@ -4,7 +4,48 @@
 
 ---
 
-## 2026-11-12 固件 `2e751de` 算法、物理参数与路线表同步（当前）
+## 2026-11-15 固件 `main` @ `4207868`（INS 圆弧环岛）同步 + 短路制动车辆模型（当前）
+
+按用户要求同步 `car_stm32_school_competition` `main`（`4207868`，PR #36 `feat/INS-hexagon`）到模拟器，**未改任何固件代码**。上一轮基线是固件 `2e751de`（模拟器 `f6091ec`）。本轮把 TS 控制器追平到固件当前行为，并按固件 `motor.c` 的驱动语义修正了一处车辆模型错误。
+
+**同步内容（TS 侧）**
+
+- **路线表**：`src/route_table.c` 逐字镜像进 `DEFAULT_ROUTE_TABLE_C`。方案 0–10 全部按当前表（方案 1 = 30 行，巡航 80、转弯 50；方案 4 = 29 行不进环岛；方案 9 = 右下角起跑 17 行；方案 10 = 北侧起跑 2 行）；`ROUTE_SCHEME_SELECT` 回到 1。
+- **HEXAGON**：六边形折线 + 顶点枢轴状态机整体替换为 **INS `R = 32.5 cm` 匀速圆弧**——入环节点确认后按本行第 9 列直行 `HEXAGON_ARC_APPROACH_CM = 30 cm` 到切点，再以里程计 + IMU 航向跟踪圆心/切向，径向误差 `HEXAGON_ARC_RADIAL_KP` 修正、`HEXAGON_ARC_YAW_DAMPING` 抑制横摆，`yaw / 弧长 / 圆心角` 三项同时达标才交棒 `ROUTE_CLEARING`；`HEXAGON_EXITING` 只保留给 `POSE_NAV_ENABLED=0` 旧契约。圆心用实测轮轴位姿与计划切线动态锚定，吸收整圈累积漂移。
+- **灰度策略**：`route_owns_gray_loss()` 扩展为 `EXECUTING/CLEARING` 全部接管（环岛圆弧内 `0x00`/`0xFF`/多区都不再触发丢线或歧义停车）；`after_hexagon` 让紧接环岛的那一行使用放宽的有界失线窗口；FOLLOW 的位姿分支不再排除 `HEXAGON` 行。
+- **虚线整行保持**：新增 `route_scenario_dashed_row()`（75 cm 行，或 65 cm 且下一行 50/40），虚线行与进入它的那一弯按位姿航向直行、位置 PID 冻结，`DASHED_HOLD_LOSS_MS/CM/EXTRA_CM = 3200 ms/50 cm/15 cm`。
+- **转弯轮速解锁**：`entry_speed_limit_at()`、横线保持上限、`ROUTE_EXECUTING` 外轮目标、滚动圆弧轴速、已证明出口的新图形确认段一律改成 `min(step.turn_speed, WHEEL_TARGET_MAX_CM_S)`；`JUNCTION_SETTLE_SPEED_CM_S` 只作同名对照（= 500），`CORNER_ARC_SPEED_CM_S` 不再参与执行。
+- **角点特例**：`route_scenario_close_corner()` 的四条内容规则（R17 95 cm、Q18 45 cm、Q22 245 cm、Q16 45 cm）全部移植；145/142 cm 短连接行的枢轴提前量 `SHORT_LINK_TURN_EARLY_CM = 1 cm`。
+- **位姿/节点证据**：整排横杠（`0xFF`）可独立作为节点证据；`after_hexagon` 行达段距门禁后放行 `>=4` 路目标并清 `smooth_edge_sides`；R17 紧接 (275,0) 的单侧左支 T 口直接放行历史；CLEARING 离口距离只在 `close_corner && history` 时用 2 cm，并要求窄线或历史证据。
+- **解析器**：从 `motion_config.h` 预置 `GRAY_FORWARD_OFFSET_CM / WHEEL_TRACK_CM / HEXAGON_ARC_APPROACH_CM`，否则第 9 列的 `HEXAGON_ARC_APPROACH_CM` 解析成 NaN、整份表 `ROUTE_FAILURE_INVALID`；`route_scenario_start_pose()` 改为逐 `#if/#elif` 分支解析（方案 8/10 环岛锚点、方案 9 右下角锚点），方案 1 回到生产起点 `P(0,110)`。
+
+**仿真器侧修正（非固件）**
+
+- **短路制动车辆模型**：固件 `motor.c set_wheel()` 明确「单轮 0 占空比时 PWM 低电平 + STBY 高 = 短路制动」，旧仿真把这一支也按滑行处理（共用 150 cm/s² 上限），枢轴结束时外侧轮惯性多转 ~0.2 s、车体多转 10° 以上。现在单轮 0 目标改用 `MOTOR_SHORT_BRAKE_DECEL_CM_S2 = 600` 与 `MOTOR_BRAKE_TAU_S`，与驱动语义一致（实车 2026-11-07 现场：交接残余 2.1 rad/s、过量 6.7°）。
+- **parity 构建**：`tests/firmware_parity.mjs` 改用固件实际使用的 `-std=gnu11`（`M_PI` 在 `-std=c11 -pedantic` 下无法编译），并支持 `CC` 环境变量指定编译器（issue #6）。
+
+**验证（Windows + w64devkit gcc 16）**
+
+| 检查 | 结果 |
+| --- | --- |
+| `npx tsc --noEmit` | 通过 |
+| `npm test` | 退出 0，70 条 PASS；整圈用例按 `KNOWN:` 打印当前停点 |
+| `npm run build` | 通过（dist 重新生成） |
+| `node tests/firmware_parity.mjs`（`FW_DIR` 指向固件 main） | 退出 0；方案 1–10 同输入逐帧一致，最大轮目标误差 ≤0.0031 cm/s、0 帧超阈；方案 10 完赛 |
+
+**已知停点（仿真侧，不是移植偏差）**
+
+同输入的 C/TS 事件序列与逐帧轮目标完全一致，所以下面停点是「固件控制律 + 仿真车辆/传感模型」的组合，不是 TS 移植错误：
+
+- 方案 1/2/4/6：单轮枢轴（`turn_speed = 50`）出弯后车轴平行错在下一段主线内侧约 **5 cm**；24 cm 前伸、半跨 3.85 cm 的 8 路点采样杆随后整杆失明，Q4/Q6 一带停车。实车同参数可完赛，差异在车辆/传感模型。
+- 方案 3/7：外框右上角的 90° 枢轴同样偏出；方案 7 完赛，方案 3 在 (376,228) `EXIT_RECAPTURE`。
+- 方案 9：右下角起跑首个枢轴后 `EXIT_LOST`。
+
+闭环这一项需要先按实物量一次 8 路模块的通道间距与安装前伸，再决定改 `sensor_pitch_cm` 还是加光斑/线宽模型——**没有为了“让方案过关”去调这三个数**。
+
+---
+
+## 2026-11-12 固件 `2e751de` 算法、物理参数与路线表同步（历史）
 
 按用户要求同步 `car_stm32_school_competition` 的 `main`（`2e751de`）到模拟器 `dev`，**未改任何固件代码**。基线模拟器为 `857e930`，此前已含固件 `59a7268` 的同步。来源仓库新增的行为已移植到 TS 层，路线表和起跑锚点也从当前 `src/route_table.c` 镜像。
 

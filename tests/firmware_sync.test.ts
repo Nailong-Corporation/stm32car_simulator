@@ -158,7 +158,7 @@ console.log('PASS: firmware motion_config.h values are mirrored (wheel 4.8, 1064
   const parsed = parseRouteTableC(DEFAULT_ROUTE_TABLE_C);
   const scheme0 = parsed.schemes.find((s) => s.id === 0);
   assert.ok(scheme0);
-  assert.equal(parsed.activeSchemeId, 4, 'bundled default must match firmware ROUTE_SCHEME_SELECT=4');
+  assert.equal(parsed.activeSchemeId, 1, 'bundled default must match firmware ROUTE_SCHEME_SELECT=1');
   assert.equal(scheme0.steps.length, 2, 'only the two active debug rows are parsed');
   const fields = ['junction_count', 'turn_speed', 'action', 'cruise_speed',
     'angle_deg', 'corner_arc_enabled', 'segment_length_cm', 'short_link_cm', 'turn_approach_cm'] as const;

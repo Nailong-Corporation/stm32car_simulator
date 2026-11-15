@@ -100,6 +100,13 @@ import {
   ROUTE_WAYPOINT_EXIT_ANGLE_RAD,
   HEXAGON_ENTRY_APPROACH_MAX_CM,
   HEXAGON_LEG_CROSS_MAX_CM,
+  HEXAGON_ARC_RADIUS_CM,
+  HEXAGON_ARC_APPROACH_CM,
+  HEXAGON_ARC_RADIAL_KP,
+  HEXAGON_ARC_RADIAL_MAX_RAD,
+  HEXAGON_ARC_EXIT_TOL_RAD,
+  HEXAGON_ARC_MIN_PROGRESS_RATIO,
+  JUNCTION_EXIT_SPEED_CM_S,
   ROUTE_CLEAR_POSE_CM,
   HEXAGON_CENTER_X_CM,
   HEXAGON_CENTER_Y_CM,
@@ -288,6 +295,13 @@ export class RoutePlannerModel {
     leg_from_x_cm: 0,
     leg_from_y_cm: 0,
     cross_cm: 0,
+    anchor_dx_cm: 0,
+    anchor_dy_cm: 0,
+    center_x_cm: 0,
+    center_y_cm: 0,
+    radius_err_cm: 0,
+    arc_progress_rad: 0,
+    last_alpha_rad: 0,
   };
 
   public navigation_warning = RouteFailure.ROUTE_FAILURE_NONE;
@@ -784,6 +798,13 @@ export class RoutePlannerModel {
       leg_from_x_cm: 0,
       leg_from_y_cm: 0,
       cross_cm: 0,
+      anchor_dx_cm: 0,
+      anchor_dy_cm: 0,
+      center_x_cm: 0,
+      center_y_cm: 0,
+      radius_err_cm: 0,
+      arc_progress_rad: 0,
+      last_alpha_rad: 0,
     };
   }
 
@@ -983,7 +1004,7 @@ export class RoutePlannerModel {
         use_line: false,
         center_pending: false,
         exit_armed: false,
-        target_heading: 0,
+        target_heading: h,
         turning: false,
         turn_index: 0,
         vertex_x_cm: 0,
@@ -992,6 +1013,13 @@ export class RoutePlannerModel {
         leg_from_x_cm: 0,
         leg_from_y_cm: 0,
         cross_cm: 0,
+        anchor_dx_cm: 0,
+        anchor_dy_cm: 0,
+        center_x_cm: 0,
+        center_y_cm: 0,
+        radius_err_cm: 0,
+        arc_progress_rad: 0,
+        last_alpha_rad: 0,
       };
     }
   }
@@ -1008,6 +1036,19 @@ export class RoutePlannerModel {
       this.lap_boundary = true;
     }
     this.beginAction(d, h, now);
+  }
+
+  /** route.c route_dashed_hold(): the dashed row and the turn that enters it. */
+  public dashedHold(): boolean {
+    if (this.index >= this.count) return false;
+    if (this.steps[this.index].dashed === true) return true;
+    return this.index + 1 < this.count && this.steps[this.index + 1].dashed === true;
+  }
+
+  /** route.c adjacent_close_or_hexagon(): a HEXAGON row right after a pivot also
+   * needs the "corner point" origin bookkeeping the R17 special case uses. */
+  private static adjacentCloseOrHexagon(next: RouteStep | undefined): boolean {
+    return !!next && (next.close_corner === true || next.action === Action.HEXAGON);
   }
 
   private anchorNextSegment(d: number, now: number): void {
@@ -1338,16 +1379,15 @@ export class RoutePlannerModel {
     return false;
   }
 
-  /** Pose-driven regular-hexagon traversal (2026-11-06).
+  /** INS circular-arc hexagon traversal (2026-11-15, mirrors route.c).
    *
-   * The ring has one external connection (right vertex V0), so a loop entered
-   * from one side has to leave on the other side.  The table's HEXAGON angle
-   * sign selects the direction (+ = clockwise) and the traversal uses the known
-   * 35 cm edges / 60 deg vertices with odometry + IMU: waiting for the 24 cm
-   * look-ahead bar to find the next vertex cannot work on 35 cm edges, and the
-   * old tangent/branch exit assumption does not hold for this lollipop.
-   * The 8-channel line still centres the car along each edge and confirms the
-   * outgoing line after the exit turn. */
+   * The ring has one external connection (right vertex V0(345,165)), so a loop
+   * entered from one side leaves on the other side.  After the entry junction
+   * confirms, the axle drives straight by turn_approach_cm (default
+   * HEXAGON_ARC_APPROACH_CM = 30 cm) onto the tangent point V0, then follows a
+   * constant-speed circular arc of radius HEXAGON_ARC_RADIUS_CM (32.5 cm) using
+   * odometry + IMU heading.  The grey PID is paused for the whole manoeuvre, so
+   * a missing line or the printed R14 graphic can neither steer nor abort it. */
   private hexagonUpdate(
     o: GrayObservation,
     d: number,
@@ -1359,6 +1399,7 @@ export class RoutePlannerModel {
   ): void {
     const x = this.hexagon;
     const dir = this.turnTargetRad() >= 0 ? 1 : -1;
+    const targetRad = Math.abs(this.turnTargetRad());
     const h0 = this.entry_heading;
     const wrap = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a));
     /* 环岛顶点方向是赛道固定几何：枢轴目标应相对“本行计划航向”，而不是动作
@@ -1385,12 +1426,12 @@ export class RoutePlannerModel {
       };
     };
 
-    if (
-      now - x.action_ms >= HEXAGON_ACTION_TIMEOUT_MS ||
-      Math.abs(d - this.entry_cm) >= HEXAGON_ACTION_MAX_CM
-    ) {
-      this.fail(RouteFailure.ROUTE_FAILURE_ACTION_TIMEOUT);
-      return;
+    {
+      let ringSpeed = Math.min(this.steps[this.index].turn_speed, WHEEL_TARGET_MAX_CM_S);
+      if (x.state === HexagonState.HEXAGON_EXITING) {
+        ringSpeed = Math.min(ringSpeed, JUNCTION_EXIT_SPEED_CM_S);
+      }
+      x.speed_cm_s = ringSpeed;
     }
     /* 基准必须用 h0（实测入口航向）：净转角是“相对进入环岛时的车头”转了多少。
      * 若用计划航向作基准，入口残留偏差本身就成了净转角——残差方向与环岛转向
@@ -1401,9 +1442,16 @@ export class RoutePlannerModel {
       this.fail(RouteFailure.ROUTE_FAILURE_WRONG_WAY);
       return;
     }
-    if (netTurn > targetRad + HEXAGON_OVERANGLE_RAD) {
-      this.fail(RouteFailure.ROUTE_FAILURE_TURN_LIMIT);
-      return;
+    {
+      const net = (h - h0) * dir;
+      if (net < -JUNCTION_WRONG_WAY_RAD) {
+        this.fail(RouteFailure.ROUTE_FAILURE_WRONG_WAY);
+        return;
+      }
+      if (net > targetRad + HEXAGON_OVERANGLE_RAD) {
+        this.fail(RouteFailure.ROUTE_FAILURE_TURN_LIMIT);
+        return;
+      }
     }
 
     const narrow = routeIsNarrowLine(o);
@@ -1454,7 +1502,7 @@ export class RoutePlannerModel {
         x.use_line = narrow && centered;
         x.target_heading = hbase;
         if (now - x.action_ms >= HEXAGON_ACTION_TIMEOUT_MS ||
-          Math.abs(d - this.entry_cm) >= HEXAGON_ENTRY_APPROACH_MAX_CM) {
+          Math.abs(d - this.entry_cm) >= maxApproach) {
           this.fail(RouteFailure.ROUTE_FAILURE_ENTRY_SPEED);
         }
         return;
@@ -1534,6 +1582,8 @@ export class RoutePlannerModel {
         x.cross_cm = (-(axle_x_cm - x.leg_from_x_cm) * ldy +
           (axle_y_cm - x.leg_from_y_cm) * ldx) / llen;
       } else {
+        x.arc_progress_rad = phi;
+        x.radius_err_cm = 0;
         x.cross_cm = 0;
       }
       if (this.pose_mode && Math.abs(x.cross_cm) > HEXAGON_LEG_CROSS_MAX_CM) {
@@ -1565,11 +1615,9 @@ export class RoutePlannerModel {
         }
         if (x.center_samples < LINE_CONFIRM_SAMPLES) ++x.center_samples;
       }
-      if (
-        x.center_samples >= LINE_CONFIRM_SAMPLES &&
+      if (x.center_samples >= LINE_CONFIRM_SAMPLES &&
         now - x.center_ms >= HEXAGON_EXIT_CONFIRM_MS &&
-        d - x.center_cm >= HEXAGON_EXIT_CONFIRM_CM
-      ) {
+        d - x.center_cm >= HEXAGON_EXIT_CONFIRM_CM) {
         x.state = HexagonState.HEXAGON_DONE;
         this.line_exit_confirmed = true;
         this.line_exit_heading_rad = h;
@@ -2407,6 +2455,8 @@ export class RoutePlannerModel {
       this.completeClear(d, now);
       return;
     }
+    /* 环岛圆弧自己完成出环交棒，不再走 2 cm 位姿离口重置。 */
+    if (this.pose_mode && s.action === Action.HEXAGON && !this.passing_junction) return;
 
     const straight = this.currentAction() === Action.STRAIGHT;
 

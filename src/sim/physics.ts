@@ -17,6 +17,7 @@ import {
   MOTOR_BRAKE_TAU_S,
   MOTOR_MAX_ACCEL_CM_S2,
   MOTOR_MAX_DECEL_CM_S2,
+  MOTOR_SHORT_BRAKE_DECEL_CM_S2,
   MOTOR_REVERSE_BRAKE_DECEL_CM_S2,
 } from './config';
 import { LineState, type EncoderCounts, type GrayObservation } from './types';
@@ -44,17 +45,23 @@ export function advanceWheel(
   pwmFreeSpeed: number,
   enabled: boolean,
   dt: number,
-  reverse = false
+  reverse = false,
+  shortBrakeDecel = MOTOR_SHORT_BRAKE_DECEL_CM_S2
 ): number {
   if (reverse && enabled) {
     const decel = MOTOR_REVERSE_BRAKE_DECEL_CM_S2 * dt;
     const change = (pwmFreeSpeed - speed) * (1 - Math.exp(-dt / MOTOR_RESPONSE_TAU_S));
     return Math.max(0, speed + Math.max(-decel, Math.min(0.0, change)));
   }
-  const tau = !enabled ? MOTOR_COAST_TAU_S : pwmFreeSpeed === 0 ? MOTOR_BRAKE_TAU_S : MOTOR_RESPONSE_TAU_S;
+  /* STBY high with a zero duty on this channel shorts the motor (H-bridge both
+   * low-side), which brakes far harder than coasting; the coasting figure must
+   * not be used for that branch. */
+  const shortBrake = enabled && pwmFreeSpeed === 0;
+  const tau = !enabled ? MOTOR_COAST_TAU_S : shortBrake ? MOTOR_BRAKE_TAU_S : MOTOR_RESPONSE_TAU_S;
   const equilibrium = enabled ? pwmFreeSpeed : 0;
   const change = (equilibrium - speed) * (1 - Math.exp(-dt / tau));
-  const limit = (change >= 0 ? MOTOR_MAX_ACCEL_CM_S2 : MOTOR_MAX_DECEL_CM_S2) * dt;
+  const decelLimit = shortBrake ? shortBrakeDecel : MOTOR_MAX_DECEL_CM_S2;
+  const limit = (change >= 0 ? MOTOR_MAX_ACCEL_CM_S2 : decelLimit) * dt;
   return Math.max(0, speed + Math.max(-limit, Math.min(limit, change)));
 }
 
@@ -81,7 +88,11 @@ export class VehicleSimulator {
   public follow: LineFollowModel;
   public gray_sensor: GraySensorModel = new GraySensorModel();
 
-  public sensor_pitch_cm = 1.1; // Distance between adjacent sensor channels (~7.7 cm total span)
+  /* 相邻两路灰度间距（cm）。1.1 cm 与固件 GRAY_SENSOR_PITCH_CM 对齐（总跨 7.7
+   * cm）。实车 8 路模块若更宽，需要先量实物再改这里，不要按“让方案过关”调。 */
+  public sensor_pitch_cm = 1.1;
+  /* Plant calibration knobs (see config.ts): short-brake decel and lateral scrub. */
+  public shortBrakeDecel = MOTOR_SHORT_BRAKE_DECEL_CM_S2;
   public sim_time_s = 0;
   public sim_time_ms = 0;
   public trajectory: Point2D[] = [];
@@ -223,8 +234,8 @@ export class VehicleSimulator {
     const reverseRight = enabled && cmd.right_pwm < 0;
     const oldLeft = this.actual_left_speed;
     const oldRight = this.actual_right_speed;
-    this.actual_left_speed = advanceWheel(oldLeft, target_v_left, enabled, dt, reverseLeft);
-    this.actual_right_speed = advanceWheel(oldRight, target_v_right, enabled, dt, reverseRight);
+    this.actual_left_speed = advanceWheel(oldLeft, target_v_left, enabled, dt, reverseLeft, this.shortBrakeDecel);
+    this.actual_right_speed = advanceWheel(oldRight, target_v_right, enabled, dt, reverseRight, this.shortBrakeDecel);
     const leftTravel = (oldLeft + this.actual_left_speed) * 0.5 * dt;
     const rightTravel = (oldRight + this.actual_right_speed) * 0.5 * dt;
 

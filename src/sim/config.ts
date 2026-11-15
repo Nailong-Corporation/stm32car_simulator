@@ -401,6 +401,22 @@ export const HEXAGON_ENTRY_APPROACH_MAX_CM = 35.0;
  * (instead of the grey loss timer) aborts it. */
 export const HEXAGON_LEG_CROSS_MAX_CM = 10.0;
 
+/* INS circular-arc hexagon traversal (2026-11-15, motion_config.h)：
+ * 入环直行到切点后按 R=32.5 cm 匀速圆弧绕一周，灰度 PID 全程暂停。 */
+export const HEXAGON_ARC_RADIUS_CM = 32.5;
+export const HEXAGON_ARC_APPROACH_CM = GRAY_FORWARD_OFFSET_CM + 6.0; /* 30 cm */
+export const HEXAGON_ARC_HEADING_KP = 24.0;
+export const HEXAGON_ARC_RADIAL_KP = 0.04;
+export const HEXAGON_ARC_RADIAL_MAX_RAD = 0.25;
+export const HEXAGON_ARC_YAW_DAMPING = 1.5;
+export const HEXAGON_ARC_EXIT_TOL_RAD = 0.05;
+export const HEXAGON_ARC_MIN_PROGRESS_RATIO = 0.75;
+
+/* 单轮目标 0 而另一轮仍驱动时，TB6612 该通道两输入同为低电平 = 短路制动
+ * （motor.c set_wheel 注释），不是滑行；制动转矩远大于滑行。 */
+export const MOTOR_SHORT_BRAKE_DECEL_CM_S2 = 600.0;
+
+
 export const ROUTE_SHORT_SPEED_CM_S = 60.0;
 export const ROUTE_LONG_SEGMENT_CM = 100.0;
 export const NAVIGATION_RECOVERY_MS = 1200;

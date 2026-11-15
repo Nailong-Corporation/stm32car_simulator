@@ -91,6 +91,14 @@ import {
   POSE_PURSUIT_LOOKAHEAD_CM,
   ROUTE_WAYPOINT_GATE_CM,
   HEXAGON_TURN_TOL_RAD,
+  DASHED_HOLD_LOSS_MS,
+  DASHED_HOLD_LOSS_CM,
+  DASHED_HOLD_EXTRA_CM,
+  ROUTE_WAYPOINT_MARGIN_CM,
+  HEXAGON_ARC_RADIUS_CM,
+  ODOMETRY_HEADING_SCALE,
+  HEXAGON_ARC_HEADING_KP,
+  HEXAGON_ARC_YAW_DAMPING,
 } from './config';
 import { OdometryModel, defaultOdometryCalibration } from './odometry';
 import { RoutePlannerModel, routeIsNarrowLine, routeIsClearLine, routeGrayShowsBranch } from './route';
@@ -363,14 +371,14 @@ export class LineFollowModel {
     return routeIsNarrowLine(obs);
   }
 
-  /** Ordinary maneuvers use route phase bounds; HEXAGON keeps its own loss rules. */
+  /** ROUTE owns gray loss across active manoeuvres (including the HEXAGON INS
+   * arc) and clearances (line_follow.c 2026-11-15). */
   private routeOwnsGrayLoss(): boolean {
     const r = this.route;
     return r.state === RouteState.ROUTE_BRAKING ||
       r.state === RouteState.ROUTE_RECOVERING ||
-      ((r.state === RouteState.ROUTE_EXECUTING || r.state === RouteState.ROUTE_CLEARING) &&
-        (r.steps[r.index]?.action !== Action.HEXAGON ||
-         (r.state === RouteState.ROUTE_EXECUTING && r.turn_approaching)));
+      r.state === RouteState.ROUTE_EXECUTING ||
+      r.state === RouteState.ROUTE_CLEARING;
   }
 
   public update(
@@ -807,8 +815,7 @@ export class LineFollowModel {
     } else if (
       this.route.pose_mode &&
       this.route.pose_cross_valid &&
-      this.route.state === RouteState.ROUTE_FOLLOW &&
-      step.action !== Action.HEXAGON
+      this.route.state === RouteState.ROUTE_FOLLOW
     ) {
       // 2026-11-08 field fix: on a straight the lateral correction must be owned
       // by the grey position PID. The old branch treated the pose segment as the
@@ -828,7 +835,8 @@ export class LineFollowModel {
        * 分支并入时保持本行线段方向，等支路离开杆后再交回位置 PID；它是结构而
        * 不是丢线，因此不启动丢线窗口。 */
       const branch = routeGrayShowsBranch(obs);
-      const usable = trusted && narrow && !branch;
+      /* 虚线行：短划不是可靠控制目标，保持位姿航向直行，等末端整排实线确认。 */
+      const usable = trusted && narrow && !branch && !dashedHold;
       if (usable) {
         if (stable) {
           this.have_reliable = true;
@@ -946,15 +954,21 @@ export class LineFollowModel {
           JUNCTION_YAW_DAMPING * this.turn_yaw_rate_rad_s,
         dt
       );
-    } else if (this.route.state === RouteState.ROUTE_EXECUTING && step.action === Action.HEXAGON) {
+    } else if ((this.route.state === RouteState.ROUTE_EXECUTING ||
+      (this.route.state === RouteState.ROUTE_CLEARING && this.route.pose_mode &&
+        !this.route.passing_junction)) &&
+      step.action === Action.HEXAGON && !this.route.passing_junction) {
+      /* HEXAGON INS arc (line_follow.c 2026-11-15): constant axle speed on the
+       * circle, feed-forward differential v*track/(2R), heading feedback against
+       * the tangent and yaw-rate damping. The grey line never steers here. */
       const x = this.route.hexagon;
       this.state = LineState.LINE_JUNCTION;
       this.abnormal = false;
-      this.exit_accelerating = false;
-      if (previous_route !== RouteState.ROUTE_EXECUTING) this.pid.reset();
-      // Ring speed comes from the route plan (pivot speed at the vertices, leg
-      // speed on the edges with a braking envelope toward the next vertex).
-      const outer = x.speed_cm_s > 0
+      this.component_cross_latched = false;
+      this.have_reliable = true;
+      this.last_reliable_ms = now_ms;
+      this.pid.reset();
+      const requested = x.speed_cm_s > 0
         ? x.speed_cm_s
         : Math.min(step.turn_speed, WHEEL_TARGET_MAX_CM_S);
       let correction = 0;
@@ -1002,6 +1016,12 @@ export class LineFollowModel {
         correction = Math.max(-0.5 * outer, Math.min(0.5 * outer, correction));
         this.outerTargets(outer, correction, dt);
       }
+      this.left_target_cm_s = Math.max(0, left);
+      this.right_target_cm_s = Math.max(0, right);
+      this.base = 0.5 * (this.left_target_cm_s + this.right_target_cm_s);
+      this.correction = 0.5 * (this.left_target_cm_s - this.right_target_cm_s);
+      this.startup_elapsed_s = Math.min(STARTUP_RAMP_TIME_S, this.startup_elapsed_s + dt);
+      this.exit_accelerating = this.route.state === RouteState.ROUTE_CLEARING;
     } else if (this.route.state === RouteState.ROUTE_EXECUTING) {
       this.exit_accelerating = false;
       if (previous_route !== RouteState.ROUTE_EXECUTING) {
@@ -1123,7 +1143,7 @@ export class LineFollowModel {
       this.abnormal = false;
       this.pid.reset();
       this.outerTargets(
-        Math.min(base_speed, JUNCTION_SETTLE_SPEED_CM_S),
+        Math.min(base_speed, step.turn_speed),
         HEADING_KP_CM_S_PER_RAD * (this.route.line_exit_heading_rad - this.odometry.heading_rad),
         dt
       );

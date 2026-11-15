@@ -1,4 +1,10 @@
 import { Action, type RouteStartPose, type RouteStep } from './types';
+import {
+  GRAY_FORWARD_OFFSET_CM,
+  HEXAGON_ARC_APPROACH_CM,
+  WHEEL_TRACK_CM,
+  TURN_PIVOT_APPROACH_CM,
+} from './config';
 
 export interface ParsedScheme {
   id: number;
@@ -167,7 +173,16 @@ export function parseRouteTableC(sourceCode: string): ParseResult {
   let inRouteArray = false;
   let inBlockComment = false;
   const customSteps: RouteStep[] = [];
-  const defines = new Map<string, number>();
+  /* motion_config.h constants referenced from route_table.c rows. The table
+   * itself only #defines the turn-approach macros, so the geometric ones must
+   * be seeded or a row such as HEXAGON_ARC_APPROACH_CM parses as NaN and the
+   * whole scheme fails route_init() with ROUTE_FAILURE_INVALID. */
+  const defines = new Map<string, number>([
+    ['GRAY_FORWARD_OFFSET_CM', GRAY_FORWARD_OFFSET_CM],
+    ['WHEEL_TRACK_CM', WHEEL_TRACK_CM],
+    ['HEXAGON_ARC_APPROACH_CM', HEXAGON_ARC_APPROACH_CM],
+    ['TURN_PIVOT_APPROACH_CM', TURN_PIVOT_APPROACH_CM],
+  ]);
 
   for (let i = 0; i < lines.length; ++i) {
     const line = lines[i];
@@ -398,7 +413,7 @@ export const DEFAULT_ROUTE_TABLE_C = `#include "route.h"
  * 普通行：正段距必须达到后再确认灰度节点；距离为0才按计数授权，位姿不独立触发。
  * short_link_cm>0：明确标注的短连接，使用前一路口确认后的有界编码器/航向投影；长度不减5。
  * 普通直角使用 TURN_RIGHT_ANGLE_STRAIGHT_CM；三极管角点使用 TURN_TRANSISTOR_STRAIGHT_CM。
- * 显式短连接仍按短段几何定位；STOP/STRAIGHT/HEXAGON 不使用此直走距离。
+ * 显式短连接仍按短段几何定位；STOP/STRAIGHT 不使用此直走距离，HEXAGON 用其设定入环直走至切点的距离（0 默认 HEXAGON_ARC_APPROACH_CM）。
  * 电阻及其他印刷图形参与节点计数，使用连续证据及离口去重。
  * 未标定行距离 = 图纸几何长度 - 5 cm；实车标定例外见逐行注释，原始长度见 test/new_track_routes.json。
  * 传感器前伸 24 cm，短段节点可能在上一动作内通过，计数需逐段回放校准。
@@ -408,7 +423,7 @@ export const DEFAULT_ROUTE_TABLE_C = `#include "route.h"
  * 本文件由 test/sync_new_track_routes.py 生成。
  */
 #ifndef ROUTE_SCHEME_SELECT
-#define ROUTE_SCHEME_SELECT 4
+#define ROUTE_SCHEME_SELECT 1
 #endif
 
 /* 起跑位姿锚点（世界坐标：x 向东、y 向南）。
@@ -508,7 +523,7 @@ const RouteStep route[] = {
     { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   95.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 15: 顶边东过 Q16 至 (375,0)；R17 已扫过，Q16 仅短候选未确认，实跑计目标1；几何 100 - 5 = 95 cm */
     { 5, 28.0f, CUSTOM_TURN, 160,    90.0f,false,  215.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 16: x375 南下至 (375,220)，过 y50/R15/y110/R12；几何 220 - 5 = 215 cm */
     { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   25.0f, 30.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 17: 底边西至 (345,220)；几何 30 - 5 = 25 cm */
-    { 1, 28.0f, HEXAGON    , 160,  -360.0f,false,   50.0f, 0.0f, 0.0f}, /* 18: HEXAGON：x345 北上入环（南进），逆时针绕环一周后从北侧 x345 出环到 (345,110)；几何 55 - 5 = 50 cm */
+    { 1, 28.0f, HEXAGON    , 160,  -360.0f,false,   50.0f, 0.0f, HEXAGON_ARC_APPROACH_CM}, /* 18: HEXAGON：x345 北上至 V0(345,165) 按 R=32.5 cm 逆时针惯导匀速圆弧一周回 V0；几何 55 - 5 = 50 cm */
     { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   50.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 19: x345 北上至 Q13(345,110)；几何 55 - 5 = 50 cm */
     { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   25.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 20: y110 东至 (375,110)；几何 30 - 5 = 25 cm */
     { 2, 28.0f, CUSTOM_TURN, 160,    90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 21: x375 南下过 R12 至 (375,220)；几何 110 - 5 = 105 cm */
@@ -589,7 +604,7 @@ const RouteStep route[] = {
     { 5, 64.0f, CUSTOM_TURN, 220,   -90.0f,false,  275.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 7: 底边东至 (375,220)，过 R8/R9/R10；几何 280 - 5 = 275 cm */
     { 2, 64.0f, CUSTOM_TURN, 220,   -90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 8: x375 北上至 (375,110)，过 R12；几何 110 - 5 = 105 cm */
     { 1, 64.0f, CUSTOM_TURN, 220,   -90.0f,false,   25.0f, 30.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 9: y110 西至 Q13(345,110)；几何 30 - 5 = 25 cm */
-    { 1, 64.0f, HEXAGON    , 220,   360.0f,false,   50.0f, 0.0f, 0.0f}, /* 10: HEXAGON：x345 南下入环（北进），绕环一周后从南侧 x345 出环到 (345,220)；几何 55 - 5 = 50 cm */
+    { 1, 64.0f, HEXAGON    , 220,   360.0f,false,   50.0f, 0.0f, HEXAGON_ARC_APPROACH_CM}, /* 10: HEXAGON：x345 南下至 V0(345,165) 按 R=32.5 cm 顺时针惯导匀速圆弧一周回 V0；几何 55 - 5 = 50 cm */
     { 1, 64.0f, CUSTOM_TURN, 220,   -90.0f,false,   50.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 11: x345 南下至 (345,220)；几何 55 - 5 = 50 cm */
     { 1, 64.0f, CUSTOM_TURN, 220,   -90.0f,false,   25.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 12: 底边东至 (375,220)，左转北上；几何 30 - 5 = 25 cm */
     { 6, 64.0f, CUSTOM_TURN, 220,   -90.0f,false,  215.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 13: x375 北上至 (375,0)，过 R12/R15/y110/y50；几何 220 - 5 = 215 cm */
@@ -630,7 +645,7 @@ const RouteStep route[] = {
     { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   95.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 15: 顶边东过 Q16 至 (375,0)；R17 已扫过，Q16 仅短候选未确认，实跑计目标1；几何 100 - 5 = 95 cm */
     { 5, 28.0f, CUSTOM_TURN, 160,    90.0f,false,  215.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 16: x375 南下至 (375,220)，过 y50/R15/y110/R12；几何 220 - 5 = 215 cm */
     { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   25.0f, 30.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 17: 底边西至 (345,220)；几何 30 - 5 = 25 cm */
-    { 1, 28.0f, HEXAGON    , 160,  -360.0f,false,   50.0f, 0.0f, 0.0f}, /* 18: HEXAGON：x345 北上入环（南进），逆时针绕环一周后从北侧 x345 出环到 (345,110)；几何 55 - 5 = 50 cm */
+    { 1, 28.0f, HEXAGON    , 160,  -360.0f,false,   50.0f, 0.0f, HEXAGON_ARC_APPROACH_CM}, /* 18: HEXAGON：x345 北上至 V0(345,165) 按 R=32.5 cm 逆时针惯导匀速圆弧一周回 V0；几何 55 - 5 = 50 cm */
     { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   50.0f, 0.0f, TURN_TRANSISTOR_STRAIGHT_CM}, /* 19: x345 北上至 Q13(345,110)；几何 55 - 5 = 50 cm */
     { 1, 28.0f, CUSTOM_TURN, 160,    90.0f,false,   25.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 20: y110 东至 (375,110)；几何 30 - 5 = 25 cm */
     { 2, 28.0f, CUSTOM_TURN, 160,    90.0f,false,  105.0f, 0.0f, TURN_RIGHT_ANGLE_STRAIGHT_CM}, /* 21: x375 南下过 R12 至 (375,220)；几何 110 - 5 = 105 cm */
@@ -775,4 +790,6 @@ bool route_scenario_close_corner(const RouteStep *step)
 #endif
     (void)step;return false;
 }
+
+
 `;
